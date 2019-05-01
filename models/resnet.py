@@ -1,14 +1,25 @@
+import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import math
+from utils.partial_class import partial_class
+from .modules.se import SEBlock
+from .modules.checkpoint import CheckpointModule
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from utils.mixup import MixUp
 
-__all__ = ['resnet']
+__all__ = ['resnet', 'resnet_se']
 
+_DEFUALT_A_NBITS = 8
+_DEFUALT_W_NBITS = 8
+_DEFUALT_G_NBITS = None
 
-def conv3x3(in_planes, out_planes, stride=1):
+def conv3x3(in_planes, out_planes, stride=1, groups=1, bias=False):
     "3x3 convolution with padding"
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
+                     padding=1, groups=groups, bias=bias)
 
 
 def init_model(model):
@@ -19,20 +30,41 @@ def init_model(model):
         elif isinstance(m, nn.BatchNorm2d):
             m.weight.data.fill_(1)
             m.bias.data.zero_()
+    for m in model.modules():
+        if isinstance(m, Bottleneck):
+            nn.init.constant_(m.bn3.weight, 0)
+        elif isinstance(m, BasicBlock):
+            nn.init.constant_(m.bn2.weight, 0)
+
+    model.fc.weight.data.normal_(0, 0.01)
+    model.fc.bias.data.zero_()
+
+
+def weight_decay_config(value=1e-4, log=False):
+    return {'name': 'WeightDecay',
+            'value': value,
+            'log': log,
+            'filter': {'parameter_name': lambda n: not n.endswith('bias'),
+                       'module': lambda m: not isinstance(m, nn.BatchNorm2d)}
+            }
 
 
 class BasicBlock(nn.Module):
-    expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes,  stride=1, expansion=1,
+                 downsample=None, groups=1, residual_block=None, dropout=0.):
         super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
+        dropout = 0 if dropout is None else dropout
+        self.conv1 = conv3x3(inplanes, planes, stride, groups=groups)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = conv3x3(planes, expansion * planes, groups=groups)
+        self.bn2 = nn.BatchNorm2d(expansion * planes)
         self.downsample = downsample
+        self.residual_block = residual_block
         self.stride = stride
+        self.expansion = expansion
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         residual = x
@@ -40,12 +72,16 @@ class BasicBlock(nn.Module):
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+        out = self.dropout(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            residual = self.downsample(residual)
+
+        if self.residual_block is not None:
+            residual = self.residual_block(residual)
 
         out += residual
         out = self.relu(out)
@@ -54,37 +90,45 @@ class BasicBlock(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes,  stride=1, expansion=4, downsample=None, groups=1, residual_block=None, dropout=0.):
         super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        dropout = 0 if dropout is None else dropout
+        self.conv1 = nn.Conv2d(
+            inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
+        self.conv2 = conv3x3(planes, planes, stride=stride, groups=groups)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.conv3 = nn.Conv2d(
+            planes, planes * expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * expansion)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
         self.downsample = downsample
+        self.residual_block = residual_block
         self.stride = stride
+        self.expansion = expansion
 
     def forward(self, x):
         residual = x
-
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+        out = self.dropout(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
+        out = self.dropout(out)
 
         out = self.conv3(out)
         out = self.bn3(out)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            residual = self.downsample(residual)
+
+        if self.residual_block is not None:
+            residual = self.residual_block(residual)
 
         out += residual
         out = self.relu(out)
@@ -97,24 +141,30 @@ class ResNet(nn.Module):
     def __init__(self):
         super(ResNet, self).__init__()
 
-    def _make_layer(self, block, planes, blocks, stride=1):
+    def _make_layer(self, block, planes, blocks, expansion=1, stride=1, groups=1, residual_block=None, dropout=None, mixup=False):
         downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
+        out_planes = planes * expansion
+        if stride != 1 or self.inplanes != out_planes:
             downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
+                nn.Conv2d(self.inplanes, out_planes,
                           kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion),
+                nn.BatchNorm2d(planes * expansion),
             )
+        if residual_block is not None:
+            residual_block = residual_block(out_planes)
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
+        layers.append(block(self.inplanes, planes, stride, expansion=expansion,
+                            downsample=downsample, groups=groups, residual_block=residual_block, dropout=dropout))
+        self.inplanes = planes * expansion
         for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
-
+            layers.append(block(self.inplanes, planes, expansion=expansion, groups=groups,
+                                residual_block=residual_block, dropout=dropout))
+        if mixup:
+            layers.append(MixUp())
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def features(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -126,93 +176,194 @@ class ResNet(nn.Module):
         x = self.layer4(x)
 
         x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
+        return x.view(x.size(0), -1)
 
+    def forward(self, x):
+        x = self.features(x)
+        x = self.fc(x)
         return x
 
 
 class ResNet_imagenet(ResNet):
 
-    def __init__(self, num_classes=1000,
-                 block=Bottleneck, layers=[3, 4, 23, 3]):
+    def __init__(self, num_classes=1000, inplanes=64,
+                 block=Bottleneck, residual_block=None, layers=[3, 4, 23, 3],
+                 width=[64, 128, 256, 512], expansion=4, groups=[1, 1, 1, 1],
+                 regime='normal', scale_lr=1, checkpoint_segments=0, mixup=False,**kwargs):
         super(ResNet_imagenet, self).__init__()
-        self.inplanes = 64
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+        self.inplanes = inplanes
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
                                bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
+        self.bn1 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        self.avgpool = nn.AvgPool2d(7)
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        for i in range(len(layers)):
+            layer = self._make_layer(block=block, planes=width[i], blocks=layers[i], expansion=expansion,
+                                     stride=1 if i == 0 else 2, residual_block=residual_block, groups=groups[i],
+                                     mixup=mixup)
+            if checkpoint_segments > 0:
+                layer_checkpoint_segments = min(checkpoint_segments, layers[i])
+                layer = CheckpointModule(layer, layer_checkpoint_segments)
+            setattr(self, 'layer%s' % str(i + 1), layer)
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(width[-1] * expansion, num_classes)
 
         init_model(self)
-        self.regime = [
-            {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1,
-             'weight_decay': 1e-4, 'momentum': 0.9},
-            {'epoch': 30, 'lr': 1e-2},
-            {'epoch': 60, 'lr': 1e-3, 'weight_decay': 0},
-            {'epoch': 90, 'lr': 1e-4}
-        ]
+
+        def ramp_up_lr(lr0, lrT, T):
+            rate = (lrT - lr0) / T
+            return "lambda t: {'lr': %s + t * %s}" % (lr0, rate)
+        if regime == 'normal':
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'regularizer': weight_decay_config(1e-4),
+                 'step_lambda': ramp_up_lr(0.1, 0.1 * scale_lr, 5004 * 5 / scale_lr)},
+                {'epoch': 5,  'lr': scale_lr * 1e-1},
+                {'epoch': 30, 'lr': scale_lr * 1e-2},
+                {'epoch': 60, 'lr': scale_lr * 1e-3},
+                {'epoch': 80, 'lr': scale_lr * 1e-4}
+            ]
+        elif regime == 'fast':
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'regularizer': weight_decay_config(1e-4),
+                 'step_lambda': ramp_up_lr(0.1, 0.1 * 4 * scale_lr, 5004 * 4 / (4 * scale_lr))},
+                {'epoch': 4,  'lr': 4 * scale_lr * 1e-1},
+                {'epoch': 18, 'lr': scale_lr * 1e-1},
+                {'epoch': 21, 'lr': scale_lr * 1e-2},
+                {'epoch': 35, 'lr': scale_lr * 1e-3},
+                {'epoch': 43, 'lr': scale_lr * 1e-4},
+            ]
+            self.data_regime = [
+                {'epoch': 0, 'input_size': 128, 'batch_size': 256},
+                {'epoch': 18, 'input_size': 224, 'batch_size': 64},
+                {'epoch': 41, 'input_size': 288, 'batch_size': 32},
+            ]
+        elif 'small' in regime:
+            if regime == 'small_half':
+                bs_factor = 2
+            else:
+                bs_factor = 1
+            scale_lr *= 4 * bs_factor
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'regularizer': weight_decay_config(1e-4),
+                 'momentum': 0.9, 'lr': scale_lr * 1e-1},
+                {'epoch': 30, 'lr': scale_lr * 1e-2},
+                {'epoch': 60, 'lr': scale_lr * 1e-3},
+                {'epoch': 80, 'lr': bs_factor * 1e-4}
+            ]
+            self.data_regime = [
+                {'epoch': 0, 'input_size': 128, 'batch_size': 256 * bs_factor},
+                {'epoch': 80, 'input_size': 224, 'batch_size': 64 * bs_factor},
+            ]
+            self.data_eval_regime = [
+                {'epoch': 0, 'input_size': 224, 'batch_size': 512 * bs_factor},
+            ]
+        elif 'qdistil' in regime:
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9,
+                 'step_lambda': ramp_up_lr(1e-4, 1e-4 * scale_lr, 5004 * 5 / scale_lr)},
+                {'epoch': 5,  'lr': scale_lr * 1e-4},
+                {'epoch': 30, 'lr': scale_lr * 1e-5},
+            ]
 
 
-class ResNet_cifar10(ResNet):
 
-    def __init__(self, num_classes=10,
-                 block=BasicBlock, depth=18):
-        super(ResNet_cifar10, self).__init__()
-        self.inplanes = 16
+class ResNet_cifar(ResNet):
+
+    def __init__(self, num_classes=10, inplanes=16,
+                 block=BasicBlock, depth=18, width=[16, 32, 64],
+                 groups=[1, 1, 1], residual_block=None, regime='normal', dropout=None, mixup=False):
+        super(ResNet_cifar, self).__init__()
+        self.inplanes = inplanes
         n = int((depth - 2) / 6)
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1,
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1,
                                bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
+        self.bn1 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = lambda x: x
-        self.layer1 = self._make_layer(block, 16, n)
-        self.layer2 = self._make_layer(block, 32, n, stride=2)
-        self.layer3 = self._make_layer(block, 64, n, stride=2)
+
+        self.layer1 = self._make_layer(block, width[0], n, groups=groups[
+                                       0], residual_block=residual_block, dropout=dropout, mixup=mixup)
+        self.layer2 = self._make_layer(
+            block, width[1], n, stride=2, groups=groups[1], residual_block=residual_block, dropout=dropout, mixup=mixup)
+        self.layer3 = self._make_layer(
+            block, width[2], n, stride=2, groups=groups[2], residual_block=residual_block, dropout=dropout, mixup=mixup)
         self.layer4 = lambda x: x
         self.avgpool = nn.AvgPool2d(8)
-        self.fc = nn.Linear(64, num_classes)
+        self.fc = nn.Linear(width[-1], num_classes)
 
         init_model(self)
-        self.regime = [
-            {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1,
-             'weight_decay': 1e-4, 'momentum': 0.9},
-            {'epoch': 81, 'lr': 1e-2},
-            {'epoch': 122, 'lr': 1e-3, 'weight_decay': 0},
-            {'epoch': 164, 'lr': 1e-4}
-        ]
+        if regime == 'normal':
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1, 'momentum': 0.9,
+                 'regularizer': weight_decay_config(1e-4)},
+                {'epoch': 81, 'lr': 1e-2},
+                {'epoch': 122, 'lr': 1e-3},
+                {'epoch': 164, 'lr': 1e-4}
+            ]
+        elif regime == 'wide-resnet':
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1, 'momentum': 0.9,
+                 'regularizer': weight_decay_config(5e-4)},
+                {'epoch': 60, 'lr': 2e-2},
+                {'epoch': 120, 'lr': 4e-3},
+                {'epoch': 160, 'lr': 8e-4}
+            ]
 
 
-def resnet(**kwargs):
-    num_classes, depth, dataset = map(
-        kwargs.get, ['num_classes', 'depth', 'dataset'])
-    if dataset == 'imagenet':
-        num_classes = num_classes or 1000
-        depth = depth or 50
+def resnet(**config):
+    dataset = config.pop('dataset', 'imagenet')
+    if config.pop('quantize', False):
+        from .modules.quantize import QConv2d, QLinear, RangeBN
+        activation_numbit = config.pop('activations_numbits', _DEFUALT_A_NBITS )
+        weights_numbits = config.pop('weights_numbits', _DEFUALT_W_NBITS )
+        gradient_numbits = config.pop('grad_numbits', _DEFUALT_G_NBITS )
+        torch.nn.Linear = partial_class(QLinear,num_bits=activation_numbit,num_bits_weight=weights_numbits,num_bits_grad=gradient_numbits)
+        torch.nn.Conv2d = partial_class(QConv2d,num_bits=activation_numbit,num_bits_weight=weights_numbits,num_bits_grad=gradient_numbits)
+        #torch.nn.BatchNorm2d = RangeBN
+
+    bn_norm = config.pop('bn_norm', None)
+    if bn_norm is not None:
+        from .modules.lp_norm import L1BatchNorm2d, TopkBatchNorm2d
+        if bn_norm == 'L1':
+            torch.nn.BatchNorm2d = L1BatchNorm2d
+        if bn_norm == 'TopK':
+            torch.nn.BatchNorm2d = TopkBatchNorm2d
+
+    if 'imagenet' in dataset:
+        config.setdefault('num_classes', 1000)
+        depth = config.pop('depth', 50)
         if depth == 18:
-            return ResNet_imagenet(num_classes=num_classes,
-                                   block=BasicBlock, layers=[2, 2, 2, 2])
+            config.update(dict(block=BasicBlock,
+                               layers=[2, 2, 2, 2],
+                               expansion=1))
         if depth == 34:
-            return ResNet_imagenet(num_classes=num_classes,
-                                   block=BasicBlock, layers=[3, 4, 6, 3])
+            config.update(dict(block=BasicBlock,
+                               layers=[3, 4, 6, 3],
+                               expansion=1))
         if depth == 50:
-            return ResNet_imagenet(num_classes=num_classes,
-                                   block=Bottleneck, layers=[3, 4, 6, 3])
+            config.update(dict(block=Bottleneck, layers=[3, 4, 6, 3]))
         if depth == 101:
-            return ResNet_imagenet(num_classes=num_classes,
-                                   block=Bottleneck, layers=[3, 4, 23, 3])
+            config.update(dict(block=Bottleneck, layers=[3, 4, 23, 3]))
         if depth == 152:
-            return ResNet_imagenet(num_classes=num_classes,
-                                   block=Bottleneck, layers=[3, 8, 36, 3])
+            config.update(dict(block=Bottleneck, layers=[3, 8, 36, 3]))
+        if depth == 200:
+            config.update(dict(block=Bottleneck, layers=[3, 24, 36, 3]))
+
+        return ResNet_imagenet(**config)
 
     elif dataset == 'cifar10':
-        num_classes = num_classes or 10
-        depth = depth or 56
-        return ResNet_cifar10(num_classes=num_classes,
-                              block=BasicBlock, depth=depth)
+        config.setdefault('num_classes', 10)
+        config.setdefault('depth', 44)
+        return ResNet_cifar(block=BasicBlock, **config)
+
+    elif dataset == 'cifar100':
+        config.setdefault('num_classes', 100)
+        config.setdefault('depth', 44)
+        return ResNet_cifar(block=BasicBlock, **config)
+
+
+def resnet_se(**config):
+    config['residual_block'] = SEBlock
+    return resnet(**config)

@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
 def _mean(p, dim):
     """Computes the mean over all dimensions except dim"""
     if dim is None:
@@ -154,6 +153,10 @@ class QuantMeasure(nn.Module):
         self.register_buffer('running_max', torch.zeros(1))
         self.momentum = momentum
         self.num_bits = num_bits
+        self.quant_enabled = True
+
+    def set_measure_mode(self,measure):
+        self.quant_enabled = not measure
 
     def forward(self, input):
         if self.training:
@@ -168,7 +171,13 @@ class QuantMeasure(nn.Module):
         else:
             min_value = self.running_min
             max_value = self.running_max
-        return quantize(input, self.num_bits, min_value=float(min_value), max_value=float(max_value), num_chunks=16)
+        if self.quant_enabled:
+            return quantize(input, self.num_bits, min_value=float(min_value), max_value=float(max_value), num_chunks=16)
+        else:
+            return input
+
+    def get_measured_range(self):
+        return float(self.running_min), float(self.running_max)
 
 
 class QConv2d(nn.Conv2d):
@@ -183,24 +192,33 @@ class QConv2d(nn.Conv2d):
         self.num_bits_grad = num_bits_grad
         self.quantize_input = QuantMeasure(self.num_bits)
         self.biprecision = biprecision
+        self.enable_quant = True
+
+    def set_measure_mode(self, measure):
+        self.enable_quant = not measure
+        self.quantize_input.set_measure_mode(measure)
 
     def forward(self, input):
-        qinput = self.quantize_input(input)
-        qweight = quantize(self.weight, num_bits=self.num_bits_weight,
-                           min_value=float(self.weight.min()),
-                           max_value=float(self.weight.max()))
-        if self.bias is not None:
-            qbias = quantize(self.bias, num_bits=self.num_bits_weight)
+        input = self.quantize_input(input)
+        if self.enable_quant:
+            qweight = quantize(self.weight, num_bits=self.num_bits_weight,
+                               min_value=float(self.weight.min()),
+                               max_value=float(self.weight.max()))
+            if self.bias is not None:
+                qbias = quantize(self.bias, num_bits=self.num_bits_weight)
+            else:
+                qbias = None
+            if not self.biprecision or self.num_bits_grad is None:
+                output = F.conv2d(input, qweight, qbias, self.stride,
+                                  self.padding, self.dilation, self.groups)
+                if self.num_bits_grad is not None:
+                    output = quantize_grad(output, num_bits=self.num_bits_grad)
+            else:
+                output = conv2d_biprec(input, qweight, qbias, self.stride,
+                                       self.padding, self.dilation, self.groups, num_bits_grad=self.num_bits_grad)
         else:
-            qbias = None
-        if not self.biprecision or self.num_bits_grad is None:
-            output = F.conv2d(qinput, qweight, qbias, self.stride,
+            output = F.conv2d(input, self.weight, self.bias, self.stride,
                               self.padding, self.dilation, self.groups)
-            if self.num_bits_grad is not None:
-                output = quantize_grad(output, num_bits=self.num_bits_grad)
-        else:
-            output = conv2d_biprec(qinput, qweight, qbias, self.stride,
-                                   self.padding, self.dilation, self.groups, num_bits_grad=self.num_bits_grad)
 
         return output
 
@@ -215,23 +233,32 @@ class QLinear(nn.Linear):
         self.num_bits_grad = num_bits_grad
         self.biprecision = biprecision
         self.quantize_input = QuantMeasure(self.num_bits)
+        self.enable_quant = True
+
+    def set_measure_mode(self, measure):
+        self.enable_quant = not measure
+        self.quantize_input.set_measure_mode(measure)
 
     def forward(self, input):
-        qinput = self.quantize_input(input)
-        qweight = quantize(self.weight, num_bits=self.num_bits_weight,
-                           min_value=float(self.weight.min()),
-                           max_value=float(self.weight.max()))
-        if self.bias is not None:
-            qbias = quantize(self.bias, num_bits=self.num_bits_weight)
-        else:
-            qbias = None
+        input = self.quantize_input(input)
+        if self.enable_quant:
+            qweight = quantize(self.weight, num_bits=self.num_bits_weight,
+                               min_value=float(self.weight.min()),
+                               max_value=float(self.weight.max()))
+            if self.bias is not None:
+                qbias = quantize(self.bias, num_bits=self.num_bits_weight)
+            else:
+                qbias = None
 
-        if not self.biprecision or self.num_bits_grad is None:
-            output = F.linear(qinput, qweight, qbias)
-            if self.num_bits_grad is not None:
-                output = quantize_grad(output, num_bits=self.num_bits_grad)
+            if not self.biprecision or self.num_bits_grad is None:
+                output = F.linear(input, qweight, qbias)
+                if self.num_bits_grad is not None:
+                    output = quantize_grad(output, num_bits=self.num_bits_grad)
+            else:
+                output = linear_biprec(input, qweight, qbias, self.num_bits_grad)
         else:
-            output = linear_biprec(qinput, qweight, qbias, self.num_bits_grad)
+            output = F.linear(input, self.weight, self.bias)
+
         return output
 
 
@@ -306,3 +333,28 @@ class RangeBN(nn.Module):
         if out.size(3) == 1 and out.size(2) == 1:
             out = out.squeeze(-1).squeeze(-1)
         return out
+
+
+def is_bn(m):
+    return isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d)
+
+def is_quant(m):
+    return isinstance(m, QLinear) or isinstance(m, QConv2d)
+
+def set_bn_is_train(model,mode):
+    with torch.no_grad():
+        for m in model.modules():
+            if is_bn(m):
+                m.train(mode)
+
+def set_measure_mode(model,measure,logger = None):
+    with torch.no_grad():
+        for m in model.modules():
+            if is_bn(m):
+                if logger:
+                    logger.debug('{} set to {}'.format(m,'eval' if measure else 'train'))
+                m.train(not measure)
+            elif is_quant(m):
+                if logger:
+                    logger.debug('{} set to {}'.format(m, 'float' if measure else 'quant'))
+                m.set_measure_mode(measure)
