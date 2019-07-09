@@ -4,7 +4,7 @@ FirstConv2d = torch.nn.Conv2d
 FC = torch.nn.Linear
 import torchvision.transforms as transforms
 import math
-from utils.optim import lr_drops,exp_decay_lr,ramp_up_lr,cosine_anneal_lr
+from utils.regime import lr_drops,exp_decay_lr,ramp_up_lr,cosine_anneal_lr
 from utils.partial_class import partial_class
 from .modules.quantize import get_bn_folding_module
 from .modules.se import SEBlock
