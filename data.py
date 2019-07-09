@@ -1,8 +1,8 @@
 import os
 import torchvision.datasets as datasets
 
-__DATASETS_DEFAULT_PATH = '/media/ssd/Datasets/'
-
+#__DATASETS_DEFAULT_PATH = '/media/hdd/Datasets/'
+__DATASETS_DEFAULT_PATH = 'Datasets'
 
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH):
@@ -32,7 +32,7 @@ def get_dataset(name, split='train', transform=None,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
-    elif name == 'imagenet':
+    elif name in ['imagenet','imaginet','randomnet']:
         if train:
             root = os.path.join(root, 'train')
         else:

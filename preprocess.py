@@ -1,6 +1,7 @@
 import torch
 import torchvision.transforms as transforms
 import random
+import numpy as np
 
 __imagenet_stats = {'mean': [0.485, 0.456, 0.406],
                    'std': [0.229, 0.224, 0.225]}
@@ -75,6 +76,14 @@ def get_transform(name='imagenet', input_size=None,
                   scale_size=None, normalize=None, augment=True):
     normalize = normalize or __imagenet_stats
     if name == 'imagenet':
+        scale_size = scale_size or 256
+        input_size = input_size or 224
+        if augment:
+            return inception_preproccess(input_size, normalize=normalize)
+        else:
+            return scale_crop(input_size=input_size,
+                              scale_size=scale_size, normalize=normalize)
+    if name in ['imaginet','randomnet']:
         scale_size = scale_size or 256
         input_size = input_size or 224
         if augment:
@@ -196,3 +205,90 @@ class ColorJitter(RandomOrder):
             self.transforms.append(Contrast(contrast))
         if saturation != 0:
             self.transforms.append(Saturation(saturation))
+
+class RandomNoise(object):
+    _SUPPORTED_NOISE = ['uniform','normal']
+    def __init__(self,type,ratio=0.05):
+        assert type in RandomNoise._SUPPORTED_NOISE
+        assert 0 < ratio < 1
+        self.type = type
+        self.ratio = ratio
+        self.img = None
+    def __call__(self, img):
+        norm_signal = torch.norm(img)
+        # set noise expectation to bias and variance to 1
+        if self.type == 'uniform':
+            alpha=1.7321
+            noise = torch.distributions.Uniform(-alpha,alpha).sample(img.shape)
+        elif self.type == 'normal':
+            noise = torch.distributions.Normal(0,1).sample(img.shape)
+        norm_noise = torch.norm(noise)
+        factor = self.ratio * norm_signal / norm_noise
+        return img * (1-self.ratio) + noise * factor
+
+class ImgGhosting():
+    def __init__(self, ratio=0.3, ghost_moment = 0.2, residual_init_rate = 0.25,fuse_distribution = torch.distributions.Beta(0.4,0.4)):
+        self.ratio = ratio
+        self.init_rate = residual_init_rate
+        self.ghost_moment=ghost_moment
+        assert 0 <= self.ratio / (1 - self.init_rate) <= 1
+        #todo check exponential dist
+        self.fuse_distribution = fuse_distribution
+        self.residual = None
+
+    def __call__(self, img):
+        if self.residual and torch.rand(1) > self.init_rate:
+            residual = self.residual.copy()
+            #update residual
+            self.residual = self.residual * self.ghost_moment + (1-self.ghost_moment) * img
+
+            # ratio of ghosted images per sample
+            if torch.rand(1) < self.ratio /(1- self.init_rate):
+                gamma = self.fuse_distribution.sample()
+                img = img * (1 - gamma) + gamma * residual
+
+        else:
+            self.residual = img
+
+        return img
+
+class Cutout(object):
+    """Randomly mask out one or more patches from an image.
+    Args:
+        n_holes (int): Number of patches to cut out of each image.
+        length (int): The length (in pixels) of each square patch.
+    """
+    def __init__(self, max_num_holes=10,ratio=1/4):
+        super(Cutout,self).__init__()
+        self.max_num_holes = max_num_holes
+        self.ratio = ratio
+
+    def __call__(self, img):
+
+        """
+        Args:
+            img (Tensor): Tensor image of size (C, H, W).
+        Returns:
+            Tensor: Image with n_holes of dimension length x length cut out of it.
+        """
+        h = img.size(1)
+        w = img.size(2)
+
+        mask = torch.ones((h,w),device=img.device)
+
+        for n in range(torch.randint(self.max_num_holes,(1,))):
+            hight = torch.randint(1,int(h * self.ratio),(1,))
+            width = torch.randint(1,int(w * self.ratio),(1,))
+            y = torch.randint(h,(1,))
+            x = torch.randint(w,(1,))
+
+            y1 = torch.clamp(y - hight // 2, 0, h)
+            y2 = torch.clamp(y + hight // 2, 0, h)
+            x1 = torch.clamp(x - width // 2, 0, w)
+            x2 = torch.clamp(x + width // 2, 0, w)
+
+            mask[y1: y2, x1: x2] = 0.
+
+        mask = mask.expand_as(img)
+        img = img * mask
+        return img
