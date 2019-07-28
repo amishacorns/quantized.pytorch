@@ -555,12 +555,16 @@ def overwrite_params(model,logger = None):
     recursive_apply(model, func)
 
 
-def freeze_quant_params(model,freeze=True,include_param_dyn_range=True,logger = None):
+def freeze_quant_params(model,freeze=True,include_param_dyn_range=True,momentum='same',logger = None):
     def func(m,*args):
         if isinstance(m,QuantMeasure):
             if logger:
                 logger.debug('{} set to {}'.format(m, 'eval' if freeze else 'train'))
             m.train(not freeze)
+            if momentum!= 'same':
+                if logger:
+                    logger.debug('setting momentum to {}'.format(momentum))
+                m.momentum=momentum
         if include_param_dyn_range and isinstance(m,QuantNode):
             m.freeze_param_dyn_rang = freeze
 
