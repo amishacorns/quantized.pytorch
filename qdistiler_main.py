@@ -1,8 +1,10 @@
 import argparse
 import os
+import subprocess
 import time
 import logging
 import torch
+import shutil
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.parallel
@@ -39,8 +41,12 @@ parser.add_argument('--results_dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
-parser.add_argument('--print-freq', '-p', default=10, type=int,
+parser.add_argument('--exp-group', default=None,
+                    help='use a shared file to collect a group of experiment results')
+parser.add_argument('--print-freq', '-pf', default=100, type=int,
                     metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--ckpt-freq', '-cf', default=10, type=int,
+                    metavar='N', help='save checkpoint frequency (default: 10)')
 parser.add_argument('--seed', default=123, type=int,
                     help='random seed (default: 123)')
 ####OP MOD
@@ -83,14 +89,16 @@ parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
 parser.add_argument('--input_size', type=int, default=None,
                     help='image input size')
 parser.add_argument('--dist-set-size', default=None, type=int,
-                    help='number of examples for distilation training (default: 123)')
+                    help='limit number of examples per class for distilation training (default: None, use entire ds)')
 parser.add_argument('--distill-aug', nargs='+', type=str,help='use intermediate layer loss',choices=['cutout','ghost','normal'],default=None)
 parser.add_argument('--mixup', action='store_true',
                     help='use training examples mixup')
+parser.add_argument('--mixup_rate', default=0.5,
+                    help='mixup distribution parameter')
 parser.add_argument('--mix-target', action='store_true',
                     help='use target mixup')
 ###OPT
-parser.add_argument('--epochs', default=110, type=int, metavar='N',
+parser.add_argument('--epochs', default=60, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -101,15 +109,7 @@ parser.add_argument('--steps-per-epoch', default=None, type=int,
                          ' will cause training iterator to sample with replacement')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--optimizer', default='SGD', type=str, metavar='OPT',
-                    help='optimizer function used')
-parser.add_argument('--lr', '--learning_rate', default=0.1, type=float,
-                    metavar='LR', help='initial learning rate')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
-                    metavar='W', help='weight decay (default: 1e-4)')
-
+parser.add_argument('-r','--overwrite-regime',default=None, help='rewrite regime with external list of dicts "[{},{}...]"')
 ####MISC
 parser.add_argument('--pretrain', action='store_true',
                     help='preform layerwise pretraining session before full network distillation')
@@ -134,10 +134,15 @@ parser.add_argument('--order-weighted-loss', action='store_true',
                     help='loss is proportional to the teacher ordering')
 parser.add_argument('--ranking-loss', action='store_true',
                     help='use top1 ranking loss')
-parser.add_argument('--aux', choices=['kld','cos',None],default=None,
+parser.add_argument('--aux', choices=['mse','kld','cos','smoothl1'],default=None,
                     help='use intermediate layer loss')
-parser.add_argument('--kld-loss', action='store_true',
-                    help='use kld loss as main criterion')
+parser.add_argument('--loss', default='mse',choices=['mse','kld','smoothl1'],
+                    help='specify main loss criterion')
+parser.add_argument('--aux-loss-scale',default=1.0,
+                    help='overwrite aux loss scale')
+parser.add_argument('--loss-scale',default=1.0,
+                    help='overwrite loss scale')
+
 ####Distributed
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of distributed processes')
@@ -151,10 +156,11 @@ parser.add_argument('--dist-backend', default='nccl', type=str,
 def main():
     global args, best_prec1, dtype
     best_prec1 = 0
+    best_val_loss = 9999.9
     args = parser.parse_args()
     dtype = torch_dtypes.get(args.dtype)
     torch.manual_seed(args.seed)
-    time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     distributed = args.local_rank >= 0 or args.world_size > 1
     is_not_master = distributed and args.local_rank > 0
     if distributed:
@@ -167,13 +173,17 @@ def main():
             args.device_ids = list(range(torch.cuda.device_count()))
         else:
             args.device_ids = [args.local_rank]
-    if is_not_master:
-        torch.manual_seed(args.seed * (1+args.local_rank))
 
     # create model config
     logging.info("creating model %s", args.model)
     model_builder = models.__dict__[args.model]
-    model_config = {'input_size': args.input_size, 'dataset':  'imagenet' if args.dataset in ['imaginet','randomnet'] else args.dataset}
+    if args.dataset in ['imaginet', 'randomnet']:
+        model_ds_config='imagenet'
+    elif args.dataset in ['cifar10-raw','imagine-cifar10-r44']:
+        model_ds_config='cifar10'
+    else:
+        model_ds_config=args.dataset
+    model_config = {'input_size': args.input_size, 'dataset':  model_ds_config}
 
     if args.model_config is not '':
         model_config = dict(model_config, **literal_eval(args.model_config))
@@ -195,9 +205,16 @@ def main():
             fl=fl_layers,
             bn_mod=('_OTF' if args.otf else ('_absorb_bn' if args.absorb_bn else '_fresh_bn' if args.fresh_bn else '_bn')))
         # specific optimizations are stored per experiment
-        opt = model_config['regime']
-        if args.kld_loss:
-            opt += '_KLD_loss'
+        regime_name = '_' + model_config.get('regime', '')
+
+        if args.overwrite_regime:
+            opt = '_custom'+ regime_name
+        elif regime_name == '_':
+            opt = '_default'
+        else:
+            opt = regime_name
+
+        opt += f'_loss-{args.loss}'
         if args.pretrain:
             opt += '_pretrain'
         if args.aux:
@@ -216,10 +233,16 @@ def main():
             opt += '_free_weights'
         if args.use_softmax_scale:
             opt += '_tau'
+        if args.dist_set_size:
+            opt += f'_cls_lim_{args.dist_set_size}'
 
     args.results_dir = os.path.join(os.environ['HOME'],'experiment_results','quantized.pytorch.results')
+
     save_calibrated_path = os.path.join(args.results_dir,'distiller',args.dataset,args.save)
-    save_path = os.path.join(save_calibrated_path, time_stamp + '_' + opt)
+    if args.exp_group:
+        exp_group_path = os.path.join(save_calibrated_path,args.exp_group)
+
+    save_path = os.path.join(save_calibrated_path, time_stamp + opt)
     if not os.path.exists(save_path) and not is_not_master:
         os.makedirs(save_path)
 
@@ -228,9 +251,9 @@ def main():
                   dummy=is_not_master)
 
     results_path = os.path.join(save_path, 'results')
-    results = ResultsLog(
-        results_path, title='Training Results - %s' % opt,resume=args.resume)
-
+    if not is_not_master:
+        results = ResultsLog(
+            results_path, title='Training Results - %s' % opt,resume=args.resume,params=args)
 
     logging.info("saving to %s", save_path)
     logging.debug("run arguments: %s", args)
@@ -248,16 +271,15 @@ def main():
     teacher = model_builder(**model_config)
     logging.info("created teacher with configuration: %s", model_config)
     logging.debug(teacher)
-    teacher_checkpoint = torch.load(args.teacher)
     logging.info(f"loading teacher checkpoint {args.teacher}")
+    teacher_checkpoint = torch.load(args.teacher,map_location='cpu')
     if 'state_dict' in teacher_checkpoint:
-        logging.info("reported top 1 score {teacher_checkpoint['best_prec1']}")
+        logging.info(f"reference top 1 score {teacher_checkpoint['best_prec1']}")
         teacher_checkpoint = teacher_checkpoint['state_dict']
     teacher.load_state_dict(teacher_checkpoint)
     q_model_config=model_config.copy()
     q_model_config.update({'quantize': True})
-    if 'regime' not in q_model_config:
-        q_model_config.update({'regime': 'qdistil_pretrain' if args.pretrain else 'qdistil'})
+
     if 'weights_numbits' not in q_model_config:
         q_model_config.update({'weights_numbits':_DEFUALT_W_NBITS})
     if 'activations_numbits' not in q_model_config:
@@ -279,6 +301,12 @@ def main():
     logging.info("creating apprentice model with configuration: %s", q_model_config)
     model = model_builder(**q_model_config)
     logging.debug(model)
+
+    regime = literal_eval(args.overwrite_regime) if args.overwrite_regime else getattr(model, 'regime', [{'epoch': 0,
+                                                                                                          'optimizer': 'SGD',
+                                                                                                          'lr': 0.1,
+                                                                                                          'momentum': 0.9,
+                                                                                                          'weight_decay': 1e-4}])
     if args.absorb_bn and not args.otf:
         logging.info('freezing remaining batch normalization in student model')
         set_bn_is_train(model,False,logger=logging)
@@ -312,32 +340,36 @@ def main():
         mixer.to(args.device)
     else:
         mixer = None
-    regime = getattr(model, 'regime', [{'epoch': 0,
-                                        'optimizer': args.optimizer,
-                                        'lr': args.lr,
-                                        'momentum': args.momentum,
-                                        'weight_decay': args.weight_decay}])
-    # todo:
-    #   1. limit the train dataset to contain 10% of the origianl data set ## CHECK
-    #   2. class balance over fixed size ds ## CHECK
+
     train_data = get_dataset(args.dataset, 'train', transform['train'])
 
     if args.dist_set_size:
         # per samples size
-        ims = []
-        samples_per_class = args.dist_set_size
-        num_classes = len(train_data.classes)
-        for jj in range(num_classes):
-            tmpp = []
-            for s in train_data.samples:
-                if s[1] == jj:
-                    tmpp.append(s)
-            print('class', jj, len(tmpp))
-            els = torch.randperm(len(tmpp))[:samples_per_class].numpy().tolist()
-            ims += [tmpp[kk] for kk in els]
+        # ims = []
+        # samples_per_class = args.dist_set_size
+        # num_classes = len(train_data.classes)
+        # for jj in range(num_classes):
+        #     tmpp = []
+        #     for s in train_data.samples:
+        #         if s[1] == jj:
+        #             tmpp.append(s)
+        #     #print('class', jj, len(tmpp))
+        #     els = torch.randperm(len(tmpp))[:samples_per_class].numpy().tolist()
+        #     ims += [tmpp[kk] for kk in els]
+        #
+        #
+        # train_data.imgs = ims
+        # train_data.samples = train_data.imgs
+        train_data=limitDS(train_data,args.dist_set_size)
+        logging.info(f'total samples in train dataset {len(train_data.imgs)}')
+        if distributed:
+            print('verify distributed samples are the same!', train_data.imgs[:100])
 
-        train_data.imgs = ims
-        train_data.samples = train_data.imgs
+    if is_not_master and args.steps_per_epoch:
+        ## this ensures that all procesees work on the same sampled sub set data but with different samples per batch
+        logging.info('setting different seed per worker for random sampler use in distributed mode')
+        torch.manual_seed(args.seed * (1+args.local_rank))
+
     # todo p3:
     #   2. in-batch augmentation
     if args.steps_per_epoch > 0:
@@ -350,7 +382,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_data,sampler=sampler,
         batch_size=args.batch_size, shuffle=(sampler is None),
-        num_workers=args.workers, pin_memory=False,drop_last=(sampler is None))
+        num_workers=args.workers, pin_memory=False,drop_last=True)
 
     val_data = get_dataset(args.dataset, 'val', transform['eval'])
     val_loader = torch.utils.data.DataLoader(
@@ -365,44 +397,48 @@ def main():
 
         args.steps_per_epoch=len(train_loader)*repeat
         logging.info(f'total steps per epoch {args.steps_per_epoch}')
-
+    if hasattr(model, 'regime_epochs'):
+        args.epochs = model.regime_epochs
     if args.steps_limit:
-        args.epochs = 1+int(args.steps_limit / args.steps_per_epoch)
-
+        args.epochs = min(1+int(args.steps_limit / args.steps_per_epoch),args.epochs)
     logging.info(f'total epochs for training {args.epochs}')
 
     #pre_train_criterion = nn.MSELoss()
     pre_train_criterion = nn.KLDivLoss(reduction='mean')
     pre_train_criterion.to(args.device)
-    loss_scale = 1.0
-    aux_loss_scale=1.0
+    loss_scale = args.loss_scale
+    aux_loss_scale = args.aux_loss_scale
 
-    if args.kld_loss:
+    if args.loss=='kld':
         criterion = nn.KLDivLoss(reduction='mean')
-        loss_scale = model.fc.out_features/10
+    elif args.loss == 'smoothl1':
+        criterion = nn.SmoothL1Loss()
     else:
+        assert(args.loss=='mse')
         criterion = nn.MSELoss()
 
-    if args.aux  == 'kld' :
-        aux = nn.KLDivLoss(reduction='mean')
+    if args.aux:
+        if args.aux == 'kld' :
+            aux = nn.KLDivLoss(reduction='mean')
+        elif args.aux == 'cos':
+            aux = CosineSimilarityChannelWiseLoss()
+        elif args.aux == 'mse':
+            aux = nn.MSELoss()
+        elif args.aux == 'smoothl1':
+            aux = nn.SmoothL1Loss()
         aux.to(args.device)
-        aux_loss_scale = model.fc.out_features / 10
-    elif args.aux == 'cos':
-        aux = CosineSimilarityChannelWiseLoss()
-        aux.to(args.device)
-        aux_loss_scale = 0.05
 
     else:
-        aux=None
+        aux = None
 
     if args.order_weighted_loss:
-        loss_scale*=1000
+        loss_scale *= 1000
 
     criterion.to(args.device, dtype)
     # define loss function (criterion) and optimizer
     # valid_criterion = getattr(model, 'criterion', nn.CrossEntropyLoss)()
     # valid_criterion.to(args.device,dtype)
-    valid_criterion=criterion
+    valid_criterion = criterion
     teacher.eval()
     teacher.to(args.device, dtype)
 
@@ -448,7 +484,7 @@ def main():
             search_absorbe_bn(model,remove_bn=False)
         model.load_state_dict(teacher.state_dict(), strict=False)
         model.to(args.device, dtype)
-        model,_,acc = calibrate(model,args.dataset,transform,val_loader=val_loader,logging=logging)
+        model,_,acc = calibrate(model,args.dataset,transform,val_loader=val_loader,logging=logging,resample=200,sample_per_class=args.dist_set_size)
 
         student_checkpoint= teacher_checkpoint.copy()
         student_checkpoint.update({'config': q_model_config, 'state_dict': model.state_dict(),
@@ -473,7 +509,7 @@ def main():
             logging.info(f'bn will be absorbed at step {args.absorb_bn_step}')
 
     optimizer = OptimRegime(model, regime)
-    logging.info('training regime: %s', regime)
+    logging.info('start training with regime-\n'+('{}\n'*len(regime)).format(*[p for p in regime]))
     if args.otf:
         logging.info('updating batch norm learnable modifiers in student model')
         state = model.state_dict().copy()
@@ -517,25 +553,33 @@ def main():
         #     model.to(args.device)
         #     if epoch > 0:
         #         model,_,_=calibrate(model,args.dataset,transform,valid_criterion,val_loader=val_loader,logging=logging)
-
         train_loss, train_prec1, train_prec5 = train(
             train_loader, model, criterion, epoch, optimizer,teacher,
             aux=aux,loss_scale=loss_scale,aux_loss_scale=aux_loss_scale,mixer=mixer,quant_freeze_steps=args.quant_freeze_steps,
             dr_weight_freeze=not args.free_w_range,distributed=distributed)
 
-
         if (epoch +1) % repeat == 0:
             # evaluate on validation set
+            if is_not_master:
+                logging.debug('local rank {} done training'.format(args.local_rank))
+                continue
             val_loss, val_prec1, val_prec5 = validate(
                 val_loader, model, valid_criterion, epoch,teacher=teacher)
-            if is_not_master:
-                print('local rank {} done eval'.format(args.local_rank))
-                time.sleep(1)
-                continue
-            print('local rank {} is now saving'.format(args.local_rank))
+            if distributed:
+                logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
             # remember best prec@1 and save checkpoint
+            is_val_best=best_val_loss > val_loss
+            if is_val_best:
+                best_val_loss=val_loss
+                best_loss_epoch=epoch
+                best_loss_top1=val_prec1
+                best_loss_train=train_loss
             is_best = val_prec1 > best_prec1
+            if is_best:
+                best_epoch=epoch
+                val_best=val_loss
+                train_best=train_loss
             best_prec1 = max(val_prec1, best_prec1)
             save_checkpoint({
                 'epoch': epoch + 1,
@@ -544,7 +588,7 @@ def main():
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
                 'regime': regime
-            }, is_best, path=save_path,save_freq=5)
+            }, is_best, path=save_path,save_freq=args.ckpt_freq)
 
             logging.info('\n Epoch: {0}\t'
                          'Training Loss {train_loss:.4f} \t'
@@ -570,13 +614,38 @@ def main():
                          legend=['training', 'validation'],
                          title='Error@5', ylabel='error %')
             results.save()
-            print('local rank {} done saving. save time: {}'.format(args.local_rank,timer_save-time.time()))
-
+            # clear log file from PIL junk logging(blocking)
+            subprocess.call(f"sed -i \"/\bSTREAM\b/d\" {save_path}/log.txt", shell=True)
+            if distributed:
+                logging.debug('local rank {} done saving. save time: {}'.format(args.local_rank,time.time()-timer_save))
+    logging.info('Training-Summary:')
+    logging.info(f'best-top1:      {best_prec1:.2f}\tval-loss {val_best:.4f}\ttrain-loss {train_best:.4f}\tepoch {best_epoch}')
+    logging.info(f'best-loss-top1: {best_loss_top1:.2f}\tval-loss {best_val_loss:.4f}\ttrain-loss {best_loss_train:.4f}\tepoch {best_loss_epoch}')
+    logging.info('regime-\n'+('{}\n'*len(regime)).format(*[p for p in regime]))
+    save_path=shutil.move(save_path, save_path + f'_top1_{best_prec1:.2f}_loss_{val_best:.4f}_e{best_epoch}')
+    logging.info(f'logdir-{save_path}')
+    if args.exp_group:
+        logging.info(f'appending experiment result summary to {args.exp_group} experiment')
+        exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
+                                 resume=1,params=None)
+        summary={'best_acc_top1': best_prec1, 'best_acc_val': val_best, 'best_acc_train': train_best,
+         'best_acc_epoch': best_epoch,
+         'best_loss_top1': best_loss_top1, 'best_loss_val': best_val_loss, 'best_loss_train': best_loss_train,
+         'best_loss_epoch': best_loss_epoch,'save_path':save_path}
+        summary.update(dict(args._get_kwargs()))
+        exp_summary.add(**summary)
+        exp_summary.save()
+        # results.plot(x='epoch', y=['train_loss', 'val_loss'],
+        #              legend=['training', 'validation'],
+        #              title='Loss', ylabel='loss')
+        # os.popen(f'cat \"{save_path}, {regime}, {best_prec1:.2f}, {val_best:.4f}, {train_best:.4f}, {best_epoch:03},'
+        #          f' {best_loss_top1:.2f}, {best_val_loss:.4f}, {best_loss_train:.4f}, {best_loss_epoch}\" >> {}.csv')
+    os.popen(f'firefox {save_path}/results.html &')
 
 def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False):
     if aux:
         model = SubModules(model)
-        teacher = SubModules(teacher)
+        teacher = SubModules(teacher) if teacher else None
 
     modules = model._modules
     if distributed:
@@ -602,7 +671,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             for n, p in m.named_parameters():
                 if p.requires_grad:
                     # print(f'{k}.{n} shape {p.shape}')
-                    if aux_start==-1 and not is_bn(m):
+                    if aux_start == -1 and not is_bn(m):
                         logging.debug(f'aux loss will start at {r} for module {k} output')
                         aux_start = r
 
@@ -615,11 +684,11 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 
     end = time.time()
     _once = 1
-    steps_per_epoch=400#data_loader.sampler.num_samples//data_loader.batch_size
-    # if distributed:
-    #     print('local rank {} waiting on training barrier'.format(args.local_rank))
-    #     dist.barrier()
-    #     print('local rank {} start training\t'.format(args.local_rank))
+    if hasattr(data_loader.sampler,'num_samples'):
+        steps_per_epoch = data_loader.sampler.num_samples//data_loader.batch_size
+    else:
+        steps_per_epoch = len(data_loader)
+
     for i, (inputs, label) in enumerate(data_loader):
         if training:
             steps = epoch * steps_per_epoch + i
@@ -634,7 +703,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         label = label.to(args.device)
         if mixer:
             with torch.no_grad():
-                inputs = mixer(inputs,[0.7,inputs.size(0),True])
+                inputs = mixer(inputs,[args.mixup_rate,inputs.size(0),True])
         output_ = model(inputs)
         loss = torch.tensor(0.0).to(args.device)
         if teacher:
@@ -665,20 +734,19 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                     loss = loss + aux(a_o,a_t)* 2*(k-aux_start +1)/(num_outputs_for_aux**2+num_outputs_for_aux)
 
                 #keep last module output for final loss
-                output = output_[-1]
-                target = target_[-1]
+                output_ = output_[-1]
+                target_ = target_[-1]
 
+            ## normal distilation extract target
+            if isinstance(criterion, nn.KLDivLoss):
+                if args.use_softmax_scale:
+                    target_ /= model.tau
+                with torch.no_grad():
+                    target = F.softmax(target_, -1)
+                output = F.log_softmax(output_, -1)
             else:
-                ## normal distilation extract target
-                if isinstance(criterion, nn.KLDivLoss):
-                    if args.use_softmax_scale:
-                        target /= model.tau
-                    with torch.no_grad():
-                        target = F.softmax(target, -1)
-                    output = F.log_softmax(output, -1)
-                else:
-                    target = target_
-                    output = output_
+                target = target_
+                output = output_
         else:
             # use real labels as targets
             target = label
@@ -705,6 +773,8 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                 target = torch.mul(target,normalizing_sorting_scale)
             output = torch.mul(output,normalizing_sorting_scale)
 
+        loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
+
         if args.ranking_loss and training:
             topk=5
             with torch.no_grad():
@@ -727,8 +797,6 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             gt = torch.ones_like(x2)
             ranking_loss = nn.MarginRankingLoss()(x1,x2,gt)
             loss = loss + ranking_loss
-
-        loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
 
         if regularizer is not None:
             loss += regularizer(model)
@@ -773,7 +841,10 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,aux_start = 0,loss_scale=1.0,aux_loss_scale=1.0,quant_freeze_steps=-1,mixer=None,dr_weight_freeze=True,distributed=False):
     # switch to train mode
     model.train()
-    steps_per_epoch=400#data_loader.sampler.num_samples // data_loader.batch_size
+    if hasattr(data_loader.sampler, 'num_samples'):
+        steps_per_epoch = data_loader.sampler.num_samples // data_loader.batch_size
+    else:
+        steps_per_epoch = len(data_loader)
     if epoch * steps_per_epoch < quant_freeze_steps or quant_freeze_steps==-1:
         logging.info('freezing quant params{}'.format('' if dr_weight_freeze else ' NOT INCL WEIGHTS'))
         freeze_quant_params(model, freeze=True, include_param_dyn_range=dr_weight_freeze, logger=logging)
@@ -881,23 +952,19 @@ class SubModules(nn.Sequential):
         return output
 
 def limitDS(dataset,samples_per_class):
-    # balance dataset to contain specified number of samples per class
     ims = []
     num_classes = len(dataset.classes)
-    for jj in range(num_classes):
-        tmpp = []
-        for s in dataset.samples:
-            if s[1] == jj:
-                tmpp.append(s)
-        #print('class', jj, len(tmpp))
-        els = torch.randperm(len(tmpp))[:samples_per_class].numpy().tolist()
-        ims += [tmpp[kk] for kk in els]
+    samp_reg_per_class=[[]]*num_classes
 
+    for s in dataset.samples:
+        samp_reg_per_class[s[1]].append(s)
+    for jj in range(num_classes):
+        ims += samp_reg_per_class[jj][:samples_per_class]
     dataset.imgs = ims
     dataset.samples = dataset.imgs
     return dataset
 
-def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_size=256,workers=4,val_loader=None,sample_per_class=5,logging=None):
+def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_size=256,workers=4,val_loader=None,sample_per_class=-1,logging=None):
     if logging:
         logging.info("set measure mode")
     # set_bn_is_train(model,False)
