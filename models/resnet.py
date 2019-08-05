@@ -559,12 +559,12 @@ class ResNet_imagenet(ResNet):
             #samples_per_epoch = 131072
             #steps_per_epoch = samples_per_epoch//batch_size - 1
             self.regime = [
-                {'steps': 0, 'optimizer': 'LARC', 'trust_coefficient':trust_coef, 'clip': True,
+                {'step': 0, 'optimizer': 'LARC', 'trust_coefficient':trust_coef, 'clip': True,
                  #'step_lambda': ramp_up_lr(lr_start*1e-2, lr_start * scale_lr, steps_per_epoch * ramp_up_epochs / scale_lr)},
                  'lr': scale_lr * lr_start},
                  #{'epoch': ramp_up_epochs,  'lr': scale_lr * lr_start},
-                 {'steps': 20000,'clip': False, 'trust_coefficient':trust_coef / 10},
-                 {'steps': 40000, 'trust_coefficient':trust_coef / 20},
+                 {'step': 20000,'clip': False, 'trust_coefficient':trust_coef / 10},
+                 {'step': 40000, 'trust_coefficient':trust_coef / 20},
 
             ]
         elif 'qdistil_fast_sgd' == regime:
@@ -579,26 +579,26 @@ class ResNet_imagenet(ResNet):
             ramp_up_steps = 1000 #int(tot_steps * 0.05)
             # samples_per_epoch = 131072
             # self.regime = [
-            #     {'steps': 0, 'optimizer': 'SGD', 'step_lambda': ramp_up_lr(lr_start*1e-2, lr_start * scale_lr, ramp_up_steps // scale_lr),'momentum' : 0.85},
-            #     {'steps': ramp_up_steps,'lr' : lr_start * scale_lr},
-            #     #{'steps': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
-            #     {'steps': int(tot_steps * 0.25), 'lr' : lr_start * scale_lr * 1e-1},
-            #     {'steps': int(tot_steps * 0.7) , 'lr' : lr_start * scale_lr * 1e-2},
+            #     {'step': 0, 'optimizer': 'SGD', 'step_lambda': ramp_up_lr(lr_start*1e-2, lr_start * scale_lr, ramp_up_steps // scale_lr),'momentum' : 0.85},
+            #     {'step': ramp_up_steps,'lr' : lr_start * scale_lr},
+            #     #{'step': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
+            #     {'step': int(tot_steps * 0.25), 'lr' : lr_start * scale_lr * 1e-1},
+            #     {'step': int(tot_steps * 0.7) , 'lr' : lr_start * scale_lr * 1e-2},
             # ]
             # self.regime = [
-            #     {'steps': 0, 'optimizer': 'SGD', 'step_lambda': ramp_up_lr(lr_start*1e-2, lr_start * scale_lr, ramp_up_steps // scale_lr),'momentum' : 0.8},
-            #     {'steps': ramp_up_steps,'lr' : lr_start * scale_lr},
-            #     #{'steps': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
-            #     {'steps': 4633, 'lr' : lr_start * scale_lr * 1e-2},
-            #     {'steps': 12000 , 'lr' : lr_start * scale_lr * 1e-3},
+            #     {'step': 0, 'optimizer': 'SGD', 'step_lambda': ramp_up_lr(lr_start*1e-2, lr_start * scale_lr, ramp_up_steps // scale_lr),'momentum' : 0.8},
+            #     {'step': ramp_up_steps,'lr' : lr_start * scale_lr},
+            #     #{'step': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
+            #     {'step': 4633, 'lr' : lr_start * scale_lr * 1e-2},
+            #     {'step': 12000 , 'lr' : lr_start * scale_lr * 1e-3},
             # ]
             self.regime = [
-                {'steps': 0, 'optimizer': 'Adam', 'lr': lr_start * scale_lr, 'beta1':0.8},
-                #{'steps': ramp_up_steps,'lr' : lr_start * scale_lr},
-                #{'steps': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
-                {'steps': 4000, 'lr' : lr_start * scale_lr * 1e-1},
+                {'step': 0, 'optimizer': 'Adam', 'lr': lr_start * scale_lr, 'beta1':0.8},
+                #{'step': ramp_up_steps,'lr' : lr_start * scale_lr},
+                #{'step': 0, 'optimizer': 'SGD','lr' : lr_start * scale_lr },
+                {'step': 4000, 'lr' : lr_start * scale_lr * 1e-1},
                 # release q params at step 10000
-                {'optimizer': 'SGD','steps': 8000 , 'lr' : lr_start * scale_lr * 1e-2},
+                {'optimizer': 'SGD','step': 8000 , 'lr' : lr_start * scale_lr * 1e-2},
             ]
         elif 'qdistil_fast_sgd_hard' == regime:
             lr_start = 1e-3
@@ -610,16 +610,16 @@ class ResNet_imagenet(ResNet):
             max_replay = 10
             ramp_up_steps = 400
             self.regime = [
-                #{'steps': 0, 'optimizer': 'SGD', 'momentum' : 0.8,
-                 {'steps': 0, 'optimizer': 'Adam', 'beta1':0.8,
+                #{'step': 0, 'optimizer': 'SGD', 'momentum' : 0.8,
+                 {'step': 0, 'optimizer': 'Adam', 'beta1':0.8,
                 #'lr' : lr_start * scale_lr},
                 #'step_lambda': ramp_up_lr(lr_start * 1e-1, lr_start * scale_lr, ramp_up_steps // scale_lr)},
                 'step_lambda': exp_decay_lr(lr_start * scale_lr,lr_start * scale_lr * 1e-3,0,15000)},
-                #{'steps': ramp_up_steps, 'step_lambda': exp_decay_lr(lr_start * scale_lr,lr_start * scale_lr * 1e-2,ramp_up_steps,8000)},
-                #{'steps': ramp_up_steps,'lr' : lr_start * scale_lr},
-                #{'steps': 4000, 'lr' : lr_start * scale_lr * 1e-1},
+                #{'step': ramp_up_steps, 'step_lambda': exp_decay_lr(lr_start * scale_lr,lr_start * scale_lr * 1e-2,ramp_up_steps,8000)},
+                #{'step': ramp_up_steps,'lr' : lr_start * scale_lr},
+                #{'step': 4000, 'lr' : lr_start * scale_lr * 1e-1},
                 # release q params at step 6000
-                {'optimizer': 'SGD','steps': 16000 , 'lr' : lr_start * scale_lr * 1e-3, 'momentum' : 0.9,'dampning':0.1},
+                {'optimizer': 'SGD','step': 16000 , 'lr' : lr_start * scale_lr * 1e-3, 'momentum' : 0.9,'dampning':0.1},
             ]
         elif 'adam_exp_decay_1' == regime:
             lr_start = 1e-4
@@ -631,9 +631,9 @@ class ResNet_imagenet(ResNet):
             max_replay = 10
             ramp_up_steps = 400
             self.regime = [
-                 {'steps': 0, 'optimizer': 'Adam', 'beta1':0.8,
+                 {'step': 0, 'optimizer': 'Adam', 'beta1':0.8,
                 'step_lambda': exp_decay_lr(lr_start * scale_lr,lr_start * scale_lr * 1e-3,0,60*400)},
-                {'optimizer': 'SGD','steps': 60*400 , 'lr' : lr_start * scale_lr * 5e-4, 'momentum' : 0.1,'dampning':0.9},
+                {'optimizer': 'SGD','step': 60*400 , 'lr' : lr_start * scale_lr * 5e-4, 'momentum' : 0.1,'dampning':0.9},
             ]
         elif 'adam_drop_1' == regime:
             lr_start = 7e-4
@@ -645,10 +645,41 @@ class ResNet_imagenet(ResNet):
             max_replay = 10
             ramp_up_steps = 400
             self.regime = [
-                {'steps': 0, 'optimizer': 'Adam', 'beta1': 0.9,
+                {'step': 0, 'optimizer': 'Adam', 'beta1': 0.9,
                  'step_lambda': lr_drops(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 10000,2)},
-                {'optimizer': 'SGD', 'steps': 16000, 'lr': lr_start * scale_lr * 5e-3, 'momentum': 0.9,
+                {'optimizer': 'SGD', 'step': 16000, 'lr': lr_start * scale_lr * 5e-3, 'momentum': 0.9,
                  'dampning': 0.1},
+            ]
+        elif 'adam_cos_sgd_1' == regime:
+            lr_start = 1e-3
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = 9999999
+            self.absorb_bn_step = 18000
+            samples = 5200
+            batch_size = 128
+            max_replay = 10
+            ramp_up_steps = 400
+            self.regime = [
+                {'step': 0, 'optimizer': 'Adam', 'beta1': 0.9,
+                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 25*400,24)},
+                                #lr_drops(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 10000,2)},
+                {'optimizer': 'SGD', 'step': 25*400, 'lr': lr_start * scale_lr * 1e-2, 'momentum': 0.1,
+                 'dampning': 0.9},
+            ]
+        elif 'adam_cos_sgd_2' == regime:
+            lr_start = 1e-3
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = 9999999
+            self.absorb_bn_step = 18000
+            samples = 5200
+            batch_size = 128
+            max_replay = 10
+            ramp_up_steps = 400
+            self.regime = [
+                {'step': 0, 'optimizer': 'Adam', 'beta1': 0.9,
+                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 40 * 400, 39)},
+                # lr_drops(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 10000,2)},
+                {'optimizer': 'SGD', 'step': 40 * 400, 'lr': max(lr_start * scale_lr * 1e-2,1e-6), 'momentum': 0},
             ]
         elif 'sgd_drop_1' == regime:
             lr_start = 1e-4
@@ -660,9 +691,9 @@ class ResNet_imagenet(ResNet):
             max_replay = 10
             ramp_up_steps = 400
             self.regime = [
-                {'steps': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
-                 'step_lambda': lr_drops(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, 40*400,2)},
-                {'optimizer': 'SGD', 'steps': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
+                {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': lr_drops(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 45*400,2)},
+                {'optimizer': 'SGD', 'step': 45*400, 'lr': lr_start * scale_lr * 5e-3, 'momentum': 0.1,
                  'dampning': 0.9}
             ]
         elif 'sgd_exp_decay_1' == regime:
@@ -675,40 +706,72 @@ class ResNet_imagenet(ResNet):
             max_replay = 10
             ramp_up_steps = 400
             self.regime = [
-                {'steps': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
                  'step_lambda': exp_decay_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, 40*400)},
-                {'optimizer': 'SGD', 'steps': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
+                {'optimizer': 'SGD', 'step': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
                  'dampning': 0.9}
             ]
+        elif 'sgd_cos_staggerd_1' == regime:
+            self.epochs=60
+            steps_per_epoch=200
+            #start epoch,epochs,lr modifier
+            cos_drops=[(20,1),(20,1e-1),(10,1e-1)]
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = -1
+            self.regime = []
+            lr_start = 1e-3 * scale_lr
+            epoch_start=0
+            for epochs,lr_md in cos_drops:
+                lr_end=lr_start*lr_md
+                self.regime +=[{'step': epoch_start * steps_per_epoch, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start, lr_end, 0, epochs*steps_per_epoch,epochs-1)}]
+
+                lr_start=lr_end
+                epoch_start+=epochs
+            self.regime+=[{'step': epoch_start * steps_per_epoch, 'lr': lr_start}]
+
         elif 'sgd_cos_anneal_1' == regime:
-            lr_start = 1e-4
+            lr_start = 1e-3
             ## reference settings to fix training regime length in update steps
             self.quant_freeze_steps = 9999999
-            self.absorb_bn_step = 40*400
-            samples = 5200
-            batch_size = 128
-            max_replay = 10
-            ramp_up_steps = 400
+            self.absorb_bn_step = 400*40
+
             self.regime = [
-                {'steps': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
-                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, 40*400)},
-                {'optimizer': 'SGD', 'steps': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
-                 'dampning': 0.9}
+                {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, 40*400)},
+                {'step': 40*400, 'lr': lr_start * scale_lr * 1e-2,
+                 'momentum': 0,
+                 #'dampning': 0.9
+                 }
             ]
         elif 'sgd_cos_anneal_2' == regime:
-            lr_start = 1e-4
+            lr_start = 1e-3
+            step_lambda_epochs = 40
             ## reference settings to fix training regime length in update steps
-            self.quant_freeze_steps = 9999999
+            self.quant_freeze_steps = -1
             self.absorb_bn_step = 40*400
-            samples = 5200
-            batch_size = 128
-            max_replay = 10
-            ramp_up_steps = 400
             self.regime = [
-                {'steps': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
-                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, 40*400,40-1)},
-                {'optimizer': 'SGD', 'steps': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
-                 'dampning': 0.9}
+                {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-2, 0, step_lambda_epochs*400,step_lambda_epochs-1)},
+                {'step': step_lambda_epochs*400, 'lr': lr_start * scale_lr * 1e-2,
+                 'momentum': 0,
+                 #'dampning': 0.9
+                 }
+            ]
+        elif 'sgd_cos_anneal_3' == regime:
+            lr_start = 1e-3
+            step_lambda_epochs = 60
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = 40*400
+            self.regime = [
+                {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, step_lambda_epochs*400)},
+                {'step': step_lambda_epochs*400, 'lr': lr_start * scale_lr * 1e-3,
+                 'momentum': 0,
+                 #'dampning': 0.9
+                 }
             ]
         elif 'qdistil_absorbed_bn' == regime:
             lr_start = 1e-2
@@ -745,7 +808,7 @@ class ResNet_cifar(ResNet):
 
     def __init__(self, num_classes=10, inplanes=16,
                  block=BasicBlock, depth=18, width=[16, 32, 64],
-                 groups=[1, 1, 1], residual_block=None, regime='normal', dropout=None, mixup=False,absorb_bn = False,**kwargs):
+                 groups=[1, 1, 1], residual_block=None, regime='normal', dropout=None, mixup=False,absorb_bn = False,scale_lr=1.0,**kwargs):
         super(ResNet_cifar, self).__init__()
         self.inplanes = inplanes
         n = int((depth - 2) / 6)
@@ -787,6 +850,55 @@ class ResNet_cifar(ResNet):
                 {'epoch': 120, 'lr': 4e-3},
                 {'epoch': 160, 'lr': 8e-4}
             ]
+        elif 'sgd_cos_staggerd_1' == regime:
+            self.regime_epochs = 80
+            self.regime_steps_per_epoch = 200
+            #start epoch,epochs,lr modifier
+            warmup=(10,1e-8)
+            cos_drops=[(15,1),(40,1e-2)]
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = -1
+            self.regime = []
+            lr_start = 1e-3 * scale_lr
+            epoch_start=0
+            if warmup:
+                ramp_up_epochs,warmup_scale=warmup
+                self.regime += [{'step': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1,
+                                 'step_lambda': cosine_anneal_lr(lr_start*warmup_scale, lr_start,0, ramp_up_epochs*self.regime_steps_per_epoch)}]
+                epoch_start+=ramp_up_epochs
+            for epochs,lr_md in cos_drops:
+                lr_end=lr_start*lr_md
+                epoch_end=epoch_start+epochs
+                self.regime +=[{'step': epoch_start * self.regime_steps_per_epoch, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start, lr_end, epoch_start*self.regime_steps_per_epoch, epoch_end*self.regime_steps_per_epoch,epochs-1)}]
+                lr_start=lr_end
+                epoch_start=epoch_end
+
+            self.regime+=[{'step': epoch_start * self.regime_steps_per_epoch, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1, 'lr': lr_start}]
+
+        elif 'sgd_cos_1' == regime:
+            self.regime_epochs = 80
+            steps_per_epoch = 400
+            # start epoch,epochs,lr modifier
+            cos_drops = [(40, 1e-2)]
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = -1
+            self.regime = []
+            lr_start = 1e-3 * scale_lr
+            epoch_start = 0
+            for epochs, lr_md in cos_drops:
+                lr_end = lr_start * lr_md
+                epoch_end = epoch_start + epochs
+
+                self.regime += [
+                    {'step': epoch_start * steps_per_epoch, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1,
+                     'step_lambda': cosine_anneal_lr(lr_start, lr_end, 0, epochs * steps_per_epoch, epochs - 1)}]
+
+                lr_start = lr_end
+                epoch_start = epoch_end
+            self.regime += [{'step': epoch_start * steps_per_epoch, 'lr': lr_start}]
 
 def resnet(**config):
     dataset = config.get('dataset', 'imagenet')
