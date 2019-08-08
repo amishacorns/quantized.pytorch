@@ -37,6 +37,8 @@ model_names = sorted(name for name in models.__dict__
 
 parser = argparse.ArgumentParser(description='PyTorch ConvNet Training')
 ###GENERAL
+parser.add_argument('--args-from-file', default=None,
+                    help='load run arguments from file')
 parser.add_argument('--results_dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
@@ -82,7 +84,7 @@ parser.add_argument('--fresh-bn', action='store_true',
 parser.add_argument('--otf', action='store_true',
                     help='use on the fly absorbing batchnorm layers')
 ###DATA
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=3, type=int, metavar='N',
                     help='number of data loading workers (default: 8)')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
@@ -138,9 +140,9 @@ parser.add_argument('--aux', choices=['mse','kld','cos','smoothl1'],default=None
                     help='use intermediate layer loss')
 parser.add_argument('--loss', default='mse',choices=['mse','kld','smoothl1'],
                     help='specify main loss criterion')
-parser.add_argument('--aux-loss-scale',default=1.0,
+parser.add_argument('--aux-loss-scale',default=1.0,type=float,
                     help='overwrite aux loss scale')
-parser.add_argument('--loss-scale',default=1.0,
+parser.add_argument('--loss-scale',default=1.0,type=float,
                     help='overwrite loss scale')
 
 ####Distributed
@@ -158,6 +160,16 @@ def main():
     best_prec1 = 0
     best_val_loss = 9999.9
     args = parser.parse_args()
+    if args.args_from_file:
+        import json
+        with open(args.args_from_file,'r') as f :
+            args_l=json.load(f)
+            for key,value in args_l.items():
+                if key in ['save','device_id']:
+                    continue
+                assert key in args, f'loaded argument {key} does not exist in current version'
+                setattr(args,key,value)
+            print(args)
     dtype = torch_dtypes.get(args.dtype)
     torch.manual_seed(args.seed)
     time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -236,7 +248,7 @@ def main():
         if args.dist_set_size:
             opt += f'_cls_lim_{args.dist_set_size}'
 
-    args.results_dir = os.path.join(os.environ['HOME'],'experiment_results','quantized.pytorch.results')
+    #args.results_dir = os.path.join(os.environ['HOME'],'experiment_results','quantized.pytorch.results')
 
     save_calibrated_path = os.path.join(args.results_dir,'distiller',args.dataset,args.save)
     if args.exp_group:
@@ -388,7 +400,7 @@ def main():
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=args.batch_size*4, shuffle=False,
-        num_workers=args.workers, pin_memory=False,drop_last=False)
+        num_workers=2, pin_memory=False,drop_last=False)
 
     repeat = 1
     if args.steps_per_epoch < 0:
@@ -681,6 +693,8 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    aux_loss_mtr = AverageMeter()
+    ranking_loss_mtr = AverageMeter()
 
     end = time.time()
     _once = 1
@@ -772,7 +786,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                 ).unsqueeze(0).to(target.device)
                 target = torch.mul(target,normalizing_sorting_scale)
             output = torch.mul(output,normalizing_sorting_scale)
-
+        aux_loss_mtr.update(loss.item())
         loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
 
         if args.ranking_loss and training:
@@ -783,19 +797,20 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             x1,x2=None,None
             for k in range(topk):
                 with torch.no_grad():
-                    ids_top1= ids[:,k:1]
+                    ids_top1= ids[:,k:k+1]
                     ids_rest= ids[:,k+1:]
                     #calculate flat ids for slicing
-                    ids_top1_= torch.cat([s + k * target.size(1) for k, s in enumerate(ids_top1)])
-                    ids_rest_ = torch.cat([s + k * target.size(1) for k, s in enumerate(ids_rest)])
+                    ids_top1_= torch.cat([s + r * target.size(1) for r, s in enumerate(ids_top1)])
+                    ids_rest_ = torch.cat([s + r * target.size(1) for r, s in enumerate(ids_rest)])
                 if x1 is None:
                     x1 = output_flat[ids_top1_].unsqueeze(1).repeat(1,target.size(1)-1)
                     x2 = output_flat[ids_rest_].reshape((target.size(0),-1))
                 else:
-                    x1 = torch.cat(x1,output_flat[ids_top1_].unsqueeze(1).repeat(1, target.size(1) - 1))
+                    x1 = torch.cat(x1,output_flat[ids_top1_].unsqueeze(1).repeat(1, target.size(1) - k - 1))
                     x2 = torch.cat(x2,output_flat[ids_rest_].reshape((target.size(0), -1)))
             gt = torch.ones_like(x2)
             ranking_loss = nn.MarginRankingLoss()(x1,x2,gt)
+            ranking_loss_mtr.update(ranking_loss.item())
             loss = loss + ranking_loss
 
         if regularizer is not None:
@@ -825,16 +840,18 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 
         if i % args.print_freq == 0:
             logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
-                         'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                         'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                         'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                         'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                         'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                         'Time ({batch_time.avg:.3f}) {batch_time.var:.3f}\t'
+                         'Data ({data_time.avg:.3f}) {data_time.var:.3f}\t'
+                         'Loss ({loss.avg:.4f}) {loss.var:.3f} \t'
+                         'Prec@1 ({top1.avg:.3f}) {top1.var:.3f} \t'
+                         'Prec@5 ({top5.avg:.3f} {top5.var:.3f} )'.format(
                 epoch, i, len(data_loader),
                 phase='TRAINING' if training else 'EVALUATING',
                 steps=f'Train steps: {steps}\t' if training else '',
                 batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5))
+                data_time=data_time, loss=losses, top1=top1, top5=top5)+
+                         f'\taux_loss {aux_loss_mtr.avg:0.4f}({aux_loss_mtr.var:0.3f})'
+                         f'\tranking loss {ranking_loss_mtr.avg:0.4f}({ranking_loss_mtr.var:0.3f})')
 
     return losses.avg, top1.avg, top5.avg
 
