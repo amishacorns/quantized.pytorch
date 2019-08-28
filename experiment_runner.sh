@@ -135,11 +135,25 @@ then
 elif [ $EXP -eq 41 ]
 then
     ##### EXP=4 - compare data impact mixup
+    # subset for kld aux loss
     EXP_G='data_size'
     BN_MOD_C=('@')
     DATA_SIZE_C=(1 10 50 100 500 1000 2000)
     AUX_C=('kld')
-    AUX_SCALE_C=(0.01 0.005)
+    AUX_SCALE_C=(0.05 0.01 0.005) #0.05 excluded
+    LOSS_C=('kld')
+    LR_C=(100)
+    MIXUP_C=('@' '--mixup')
+    #####
+elif [ $EXP -eq 411 ]
+then
+    ##### EXP=4 - compare data impact mixup
+    #subset no aux loss
+    EXP_G='data_size'
+    BN_MOD_C=('@' '--fresh-bn')
+    DATA_SIZE_C=(1 10 50 100 500 1000 2000)
+    AUX_C=('@')
+    #AUX_SCALE_C=(0.05 0.01 0.005) #0.05 excluded
     LOSS_C=('kld')
     LR_C=(100)
     MIXUP_C=('@' '--mixup')
@@ -205,14 +219,16 @@ echo dataset: $DATASET
                 echo '>' enter gpu allocation block
                 while [ `nvidia-smi | grep python| wc -l` -ge $EXP_HOLD_EVERY ]
                 do
-                    sleep 5
+                    t=`bc -l <<< "scale=4; 5+${RANDOM}/32767"`
+                    sleep $t
                 done
 
                 while [ `nvidia-smi | grep python | grep " $GPU_ID " | wc -l` -ge $N_EXP_PER_GPU ]
                 do
                     let GPU_ID=$GPU_ID+1
                     let GPU_ID=$GPU_ID%${#DEVICE_ID_C[@]}
-                    sleep 1
+                    t=`bc -l <<< "scale=4; 1+${RANDOM}/32767"`
+                    sleep $t
                     echo '>' gpu "$GPU_ID" is running `nvidia-smi | grep python| grep " $GPU_ID "| wc -l` python tasks
                 done
                 echo '>' found open GPU "$GPU_ID"
