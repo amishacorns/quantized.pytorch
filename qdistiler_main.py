@@ -191,7 +191,7 @@ def main():
     model_builder = models.__dict__[args.model]
     if args.dataset in ['imaginet', 'randomnet']:
         model_ds_config='imagenet'
-    elif args.dataset in ['cifar10-raw','imagine-cifar10-r44']:
+    elif 'cifar10' in args.dataset:
         model_ds_config='cifar10'
     else:
         model_ds_config=args.dataset
@@ -353,29 +353,7 @@ def main():
     else:
         mixer = None
 
-    train_data = get_dataset(args.dataset, 'train', transform['train'])
-
-    if args.dist_set_size:
-        # per samples size
-        # ims = []
-        # samples_per_class = args.dist_set_size
-        # num_classes = len(train_data.classes)
-        # for jj in range(num_classes):
-        #     tmpp = []
-        #     for s in train_data.samples:
-        #         if s[1] == jj:
-        #             tmpp.append(s)
-        #     #print('class', jj, len(tmpp))
-        #     els = torch.randperm(len(tmpp))[:samples_per_class].numpy().tolist()
-        #     ims += [tmpp[kk] for kk in els]
-        #
-        #
-        # train_data.imgs = ims
-        # train_data.samples = train_data.imgs
-        train_data=limitDS(train_data,args.dist_set_size)
-        logging.info(f'total samples in train dataset {len(train_data.imgs)}')
-        if distributed:
-            print('verify distributed samples are the same!', train_data.imgs[:100])
+    train_data = get_dataset(args.dataset, 'train', transform['train'],limit=args.dist_set_size)
 
     if is_not_master and args.steps_per_epoch:
         ## this ensures that all procesees work on the same sampled sub set data but with different samples per batch
@@ -551,7 +529,8 @@ def main():
             pass
 
     for epoch in range(args.start_epoch , args.epochs):
-        # train for one epoch
+        ## train for one epoch
+        ## absorb bn after absorb bn steps of training
         # if not args.absorb_bn and -1 < args.absorb_bn_step == args.steps_per_epoch*epoch:
         #     logging.info(f'step {epoch*len(train_loader)} absorbing batchnorm layers')
         #     if epoch>0:
@@ -580,6 +559,10 @@ def main():
             if distributed:
                 logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
+            ## clear log file from PIL junk logging(blocking)
+            # blocking call
+            # subprocess.call("sed '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path), shell=True)
+            cleanup_proc=subprocess.popen("sed '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path))
             # remember best prec@1 and save checkpoint
             is_val_best=best_val_loss > val_loss
             if is_val_best:
@@ -601,7 +584,7 @@ def main():
                 'best_prec1': best_prec1,
                 'regime': regime
             }, is_best, path=save_path,save_freq=args.ckpt_freq)
-
+            cleanup_proc.wait()
             logging.info('\n Epoch: {0}\t'
                          'Training Loss {train_loss:.4f} \t'
                          'Training Prec@1 {train_prec1:.3f} \t'
@@ -626,13 +609,17 @@ def main():
                          legend=['training', 'validation'],
                          title='Error@5', ylabel='error %')
             results.save()
-            # clear log file from PIL junk logging(blocking)
-            subprocess.call(f"sed -i \"/\bSTREAM\b/d\" {save_path}/log.txt", shell=True)
             if distributed:
                 logging.debug('local rank {} done saving. save time: {}'.format(args.local_rank,time.time()-timer_save))
-    logging.info('Training-Summary:')
+    scores=results.results['val_error1'].to_numpy()
+    scores.sort()
+    scores=scores[:5]
+    #calc stats for 5 best scores
+    smth_top1_avg,smth_top1_std=scores.mean(),scores.std()
+    logging.info(f'Training-Summary:')
     logging.info(f'best-top1:      {best_prec1:.2f}\tval-loss {val_best:.4f}\ttrain-loss {train_best:.4f}\tepoch {best_epoch}')
     logging.info(f'best-loss-top1: {best_loss_top1:.2f}\tval-loss {best_val_loss:.4f}\ttrain-loss {best_loss_train:.4f}\tepoch {best_loss_epoch}')
+    logging.info(f'smoothed top1:\tmean {smth_top1_avg:0.4f}\tstd {smth_top1_std:0.4f}')
     logging.info('regime-\n'+('{}\n'*len(regime)).format(*[p for p in regime]))
     save_path=shutil.move(save_path, save_path + f'_top1_{best_prec1:.2f}_loss_{val_best:.4f}_e{best_epoch}')
     logging.info(f'logdir-{save_path}')
@@ -640,7 +627,8 @@ def main():
         logging.info(f'appending experiment result summary to {args.exp_group} experiment')
         exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
                                  resume=1,params=None)
-        summary={'best_acc_top1': best_prec1, 'best_acc_val': val_best, 'best_acc_train': train_best,
+        summary={'top1_smooth_mean':smth_top1_avg,'top1_smooth_std':smth_top1_std,
+                 'best_acc_top1': best_prec1, 'best_acc_val': val_best, 'best_acc_train': train_best,
          'best_acc_epoch': best_epoch,
          'best_loss_top1': best_loss_top1, 'best_loss_val': best_val_loss, 'best_loss_train': best_loss_train,
          'best_loss_epoch': best_loss_epoch,'save_path':save_path}
@@ -650,8 +638,7 @@ def main():
         # results.plot(x='epoch', y=['train_loss', 'val_loss'],
         #              legend=['training', 'validation'],
         #              title='Loss', ylabel='loss')
-        # os.popen(f'cat \"{save_path}, {regime}, {best_prec1:.2f}, {val_best:.4f}, {train_best:.4f}, {best_epoch:03},'
-        #          f' {best_loss_top1:.2f}, {best_val_loss:.4f}, {best_loss_train:.4f}, {best_loss_epoch}\" >> {}.csv')
+
     os.popen(f'firefox {save_path}/results.html &')
 
 def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False):
@@ -968,19 +955,6 @@ class SubModules(nn.Sequential):
             output.append(input)
         return output
 
-def limitDS(dataset,samples_per_class):
-    ims = []
-    num_classes = len(dataset.classes)
-    samp_reg_per_class=[[]]*num_classes
-
-    for s in dataset.samples:
-        samp_reg_per_class[s[1]].append(s)
-    for jj in range(num_classes):
-        ims += samp_reg_per_class[jj][:samples_per_class]
-    dataset.imgs = ims
-    dataset.samples = dataset.imgs
-    return dataset
-
 def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_size=256,workers=4,val_loader=None,sample_per_class=-1,logging=None):
     if logging:
         logging.info("set measure mode")
@@ -988,8 +962,8 @@ def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_si
     set_measure_mode(model, True, logger=logging)
     if logging:
         logging.info("calibrating model to get quant params")
-    calibration_data = get_dataset(dataset, 'train', transform['train'])
-    calibration_data = limitDS(calibration_data, sample_per_class)
+    calibration_data = get_dataset(dataset, 'train', transform['train'],limit=sample_per_class)
+    # calibration_data = limitDS(calibration_data, sample_per_class)
     if resample>0:
         cal_sampler = torch.utils.data.RandomSampler(calibration_data, replacement=True,
                                                      num_samples=resample * batch_size)
