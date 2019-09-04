@@ -92,6 +92,10 @@ parser.add_argument('--input_size', type=int, default=None,
                     help='image input size')
 parser.add_argument('--dist-set-size', default=None, type=int,
                     help='limit number of examples per class for distilation training (default: None, use entire ds)')
+parser.add_argument('--calibration-set-size', default=500, type=int,
+                    help='limit number of examples per class for distilation training (default: None, use entire ds)')
+parser.add_argument('--recalibrate', action='store_true',
+                    help='use training examples mixup')
 parser.add_argument('--distill-aug', nargs='+', type=str,help='use intermediate layer loss',choices=['cutout','ghost','normal'],default=None)
 parser.add_argument('--mixup', action='store_true',
                     help='use training examples mixup')
@@ -460,8 +464,9 @@ def main():
                          checkpoint_file, checkpoint['epoch'])
         else:
             logging.error("no checkpoint found at '%s'", args.resume)
+            exit(1)
 
-    elif os.path.isfile(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar')):
+    elif not args.recalibrate and os.path.isfile(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar')):
         student_checkpoint = torch.load(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar'),'cpu')
         logging.info(f"loading pre-calibrated quantized model from {save_calibrated_path}, reported top 1 score {student_checkpoint['best_prec1']}")
         if args.fresh_bn:
@@ -474,7 +479,7 @@ def main():
             search_absorbe_bn(model,remove_bn=False)
         model.load_state_dict(teacher.state_dict(), strict=False)
         model.to(args.device, dtype)
-        model,_,acc = calibrate(model,args.dataset,transform,val_loader=val_loader,logging=logging,resample=200,sample_per_class=args.dist_set_size)
+        model,_,acc = calibrate(model,args.dataset,transform,val_loader=val_loader,logging=logging,resample=200,sample_per_class=args.calibration_set_size)
 
         student_checkpoint= teacher_checkpoint.copy()
         student_checkpoint.update({'config': q_model_config, 'state_dict': model.state_dict(),
