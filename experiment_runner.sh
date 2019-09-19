@@ -8,27 +8,50 @@ then echo '';
 else echo $2 $1;
 fi; }
 
+function arr_to_str_delim() {
+tmp=$0
+for i in ${0[@]:1}; do tmp="$tmp$1$i"; done
+echo $tmp
+ }
+RUNNING_PROCS=()
 #set -x
 #set -e
 #general settings
-DEVICE_ID_C=(0 1 2 3)
-N_EXP_PER_GPU=2
-#assuming all experiments take the same time
-let EXP_HOLD_EVERY=$N_EXP_PER_GPU*${#DEVICE_ID_C[@]}
-echo "> running "$EXP_HOLD_EVERY" experiments in parallel"
-T_W_PATH=results/resnet44_cifar10/model_best.pth.tar
-#STEP_LIMIT="--steps-limit 16000"
-##### default settings
 #script accepts experiment ÍD argument
+
+##### default settings
+#STEP_LIMIT="--steps-limit 16000"
+DEVICE_ID_C=(0 1 2 3)
+EXP_RUNNER_LOGDIR='exp_runner_logs'
+N_EXP_PER_GPU=2
 EXP=${1:-1}
 DATASET_C=('cifar10-raw')
 DATA_SIZE_C=('@')
-AUX_C=('@')
+AUX_C=('smoothl1')
 BN_MOD_C=('@')
-LOSS_C=('mse')
-LR_C=(1.)
-MIXUP_C=('@')
-AUX_SCALE_C=('@')
+LOSS_C=('kld')
+LR_C=(100.)
+MIXUP_C=('--mixup')
+SEED_C=(123)
+AUX_SCALE_C=(0.01)
+BATCH_SIZE=512
+W_BITS=2
+ACT_BITS=4
+W_RANGE_MOD='--free-w-range'
+T_W_PATH=results/resnet44_cifar10/model_best.pth.tar
+EXT_MODEL_CFG=
+DEPTH=44
+##### BEGIN
+if [ ! -d $EXP_RUNNER_LOGDIR ]
+then mkdir -p $EXP_RUNNER_LOGDIR
+fi
+
+x=$DEVICE_ID_C
+for i in ${DEVICE_ID_C[@]:1}; do x=$x,$i; done
+export CUDA_VISIBLE_DEVICES=$x
+let EXP_HOLD_EVERY=$N_EXP_PER_GPU*${#DEVICE_ID_C[@]}
+echo "> running up to $EXP_HOLD_EVERY experiments in parallel"
+
 if [ $EXP -eq 1 ]
 then
     ##### EXP=1 - find best lr per loss function
@@ -123,14 +146,16 @@ then
 elif [ $EXP -eq 4 ]
 then
     ##### EXP=4 - compare data impact mixup
-    EXP_G='data_size'
+    DATASET_C=('imagine-cifar10-r44-no_dd_r10' 'imagine-cifar10-r44-no_dd_r50' 'imagine-cifar10-r44-no_dd_r100' 'imagine-cifar10-r44-no_dd_r500' 'imagine-cifar10-r44-no_dd_r1000' )
+    EXP_G='data_size_new'
     BN_MOD_C=('@') #todo best from exp 2 --fresh-bn
-    DATA_SIZE_C=(1 10 50 100 500 1000 2000)
-    AUX_C=('smoothl1' 'cos')
-    AUX_SCALE_C=(0.01 0.005) #todo best from exp3
+    DATA_SIZE_C=(1 10 50 100 500 1000 2000 3000 4000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01) #todo best from exp3
     LOSS_C=('kld') #todo best from exp3
     LR_C=(100)
-    MIXUP_C=('@' '--mixup') #mixup is generally better
+    MIXUP_C=('--mixup') #mixup is generally better
+    SEED_C=(1 2 3 4 5)
     #####
 elif [ $EXP -eq 41 ]
 then
@@ -158,49 +183,190 @@ then
     LR_C=(100)
     MIXUP_C=('@' '--mixup')
     #####
+elif [ $EXP -eq 5 ]
+then
+    EXP_G='quality_calibration'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('cifar10-raw' 'imagine-cifar10-r44-dd_r100' 'imagine-cifar10-r44-dd_r500' 'imagine-cifar10-r44-dd_r1000' 'imagine-cifar10-r44-no_dd_r100' 'imagine-cifar10-r44-no_dd_r500' 'imagine-cifar10-r44-no_dd_r1000')
+    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    W_BITS=4
+    SEED_C=(1 2 3 4 5)
+    N_EXP_PER_GPU=4
+elif [ $EXP -eq 501 ]
+then
+    EXP_G='quality_calibration'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('imagine-cifar10-r44-no_bn_r100')
+    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    W_BITS=4
+    SEED_C=(1 2 3 4 5)
+    N_EXP_PER_GPU=4
+elif [ $EXP -eq 502 ]
+then
+    EXP_G='quality_calibration'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('random-cifar10')
+    EXT_FLAGS="--recalibrate --calibration-set-size 50000 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    W_BITS=4
+    SEED_C=(1 2 3 4 5)
+    N_EXP_PER_GPU=4
+elif [ $EXP -eq 511 ]
+then
+    EXP_G='quality_calibration_cifar100'
+    N_EXP_PER_GPU=2
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('random-cifar100')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5000 --shuffle-calibration-steps 200"
+    DATA_SIZE_C=(5000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    LR_C=(50)
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DEPTH=28
+    W_RANGE_MOD=
+    BATCH_SIZE=256
+    W_BITS=4
+    SEED_C=(1 2 3 4 5)
+elif [ $EXP -eq 512 ]
+then
+    EXP_G='quality_calibration_cifar100'
+    N_EXP_PER_GPU=2
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' 'crossover@cifar100@imagine-cifar10-r44-dd_r1000' 'crossover@cifar100@imagine-cifar10-r44-no_bn_r100')
+    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
+    DATA_SIZE_C=(5000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    LR_C=(50)
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DEPTH=28
+    W_RANGE_MOD=
+    BATCH_SIZE=256
+    W_BITS=4
+    SEED_C=(1 2 3 4 5)
+elif [ $EXP -eq 6 ]
+then
+    EXP_G='quality_distilation'
+    DATASET_C=('imagine-cifar10-r44-r1k' 'imagine-cifar10-r44-r5k' 'imagine-cifar10-r44-r10k' 'imagine-cifar10-r44-r15k')
+    DATA_SIZE_C=(4000 5000 6000)
+elif [ $EXP -eq 0 ]
+then
+    EXP_G='compare_gen_methods'
+    DATASET_C=('imagine-cifar10-r44-no_dd_r100' 'imagine-cifar10-r44-no_dd_r500' 'imagine-cifar10-r44-no_dd_r1000')
+    DATA_SIZE_C=(2000) #(4000 5000 6000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    SEED_C=(1 2 3 4 5)
+elif [ $EXP -eq 9 ]
+then
+    EXP_G='compare_gen_methods'
+    DATASET_C=('imagine-cifar10-r44-dd_r100' 'imagine-cifar10-r44-dd_r500' 'imagine-cifar10-r44-dd_r1000')
+    DATA_SIZE_C=(1000 2000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    SEED_C=(1) #2 3 4 5)
+
+elif [ $EXP -eq 123 ]
+then
+    EXP_G='cifar-100'
+    DATASET_C=('imagine-cifar100-wr28-10-no_dd_r500')
+    DATA_SIZE_C=(100)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    LR_C=(10 50)
+    SEED_C=(1) #2 3 4 5)
+    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DEPTH=28
+    BATCH_SIZE=256
+    W_BITS=4
+    W_RANGE_MOD=
+elif [ $EXP -eq 666 ]
+then
+    #cross over cifar10 datasets to cifat100
+    EXP_G='cross-over_cifar10-cifar-100'
+    DATASET_C=('crossover@cifar100@cifar10-raw' 'crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' )
+    DATA_SIZE_C=(5000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    LR_C=(50)
+    SEED_C=(1) #2 3 4 5)
+    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DEPTH=28
+    BATCH_SIZE=256
+    W_BITS=4
+    W_RANGE_MOD=
+elif [ $EXP -eq 6661 ]
+then
+    #cross over cifar10 datasets to cifat100
+    EXP_G='cross-over_cifar10-cifar-100'
+    DATASET_C=('crossover@cifar100@imagine-cifar10-r44-no_bn_r100') #crossover@cifar100@cifar10-raw'  'crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' )
+    DATA_SIZE_C=(5000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01)
+    LR_C=(50)
+    SEED_C=(1) #2 3 4 5)
+    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DEPTH=28
+    BATCH_SIZE=256
+    W_BITS=4
+    W_RANGE_MOD=
 else
     echo '> experiment ID not defined'
     exit 0
 fi
 
-let TOT_EXP_TO_RUN=${#MIXUP_C[@]}*${#BN_MOD_C[@]}*${#DATA_SIZE_C[@]}*${#AUX_C[@]}*${#AUX_SCALE_C[@]}*${#LR_C[@]}*${#LOSS_C[@]}
+let TOT_EXP_TO_RUN=`echo "${#MIXUP_C[@]}*${#BN_MOD_C[@]}*${#DATA_SIZE_C[@]}*${#AUX_C[@]}*${#AUX_SCALE_C[@]}*${#LR_C[@]}*${#LOSS_C[@]}*${#SEED_C[@]}"`
 echo '>' running exp set $EXP with $TOT_EXP_TO_RUN configurations
 EXP_COUNT=0
 
 for DATASET in ${DATASET_C[@]}
 do
-echo dataset: $DATASET
+    for SEED in ${SEED_C[@]}
+    do
     for SIZE in ${DATA_SIZE_C[@]}
     do
-        echo samples per class: $SIZE
+
 
         for BN_MOD in ${BN_MOD_C[@]}
         do
-        echo bn mod: $BN_MOD
 
         for LOSS in ${LOSS_C[@]}
         do
-        echo loss: $LOSS
 
         for AUX in ${AUX_C[@]}
         do
-        echo aux: $AUX
 
         for MIX in ${MIXUP_C[@]}
         do
-        echo mixup: $MIX
 
         for LR in ${LR_C[@]}
         do
-        echo lr_scale: $LR
 
         for AUX_S in ${AUX_SCALE_C[@]}
         do
-        echo aux_scale: $AUX_S
         #    if (( ($EXP_COUNT % $EXP_HOLD_EVERY) == 0 ))
         #    then BG='';
         #    else BG='&';
         #    fi;
+            echo dataset: $DATASET
+            echo $SEED
+            echo samples per class: $SIZE
+            echo bn mod: $BN_MOD
+            echo loss: $LOSS
+            echo aux: $AUX
+            echo mixup: $MIX
+            echo lr_scale: $LR
+            echo aux_scale: $AUX_S
             BG='&'
             # get valid experiment flags
             AUX_=`getarg $AUX "--aux"`
@@ -212,46 +378,65 @@ echo dataset: $DATASET
             echo init allocation loop
 
             # find a free gpu for experiment
-            let GPU_ID=0 # $EXP_COUNT%${#DEVICE_ID_C[@]}
+            GPU_ID=0
+            GPU=${DEVICE_ID_C[0]}
             esc=1
             while [ $esc ]
             do
                 echo '>' enter gpu allocation block
-                while [ `nvidia-smi | grep python| wc -l` -ge $EXP_HOLD_EVERY ]
+                tmp=$RUNNING_PROCS
+                for i in ${RUNNING_PROCS[@]:1}; do tmp="$tmp|$i"; done
+                echo $tmp
+                #check how many processes where lunched
+                while [ ${#RUNNING_PROCS[@]} -gt 0 -a `nvidia-smi | grep -E "$tmp" | wc -l` -ge $EXP_HOLD_EVERY ]
                 do
-                    t=`bc -l <<< "scale=4; 5+${RANDOM}/32767"`
-                    sleep $t
+                    #t=`bc -l <<< "scale=4; 5+${RANDOM}/32767"`
+                    #sleep $t
+                    sleep 5
                 done
 
-                while [ `nvidia-smi | grep python | grep " $GPU_ID " | wc -l` -ge $N_EXP_PER_GPU ]
+                while [ `nvidia-smi | grep python | grep " $GPU " | wc -l` -ge $N_EXP_PER_GPU ]
                 do
                     let GPU_ID=$GPU_ID+1
                     let GPU_ID=$GPU_ID%${#DEVICE_ID_C[@]}
-                    t=`bc -l <<< "scale=4; 1+${RANDOM}/32767"`
-                    sleep $t
-                    echo '>' gpu "$GPU_ID" is running `nvidia-smi | grep python| grep " $GPU_ID "| wc -l` python tasks
+                    GPU=${DEVICE_ID_C[$GPU_ID]}
+                    echo '>' gpu "$GPU" is running `nvidia-smi | grep python| grep " $GPU "| wc -l` python tasks
+                    if [ $GPU_ID -eq 0 ]
+                    then sleep 5
+                    fi
                 done
-                echo '>' found open GPU "$GPU_ID"
+                echo '>' found open GPU "$GPU"
 
-                if [ `nvidia-smi | grep python| grep " $GPU_ID " | wc -l` -lt $N_EXP_PER_GPU ]
+                if [ `nvidia-smi | grep python| grep " $GPU " | wc -l` -lt $N_EXP_PER_GPU ]
                 then
                     echo '>' leaving gpu allocation block
                     esc=0
                     break
                 fi
             done
+            echo $EXP_G
+            echo dataset: $DATASET
+            echo $SEED
+            echo samples per class: $SIZE
+            echo bn mod: $BN_MOD
+            echo loss: $LOSS
+            echo aux: $AUX
+            echo mixup: $MIX
+            echo lr_scale: $LR
+            echo aux_scale: $AUX_S
 
-            M_CFG="{'depth': 44, 'regime':'sgd_cos_staggerd_1', 'conv1':{'a': 4,'w':4},'fc':{'a': 4,'w':4}, 'activations_numbits':4,'weights_numbits':2, 'bias_quant':False $LR_}"
+            M_CFG="{'depth': $DEPTH, 'regime':'sgd_cos_staggerd_1', 'conv1':{'a': 4,'w':4},'fc':{'a': 4,'w':4}, 'activations_numbits':$ACT_BITS,'weights_numbits':$W_BITS, 'bias_quant':False $LR_ $EXT_MODEL_CFG}"
             echo '>' start experiment $EXP_COUNT' / '$TOT_EXP_TO_RUN, cfg: $M_CFG
             eval python qdistiler_main.py --model resnet --model_config '"$M_CFG"'  --teacher $T_W_PATH --dataset $DATASET \
-            --train-first-conv --steps-per-epoch 200 --quant-freeze-steps -1 --b 512 --device_ids $GPU_ID --free-w-range \
+            --train-first-conv --steps-per-epoch 200 --quant-freeze-steps -1 --b $BATCH_SIZE --device_ids $GPU_ID $W_RANGE_MOD \
             $SIZE_ --exp-group $EXP_G $AUX_ --loss $LOSS $STEP_LIMIT $BN_MOD_ $AUX_S_ $MIX_\
-            --print-freq 100 2> $EXP'_'$EXP_COUNT'_stderr.log' $BG
-            echo "> pid for exp $EXP_COUNT $!"
+            $EXT_FLAGS --print-freq 100 --seed $SEED 2> $EXP_RUNNER_LOGDIR/$EXP'_'$EXP_COUNT'_stderr.log' $BG
+            EXP_PROC="$!"
+            echo "> pid for exp $EXP_COUNT $EXP_PROC"
             let EXP_COUNT=$EXP_COUNT+1
-
+            RUNNING_PROCS+=("$EXP_PROC")
             #sleep to avoid result dir overwrite
-            sleep 10
+            sleep 5
 
         done #AUX_S
         done #LR
@@ -260,11 +445,14 @@ echo dataset: $DATASET
         done #LOSS
         done #BN
     done #SIZE
+    done #SEED
 done #DATASET
 
 #wait untill done
 echo 'DONE Launching experiments! staying alive for processes to finish running'
-while [ `nvidia-smi | grep python| wc -l` -ge 0 ]
+tmp=$RUNNING_PROCS
+for i in ${RUNNING_PROCS[@]:1}; do tmp="$tmp|$i"; done
+while [ `nvidia-smi | grep -E "$tmp" | wc -l` -gt 0 ]
 do
    sleep 10
 done

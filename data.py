@@ -22,6 +22,13 @@ _DATASET_META_DATA={
     'imagenet':_IMAGENET
 }
 
+_IMAGINE_CONFIGS={
+    'no_dd',
+    'no_bn',
+    'no_dd_smooth_loss',
+    'smooth_loss'
+}
+
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,limit=None):
     train = (split == 'train')
@@ -30,6 +37,17 @@ def get_dataset(name, split='train', transform=None,
             ds_dir_name = name[:-4]
         else:
             raise NotImplementedError
+    elif name.startswith('imagine-'):
+        if train:
+            ds_dir_name=None
+            for i_cfg in _IMAGINE_CONFIGS:
+                idx=name.find(i_cfg)
+                if idx >0:
+                    ds_dir_name=os.path.join(name[:idx-1],i_cfg,name[idx+len(i_cfg)+1:])
+                    break
+            assert ds_dir_name is not None
+        elif hasattr(datasets,name.split('-')[1].upper()):
+            return get_dataset(name.split('-')[1], split, transform, target_transform, limit=limit)
     else:
         ds_dir_name = name
     root = os.path.join(datasets_path, ds_dir_name)
