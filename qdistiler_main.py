@@ -93,7 +93,9 @@ parser.add_argument('--input_size', type=int, default=None,
 parser.add_argument('--dist-set-size', default=None, type=int,
                     help='limit number of examples per class for distilation training (default: None, use entire ds)')
 parser.add_argument('--calibration-set-size', default=500, type=int,
-                    help='limit number of examples per class for distilation training (default: None, use entire ds)')
+                    help='limit number of examples per class for calibration (default: 500, use entire ds)')
+parser.add_argument('--shuffle-calibration-steps', default=200, type=int,
+                    help='number of calibration steps')
 parser.add_argument('--recalibrate', action='store_true',
                     help='use training examples mixup')
 parser.add_argument('--distill-aug', nargs='+', type=str,help='use intermediate layer loss',choices=['cutout','ghost','normal'],default=None)
@@ -193,12 +195,21 @@ def main():
     # create model config
     logging.info("creating model %s", args.model)
     model_builder = models.__dict__[args.model]
-    if args.dataset in ['imaginet', 'randomnet']:
+    train_dataset_name=args.dataset
+    val_dataset_name=args.dataset
+    model_ds_config = args.dataset
+    if args.dataset.startswith('crossover'):
+        _ , model_ds_config, train_dataset_name = args.dataset.split('@')
+        val_dataset_name=model_ds_config
+    elif args.dataset in ['imaginet', 'randomnet']:
         model_ds_config='imagenet'
+    elif 'cifar100' in args.dataset:
+        model_ds_config='cifar100'
     elif 'cifar10' in args.dataset:
         model_ds_config='cifar10'
     else:
-        model_ds_config=args.dataset
+        raise NotImplementedError
+
     model_config = {'input_size': args.input_size, 'dataset':  model_ds_config}
 
     if args.model_config is not '':
@@ -256,7 +267,10 @@ def main():
 
     save_calibrated_path = os.path.join(args.results_dir,'distiller',args.dataset,args.save)
     if args.exp_group:
-        exp_group_path = os.path.join(save_calibrated_path,args.exp_group)
+        if args.exp_group.startswith('abs@'):
+            exp_group_path=args.exp_group[4:]
+        else:
+            exp_group_path = os.path.join(save_calibrated_path,args.exp_group)
 
     save_path = os.path.join(save_calibrated_path, time_stamp + opt)
     if not os.path.exists(save_path) and not is_not_master:
@@ -334,9 +348,9 @@ def main():
     # Data loading code
     # todo mharoush: add distillation specific transforms
     default_transform = {
-        'train': get_transform(args.dataset,
+        'train': get_transform(train_dataset_name,
                                input_size=args.input_size, augment=True),
-        'eval': get_transform(args.dataset,
+        'eval': get_transform(val_dataset_name,
                               input_size=args.input_size, augment=False)
     }
     transform = getattr(model, 'input_transform', default_transform)
@@ -357,7 +371,7 @@ def main():
     else:
         mixer = None
 
-    train_data = get_dataset(args.dataset, 'train', transform['train'],limit=args.dist_set_size)
+    train_data = get_dataset(train_dataset_name, 'train', transform['train'],limit=args.dist_set_size)
 
     if is_not_master and args.steps_per_epoch:
         ## this ensures that all procesees work on the same sampled sub set data but with different samples per batch
@@ -378,7 +392,7 @@ def main():
         batch_size=args.batch_size, shuffle=(sampler is None),
         num_workers=args.workers, pin_memory=False,drop_last=True)
 
-    val_data = get_dataset(args.dataset, 'val', transform['eval'])
+    val_data = get_dataset(val_dataset_name, 'val', transform['eval'])
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=args.batch_size*4, shuffle=False,
@@ -479,13 +493,24 @@ def main():
             search_absorbe_bn(model,remove_bn=False)
         model.load_state_dict(teacher.state_dict(), strict=False)
         model.to(args.device, dtype)
-        model,_,acc = calibrate(model,args.dataset,transform,val_loader=val_loader,logging=logging,resample=200,sample_per_class=args.calibration_set_size)
+        model,loss_avg,acc = calibrate(model,train_dataset_name,transform,val_loader=val_loader,logging=logging,resample=args.shuffle_calibration_steps,sample_per_class=args.calibration_set_size)
 
         student_checkpoint= teacher_checkpoint.copy()
         student_checkpoint.update({'config': q_model_config, 'state_dict': model.state_dict(),
                                    'epoch': 0,'regime':None, 'best_prec1': acc})
         logging.info("saving apprentice checkpoint")
         save_checkpoint(student_checkpoint, path=save_calibrated_path,filename='calibrated_checkpoint')
+        if args.recalibrate:
+            if args.exp_group:
+                print(f'reported calibration\t loss-{loss_avg:.3f} top1-{acc:.2f}', )
+                logging.info(f'appending experiment result summary to {args.exp_group} experiment')
+                exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
+                                         resume=1, params=None)
+                summary = {'acc_top1': acc, 'loss_avg': loss_avg, 'save_path': save_calibrated_path}
+                summary.update(dict(args._get_kwargs()))
+                exp_summary.add(**summary)
+                exp_summary.save()
+            exit(0)
     #regime[0].update({'use_float_copy':True})
     #model
     if args.use_softmax_scale:
@@ -564,10 +589,7 @@ def main():
             if distributed:
                 logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
-            ## clear log file from PIL junk logging(blocking)
-            # blocking call
-            # subprocess.call("sed '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path), shell=True)
-            cleanup_proc=subprocess.popen("sed '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path))
+            cleanup_proc=subprocess.Popen("sed -i '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path),shell=True)
             # remember best prec@1 and save checkpoint
             is_val_best=best_val_loss > val_loss
             if is_val_best:
@@ -978,7 +1000,7 @@ def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_si
     calibration_loader = torch.utils.data.DataLoader(
         calibration_data, sampler=cal_sampler,
         batch_size=batch_size, shuffle=cal_sampler is None,
-        num_workers=workers, pin_memory=False, drop_last=cal_sampler is None)
+        num_workers=workers, pin_memory=False, drop_last=True)
     calib_criterion = calib_criterion or getattr(model, 'criterion', nn.CrossEntropyLoss)()
     calib_criterion.to(args.device,dtype)
     with torch.no_grad():
