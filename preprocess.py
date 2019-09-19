@@ -258,11 +258,11 @@ class Cutout(object):
         n_holes (int): Number of patches to cut out of each image.
         length (int): The length (in pixels) of each square patch.
     """
-    def __init__(self, max_num_holes=10,ratio=1/4,area_threshold=0.65):
+    def __init__(self, max_num_holes=10,ratio=1/4):#,area_threshold=0.65):
         super(Cutout,self).__init__()
         self.max_num_holes = max_num_holes
         self.ratio = ratio
-        self.area_threshold=area_threshold
+        #self.area_threshold=area_threshold
 
     def __call__(self, img):
 
@@ -274,7 +274,7 @@ class Cutout(object):
         """
         h = img.size(1)
         w = img.size(2)
-        area = h*w
+        #area = h*w
         mask = torch.ones((h,w),device=img.device)
 
         for n in range(torch.randint(self.max_num_holes,(1,))):
@@ -289,8 +289,8 @@ class Cutout(object):
             x2 = torch.clamp(x + width // 2, 0, w)
 
             mask[y1: y2, x1: x2] = 0.
-            if mask.sum()/area > self.area_threshold:
-                mask[y1: y2, x1: x2] = 1
+            # if mask.sum()/area > self.area_threshold:
+            #     mask[y1: y2, x1: x2] = 1
 
         mask = mask.expand_as(img)
         img = img * mask
