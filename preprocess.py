@@ -41,7 +41,10 @@ def scale_random_crop(input_size, scale_size=None, normalize=__imagenet_stats):
 
 
 def pad_random_crop(input_size, scale_size=None, normalize=__imagenet_stats):
-    padding = int((scale_size - input_size) / 2)
+    if type(input_size) is tuple:
+        padding = (int((scale_size - input_size[0]) / 2), int((scale_size - input_size[1]) / 2))
+    else:
+        padding = int((scale_size - input_size) / 2)
     return transforms.Compose([
         transforms.RandomCrop(input_size, padding=padding),
         transforms.RandomHorizontalFlip(),

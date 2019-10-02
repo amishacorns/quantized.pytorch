@@ -3,6 +3,8 @@ import torchvision.datasets as datasets
 import torch
 from utils.dataset import RandomDatasetGenerator
 from utils.misc import _META
+import warnings
+warnings.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
 
 
 class _DS_META(_META):
@@ -26,11 +28,13 @@ _IMAGINE_CONFIGS={
     'no_dd',
     'no_bn',
     'no_dd_smooth_loss',
-    'smooth_loss'
+    'smooth_loss',
+    'dd_only'
 }
 
 def get_dataset(name, split='train', transform=None,
-                target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,limit=None):
+                target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
+                limit=None,shuffle_before_limit=False):
     train = (split == 'train')
     if name.endswith('-raw'):
         if name[:-4] in ['cifar10','cifar100']:
@@ -46,8 +50,9 @@ def get_dataset(name, split='train', transform=None,
                     ds_dir_name=os.path.join(name[:idx-1],i_cfg,name[idx+len(i_cfg)+1:])
                     break
             assert ds_dir_name is not None
-        elif hasattr(datasets,name.split('-')[1].upper()):
+        else:
             return get_dataset(name.split('-')[1], split, transform, target_transform, limit=limit)
+
     else:
         ds_dir_name = name
     root = os.path.join(datasets_path, ds_dir_name)
@@ -69,6 +74,12 @@ def get_dataset(name, split='train', transform=None,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
+    elif name == 'SVHN':
+        return datasets.SVHN(root=root,
+                              split=split,
+                              transform=transform,
+                              target_transform=target_transform,
+                              download=download)
     elif name == 'stl10':
         return datasets.STL10(root=root,
                               split=split,
@@ -84,7 +95,10 @@ def get_dataset(name, split='train', transform=None,
                                     transform=transform,
                                     target_transform=target_transform)
         if limit:
-            ds=balance_image_folder_ds(ds, limit)
+            if 'no_dd' in name:
+                ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit)
+            else:
+                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit)
 
         return ds
     elif name.startswith('random-'):
@@ -102,22 +116,29 @@ def get_dataset(name, split='train', transform=None,
             return get_dataset(name[7:],split,transform,target_transform,limit=limit)
 
 
-def balance_image_folder_ds(dataset, samples_per_class,shuffle=False,seed=0):
+def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=0):
     assert isinstance(dataset,datasets.DatasetFolder)
     if shuffle:
         import random
         random.seed(seed)
     samps = []
-    num_classes = len(dataset.classes)
-    samp_reg_per_class=[[]]*num_classes
+    if per_class:
+        samp_reg_per_class=[[]]*num_classes
+        num_classes = len(dataset.classes)
+        for s in dataset.samples:
+            samp_reg_per_class[s[1]].append(s)
 
-    for s in dataset.samples:
-        samp_reg_per_class[s[1]].append(s)
-    for jj in range(num_classes):
+        for jj in range(num_classes):
+            if shuffle:
+                samps += random.sample(samp_reg_per_class[jj],n_samples)
+            else:
+                samps += samp_reg_per_class[jj][:n_samples]
+    else:
         if shuffle:
-            samps += random.sample(samp_reg_per_class[jj],samples_per_class)
+            samps = random.sample(dataset.samples,n_samples)
         else:
-            samps += samp_reg_per_class[jj][:samples_per_class]
+            samps = dataset.samples[:n_samples]
+
     if hasattr(dataset,'imgs'):
         dataset.imgs = samps
     dataset.samples = samps
