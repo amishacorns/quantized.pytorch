@@ -1,6 +1,6 @@
 import argparse
 import os
-import subprocess
+#import subprocess
 import time
 import logging
 import torch
@@ -83,6 +83,10 @@ parser.add_argument('--fresh-bn', action='store_true',
                     help='student model absorbs batchnorm running mean and var before distillation but leaves bn layers with affine parameters')
 parser.add_argument('--otf', action='store_true',
                     help='use on the fly absorbing batchnorm layers')
+parser.add_argument('--reset-weights', action='store_true',
+                    help='do not load teacher weights to the student model')
+parser.add_argument('--no-quantize', action='store_true',
+                    help='do not quantize student model')
 ###DATA
 parser.add_argument('-j', '--workers', default=3, type=int, metavar='N',
                     help='number of data loading workers (default: 8)')
@@ -207,8 +211,6 @@ def main():
         model_ds_config='cifar100'
     elif 'cifar10' in args.dataset:
         model_ds_config='cifar10'
-    else:
-        raise NotImplementedError
 
     model_config = {'input_size': args.input_size, 'dataset':  model_ds_config}
 
@@ -227,8 +229,8 @@ def main():
         # save all experiments with same setup in the same root dir including calibration checkpoint
         args.save = '{net}{spec}_{gw}w{ga}a{fl}{bn_mod}'.format(
             net=args.model,spec=model_config['depth'],
-            gw=model_config['weights_numbits'],
-            ga=model_config['activations_numbits'],
+            gw=model_config.get('weights_numbits','f32'),
+            ga=model_config.get('activations_numbits','f32'),
             fl=fl_layers,
             bn_mod=('_OTF' if args.otf else ('_absorb_bn' if args.absorb_bn else '_fresh_bn' if args.fresh_bn else '_bn')))
         # specific optimizations are stored per experiment
@@ -308,25 +310,26 @@ def main():
         teacher_checkpoint = teacher_checkpoint['state_dict']
     teacher.load_state_dict(teacher_checkpoint)
     q_model_config=model_config.copy()
-    q_model_config.update({'quantize': True})
+    if not args.no_quantize:
+        q_model_config.update({'quantize': True})
 
-    if 'weights_numbits' not in q_model_config:
-        q_model_config.update({'weights_numbits':_DEFUALT_W_NBITS})
-    if 'activations_numbits' not in q_model_config:
-        q_model_config.update({'activations_numbits':_DEFUALT_A_NBITS})
-    if args.absorb_bn or args.otf or args.fresh_bn:
-        assert not (args.absorb_bn and args.otf or args.absorb_bn and  args.fresh_bn or args.otf and  args.fresh_bn)
-        from utils.absorb_bn import search_absorbe_bn
-        logging.info('absorbing teacher batch normalization')
-        search_absorbe_bn(teacher,verbose=True,remove_bn=not args.fresh_bn,keep_modifiers=args.fresh_bn)
-        if not args.fresh_bn:
-            model_config.update({'absorb_bn': True})
-            teacher_nobn = model_builder(**model_config)
-            teacher_nobn.load_state_dict(teacher.state_dict())
-            teacher = teacher_nobn
-            teacher.eval()
-            q_model_config.update({'absorb_bn': True})
-    q_model_config.update({'OTF': args.otf})
+        if 'weights_numbits' not in q_model_config:
+            q_model_config.update({'weights_numbits':_DEFUALT_W_NBITS})
+        if 'activations_numbits' not in q_model_config:
+            q_model_config.update({'activations_numbits':_DEFUALT_A_NBITS})
+        if args.absorb_bn or args.otf or args.fresh_bn:
+            assert not (args.absorb_bn and args.otf or args.absorb_bn and  args.fresh_bn or args.otf and  args.fresh_bn)
+            from utils.absorb_bn import search_absorbe_bn
+            logging.info('absorbing teacher batch normalization')
+            search_absorbe_bn(teacher,verbose=True,remove_bn=not args.fresh_bn,keep_modifiers=args.fresh_bn)
+            if not args.fresh_bn:
+                model_config.update({'absorb_bn': True})
+                teacher_nobn = model_builder(**model_config)
+                teacher_nobn.load_state_dict(teacher.state_dict())
+                teacher = teacher_nobn
+                teacher.eval()
+                q_model_config.update({'absorb_bn': True})
+        q_model_config.update({'OTF': args.otf})
 
     logging.info("creating apprentice model with configuration: %s", q_model_config)
     model = model_builder(**q_model_config)
@@ -348,7 +351,7 @@ def main():
     # Data loading code
     # todo mharoush: add distillation specific transforms
     default_transform = {
-        'train': get_transform(train_dataset_name,
+        'train': get_transform(val_dataset_name,
                                input_size=args.input_size, augment=True),
         'eval': get_transform(val_dataset_name,
                               input_size=args.input_size, augment=False)
@@ -370,7 +373,6 @@ def main():
         mixer.to(args.device)
     else:
         mixer = None
-
     train_data = get_dataset(train_dataset_name, 'train', transform['train'],limit=args.dist_set_size)
 
     if is_not_master and args.steps_per_epoch:
@@ -480,7 +482,7 @@ def main():
             logging.error("no checkpoint found at '%s'", args.resume)
             exit(1)
 
-    elif not args.recalibrate and os.path.isfile(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar')):
+    elif not args.recalibrate and not args.reset_weights and os.path.isfile(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar')):
         student_checkpoint = torch.load(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar'),'cpu')
         logging.info(f"loading pre-calibrated quantized model from {save_calibrated_path}, reported top 1 score {student_checkpoint['best_prec1']}")
         if args.fresh_bn:
@@ -489,9 +491,10 @@ def main():
     else:
         # no checkpoint for model, calibrate quant measure nodes and freeze bn
         logging.info("initializing apprentice model with teacher parameters: %s", q_model_config)
-        if args.fresh_bn:
-            search_absorbe_bn(model,remove_bn=False)
-        model.load_state_dict(teacher.state_dict(), strict=False)
+        if not args.reset_weights:
+            if args.fresh_bn:
+                search_absorbe_bn(model,remove_bn=False)
+            model.load_state_dict(teacher.state_dict(), strict=False)
         model.to(args.device, dtype)
         model,loss_avg,acc = calibrate(model,train_dataset_name,transform,val_loader=val_loader,logging=logging,resample=args.shuffle_calibration_steps,sample_per_class=args.calibration_set_size)
 
@@ -589,7 +592,7 @@ def main():
             if distributed:
                 logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
-            cleanup_proc=subprocess.Popen("sed -i '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path),shell=True)
+            #cleanup_proc=subprocess.Popen("sed -i '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path),shell=True)
             # remember best prec@1 and save checkpoint
             is_val_best=best_val_loss > val_loss
             if is_val_best:
@@ -611,7 +614,7 @@ def main():
                 'best_prec1': best_prec1,
                 'regime': regime
             }, is_best, path=save_path,save_freq=args.ckpt_freq)
-            cleanup_proc.wait()
+            #cleanup_proc.wait()
             logging.info('\n Epoch: {0}\t'
                          'Training Loss {train_loss:.4f} \t'
                          'Training Prec@1 {train_prec1:.3f} \t'
@@ -833,8 +836,8 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         # measure accuracy and record loss
         try:
             prec1, prec5 = accuracy(output.detach(), label, topk=(1, 5))
-            top1.update(float(prec1), inputs.size(0))
-            top5.update(float(prec5), inputs.size(0))
+            top1.update(prec1.item(), inputs.size(0))
+            top5.update(prec5.item(), inputs.size(0))
         except:
             pass
         losses.update(float(loss), inputs.size(0))
