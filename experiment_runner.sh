@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-eval "$(conda shell.bash hook)"
-conda activate p37t1
+#eval "$(conda shell.bash hook)"
+source activate pytorch_p36
 #@ is used to represent a None like value that ignores the parameter (ie not used). return second argument as prefix
 function getarg() {
 if [ $1 == '@' ];
@@ -24,7 +24,7 @@ R44_C10_PATH=results/resnet44_cifar10/model_best.pth.tar
 R18_IMGNT_PATH=''
 ##### default settings
 #STEP_LIMIT="--steps-limit 16000"
-DEVICE_ID_C=(0 1 2 3)
+DEVICE_ID_C=(0 1 2 3 4 5 6 7)
 EXP_RUNNER_LOGDIR='exp_runner_logs'
 N_EXP_PER_GPU=2
 EXP=${1:-1}
