@@ -18,7 +18,10 @@ RUNNING_PROCS=()
 #set -e
 #general settings
 #script accepts experiment ÍD argument
-
+WRN28_10_C100_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+R44_C100_PATH=results/resnet44_ba_m40_cifar100/model_best.pth.tar
+R44_C10_PATH=results/resnet44_cifar10/model_best.pth.tar
+R18_IMGNT_PATH=''
 ##### default settings
 #STEP_LIMIT="--steps-limit 16000"
 DEVICE_ID_C=(0 1 2 3)
@@ -38,7 +41,7 @@ BATCH_SIZE=512
 W_BITS=2
 ACT_BITS=4
 W_RANGE_MOD='--free-w-range'
-T_W_PATH=results/resnet44_cifar10/model_best.pth.tar
+T_W_PATH=$R44_C10_PATH
 EXT_MODEL_CFG=
 DEPTH=44
 ##### BEGIN
@@ -49,8 +52,6 @@ fi
 x=$DEVICE_ID_C
 for i in ${DEVICE_ID_C[@]:1}; do x=$x,$i; done
 export CUDA_VISIBLE_DEVICES=$x
-let EXP_HOLD_EVERY=$N_EXP_PER_GPU*${#DEVICE_ID_C[@]}
-echo "> running up to $EXP_HOLD_EVERY experiments in parallel"
 
 if [ $EXP -eq 1 ]
 then
@@ -304,79 +305,49 @@ then
     BATCH_SIZE=256
     W_BITS=4
     W_RANGE_MOD=
-elif [ $EXP -eq 6661 ]
+elif [ $EXP -eq 999 ]
 then
-    #cross over cifar10 datasets to cifat100
-    EXP_G='cross-over_cifar10-cifar-100'
-    DATASET_C=('crossover@cifar100@imagine-cifar10-r44-no_bn_r100') #crossover@cifar100@cifar10-raw'  'crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' )
-    DATA_SIZE_C=(5000)
+    #cross over cifar10 datasets to stl,svhn
+    N_EXP_PER_GPU=2
+    EXP_G='abs@cross-over-cifar10'
+    DATASET_C=('crossover@cifar10@stl10' 'crossover@cifar10@SVHN') #crossover@cifar100@cifar10-raw'  'crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' )
+    DATA_SIZE_C=('@')
     AUX_C=('smoothl1')
     AUX_SCALE_C=(0.01)
-    LR_C=(50)
-    SEED_C=(1) #2 3 4 5)
-    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
-    EXT_MODEL_CFG=",'width':[160,320,640]"
-    DEPTH=28
-    BATCH_SIZE=256
-    W_BITS=4
-    W_RANGE_MOD=
+    LR_C=(100)
+    SEED_C=(1 2 3)
+    T_W_PATH=$R44_C10_PATH
+    DEPTH=44
+    BATCH_SIZE=512
+    W_BITS=2
 else
     echo '> experiment ID not defined'
     exit 0
 fi
-
+let EXP_HOLD_EVERY=$N_EXP_PER_GPU*${#DEVICE_ID_C[@]}
+echo "> running up to $EXP_HOLD_EVERY experiments in parallel"
 let TOT_EXP_TO_RUN=`echo "${#MIXUP_C[@]}*${#BN_MOD_C[@]}*${#DATA_SIZE_C[@]}*${#AUX_C[@]}*${#AUX_SCALE_C[@]}*${#LR_C[@]}*${#LOSS_C[@]}*${#SEED_C[@]}"`
 echo '>' running exp set $EXP with $TOT_EXP_TO_RUN configurations
 EXP_COUNT=0
-
+for SEED in ${SEED_C[@]}
+do
 for DATASET in ${DATASET_C[@]}
 do
-    for SEED in ${SEED_C[@]}
-    do
     for SIZE in ${DATA_SIZE_C[@]}
     do
-
-
         for BN_MOD in ${BN_MOD_C[@]}
         do
-
         for LOSS in ${LOSS_C[@]}
         do
-
         for AUX in ${AUX_C[@]}
         do
-
         for MIX in ${MIXUP_C[@]}
         do
-
         for LR in ${LR_C[@]}
         do
-
         for AUX_S in ${AUX_SCALE_C[@]}
         do
-        #    if (( ($EXP_COUNT % $EXP_HOLD_EVERY) == 0 ))
-        #    then BG='';
-        #    else BG='&';
-        #    fi;
-            echo dataset: $DATASET
-            echo $SEED
-            echo samples per class: $SIZE
-            echo bn mod: $BN_MOD
-            echo loss: $LOSS
-            echo aux: $AUX
-            echo mixup: $MIX
-            echo lr_scale: $LR
-            echo aux_scale: $AUX_S
-            BG='&'
-            # get valid experiment flags
-            AUX_=`getarg $AUX "--aux"`
-            AUX_S_=`getarg $AUX_S "--aux-loss-scale"`
-            MIX_=`getarg $MIX`
-            SIZE_=`getarg $SIZE "--dist-set-size"`
-            LR_=`getarg $LR ",'scale_lr':"`
-            BN_MOD_=`getarg $BN_MOD`
             echo init allocation loop
-
             # find a free gpu for experiment
             GPU_ID=0
             GPU=${DEVICE_ID_C[0]}
@@ -414,6 +385,15 @@ do
                     break
                 fi
             done
+
+            # get valid experiment flags
+            AUX_=`getarg $AUX "--aux"`
+            AUX_S_=`getarg $AUX_S "--aux-loss-scale"`
+            MIX_=`getarg $MIX`
+            SIZE_=`getarg $SIZE "--dist-set-size"`
+            LR_=`getarg $LR ",'scale_lr':"`
+            BN_MOD_=`getarg $BN_MOD`
+
             echo $EXP_G
             echo dataset: $DATASET
             echo $SEED
@@ -430,13 +410,17 @@ do
             eval python qdistiler_main.py --model resnet --model_config '"$M_CFG"'  --teacher $T_W_PATH --dataset $DATASET \
             --train-first-conv --steps-per-epoch 200 --quant-freeze-steps -1 --b $BATCH_SIZE --device_ids $GPU_ID $W_RANGE_MOD \
             $SIZE_ --exp-group $EXP_G $AUX_ --loss $LOSS $STEP_LIMIT $BN_MOD_ $AUX_S_ $MIX_\
-            $EXT_FLAGS --print-freq 100 --seed $SEED 2> $EXP_RUNNER_LOGDIR/$EXP'_'$EXP_COUNT'_stderr.log' $BG
+            $EXT_FLAGS --print-freq 100 --seed $SEED 2> $EXP_RUNNER_LOGDIR/$EXP'_'$EXP_COUNT'_stderr.log' &
             EXP_PROC="$!"
             echo "> pid for exp $EXP_COUNT $EXP_PROC"
             let EXP_COUNT=$EXP_COUNT+1
             RUNNING_PROCS+=("$EXP_PROC")
             #sleep to avoid result dir overwrite
             sleep 5
+
+            let GPU_ID=$GPU_ID+1
+            let GPU_ID=$GPU_ID%${#DEVICE_ID_C[@]}
+            GPU=${DEVICE_ID_C[$GPU_ID]}
 
         done #AUX_S
         done #LR
