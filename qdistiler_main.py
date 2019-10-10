@@ -88,7 +88,7 @@ parser.add_argument('--reset-weights', action='store_true',
 parser.add_argument('--no-quantize', action='store_true',
                     help='do not quantize student model')
 ###DATA
-parser.add_argument('-j', '--workers', default=3, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 8)')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
@@ -205,7 +205,7 @@ def main():
     if args.dataset.startswith('crossover'):
         _ , model_ds_config, train_dataset_name = args.dataset.split('@')
         val_dataset_name=model_ds_config
-    elif args.dataset in ['imaginet', 'randomnet']:
+    elif args.dataset in ['imaginet', 'randomnet'] or 'imagenet' in args.dataset:
         model_ds_config='imagenet'
     elif 'cifar100' in args.dataset:
         model_ds_config='cifar100'
@@ -398,7 +398,7 @@ def main():
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=args.batch_size*4, shuffle=False,
-        num_workers=2, pin_memory=False,drop_last=False)
+        num_workers=args.workers, pin_memory=False,drop_last=False)
 
     repeat = 1
     if args.steps_per_epoch < 0:
@@ -857,11 +857,11 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 
         if i % args.print_freq == 0:
             logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
-                         'Time ({batch_time.avg:.3f}) {batch_time.var:.3f}\t'
-                         'Data ({data_time.avg:.3f}) {data_time.var:.3f}\t'
-                         'Loss ({loss.avg:.4f}) {loss.var:.3f} \t'
-                         'Prec@1 ({top1.avg:.3f}) {top1.var:.3f} \t'
-                         'Prec@5 ({top5.avg:.3f} {top5.var:.3f} )'.format(
+                         'Time {batch_time.avg:.3f} ({batch_time.var:.3f})\t'
+                         'Data {data_time.avg:.3f} ({data_time.var:.3f})\t'
+                         'Loss {loss.avg:.4f} ({loss.var:.3f}) \t'
+                         'Prec@1 {top1.avg:.3f} ({top1.var:.3f}) \t'
+                         'Prec@5 {top5.avg:.3f} ({top5.var:.3f})'.format(
                 epoch, i, len(data_loader),
                 phase='TRAINING' if training else 'EVALUATING',
                 steps=f'Train steps: {steps}\t' if training else '',

@@ -25,7 +25,7 @@ _DATASET_META_DATA={
 }
 
 _IMAGINE_CONFIGS={
-    'no_dd',
+    'no_dd_kl','no_dd_mse',
     'no_bn',
     'no_dd_smooth_loss',
     'smooth_loss',

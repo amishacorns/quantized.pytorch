@@ -78,15 +78,7 @@ def inception_color_preproccess(input_size, normalize=__imagenet_stats):
 def get_transform(name='imagenet', input_size=None,
                   scale_size=None, normalize=None, augment=True):
     normalize = normalize or __imagenet_stats
-    if name == 'imagenet':
-        scale_size = scale_size or 256
-        input_size = input_size or 224
-        if augment:
-            return inception_preproccess(input_size, normalize=normalize)
-        else:
-            return scale_crop(input_size=input_size,
-                              scale_size=scale_size, normalize=normalize)
-    if name in ['imaginet','randomnet']:
+    if 'imagenet' in name or name in ['imaginet','randomnet']:
         scale_size = scale_size or 256
         input_size = input_size or 224
         if augment:
