@@ -123,8 +123,8 @@ def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed
         random.seed(seed)
     samps = []
     if per_class:
-        samp_reg_per_class=[[]]*num_classes
         num_classes = len(dataset.classes)
+        samp_reg_per_class=[[]]*num_classes
         for s in dataset.samples:
             samp_reg_per_class[s[1]].append(s)
 
