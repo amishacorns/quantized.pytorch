@@ -25,8 +25,8 @@ _DATASET_META_DATA={
 }
 
 _IMAGINE_CONFIGS={
-    'no_dd_kl','no_dd_mse',
-    'no_bn',
+    'no_dd_kl','no_dd_mse','no_dd_sym',
+    'no_bn','dd-exp_kl','dd-ce_kl',
     'no_dd_smooth_loss',
     'smooth_loss',
     'dd_only'
@@ -109,7 +109,7 @@ def get_dataset(name, split='train', transform=None,
         else:
             raise NotImplementedError
 
-        limit = limit*nclasses if limit else None
+        limit = limit*nclasses if limit else 1000*nclasses
         if train:
             return RandomDatasetGenerator(data_shape,mean,std,limit=limit,transform=transform,train=train)
         else:
@@ -124,15 +124,19 @@ def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed
     samps = []
     if per_class:
         num_classes = len(dataset.classes)
-        samp_reg_per_class=[[]]*num_classes
+        #samp_reg_per_class=[[]]*num_classes
+        samp_reg_per_class={}
         for s in dataset.samples:
-            samp_reg_per_class[s[1]].append(s)
-
-        for jj in range(num_classes):
-            if shuffle:
-                samps += random.sample(samp_reg_per_class[jj],n_samples)
+            if s[1] in samp_reg_per_class:
+                if shuffle or len(samp_reg_per_class[s[1]])<n_samples:
+                    samp_reg_per_class[s[1]]+=[s]
             else:
-                samps += samp_reg_per_class[jj][:n_samples]
+                samp_reg_per_class[s[1]]=[s]
+        for k in samp_reg_per_class.keys():
+            if shuffle:
+                samps += random.sample(samp_reg_per_class[k],n_samples)
+            else:
+                samps += samp_reg_per_class[k]
     else:
         if shuffle:
             samps = random.sample(dataset.samples,n_samples)
