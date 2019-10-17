@@ -711,25 +711,28 @@ class ResNet_imagenet(ResNet):
                 {'optimizer': 'SGD', 'step': 40*400, 'lr': lr_start * scale_lr * 5e-4, 'momentum': 0.1,
                  'dampning': 0.9}
             ]
-        elif 'sgd_cos_staggerd_1' == regime:
-            self.epochs=60
-            steps_per_epoch=200
-            #start epoch,epochs,lr modifier
-            cos_drops=[(20,1),(20,1e-1),(10,1e-1)]
+        elif 'IBM' == regime:
+            lr_start = 0.0015
+            lr_end = 1e-6
             ## reference settings to fix training regime length in update steps
             self.quant_freeze_steps = -1
             self.absorb_bn_step = -1
-            self.regime = []
-            lr_start = 1e-3 * scale_lr
-            epoch_start=0
-            for epochs,lr_md in cos_drops:
-                lr_end=lr_start*lr_md
-                self.regime +=[{'step': epoch_start * steps_per_epoch, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
-                 'step_lambda': cosine_anneal_lr(lr_start, lr_end, 0, epochs*steps_per_epoch,epochs-1)}]
+            self.regime_epochs = 110
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1,'epoch_lambda': exp_decay_lr(lr_start * scale_lr, lr_end * scale_lr,0,110)},
+            ]
+        elif 'IBM_short' == regime:
+            lr_start = 0.0015
+            lr_end = 1e-6
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = -1
+            self.regime_epochs = 110
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1,
+                 'epoch_lambda': exp_decay_lr(lr_start * scale_lr, lr_end * scale_lr, 0, 110,n_drops=5)},
+            ]
 
-                lr_start=lr_end
-                epoch_start+=epochs
-            self.regime+=[{'step': epoch_start * steps_per_epoch, 'lr': lr_start}]
 
         elif 'sgd_cos_anneal_1' == regime:
             lr_start = 1e-3
@@ -764,7 +767,7 @@ class ResNet_imagenet(ResNet):
             step_lambda_epochs = 60
             ## reference settings to fix training regime length in update steps
             self.quant_freeze_steps = -1
-            self.absorb_bn_step = 40*400
+            self.absorb_bn_step =-1 # 40*400
             self.regime = [
                 {'step': 0, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
                  'step_lambda': cosine_anneal_lr(lr_start * scale_lr, lr_start * scale_lr * 1e-3, 0, step_lambda_epochs*400)},
@@ -773,6 +776,33 @@ class ResNet_imagenet(ResNet):
                  #'dampning': 0.9
                  }
             ]
+        elif 'sgd_cos_staggerd_1' == regime:
+            self.regime_epochs = 120
+            self.regime_steps_per_epoch = 400
+            #start epoch,epochs,lr modifier
+            warmup=(5,1e-8)
+            cos_drops=[(95,1e-3)]
+            ## reference settings to fix training regime length in update steps
+            self.quant_freeze_steps = -1
+            self.absorb_bn_step = -1
+            self.regime = []
+            lr_start = 1e-3 * scale_lr
+            epoch_start=0
+            if warmup:
+                ramp_up_epochs,warmup_scale=warmup
+                self.regime += [{'step': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1,
+                                 'step_lambda': cosine_anneal_lr(lr_start*warmup_scale, lr_start,0, ramp_up_epochs*self.regime_steps_per_epoch)}]
+                epoch_start+=ramp_up_epochs
+            for epochs,lr_md in cos_drops:
+                lr_end=lr_start*lr_md
+                epoch_end=epoch_start+epochs
+                self.regime +=[{'step': epoch_start * self.regime_steps_per_epoch, 'optimizer': 'SGD','momentum': 0.9, 'dampning': 0.1,
+                 'step_lambda': cosine_anneal_lr(lr_start, lr_end, epoch_start*self.regime_steps_per_epoch, epoch_end*self.regime_steps_per_epoch,epochs-1)}]
+                lr_start=lr_end
+                epoch_start=epoch_end
+
+            self.regime+=[{'step': epoch_start * self.regime_steps_per_epoch, 'optimizer': 'SGD', 'momentum': 0.9, 'dampning': 0.1, 'lr': lr_start}]
+
         elif 'qdistil_absorbed_bn' == regime:
             lr_start = 1e-2
             trust_coef = 1e-1
