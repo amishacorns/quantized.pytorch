@@ -116,7 +116,7 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--steps-limit', default=None, type=int,
                     help='limit training steps')
-parser.add_argument('--steps-per-epoch', default=None, type=int,
+parser.add_argument('--steps-per-epoch', default=-1, type=int,
                     help='number of steps per epoch, value greater than 0'
                          ' will cause training iterator to sample with replacement')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -148,13 +148,16 @@ parser.add_argument('--ranking-loss', action='store_true',
                     help='use top1 ranking loss')
 parser.add_argument('--aux', choices=['mse','kld','cos','smoothl1'],default=None,
                     help='use intermediate layer loss')
-parser.add_argument('--loss', default='mse',choices=['mse','kld','smoothl1'],
+parser.add_argument('--kd-loss', default='',choices=['mse','kld','smoothl1'],
                     help='specify main loss criterion')
 parser.add_argument('--aux-loss-scale',default=1.0,type=float,
                     help='overwrite aux loss scale')
 parser.add_argument('--loss-scale',default=1.0,type=float,
                     help='overwrite loss scale')
-
+parser.add_argument('--ce-only',action='store_true',
+                    help='train with lable cross entropy only')
+parser.add_argument('--ce',action='store_true',
+                    help='train with lable cross entropy')
 ####Distributed
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of distributed processes')
@@ -243,7 +246,11 @@ def main():
         else:
             opt = regime_name
 
-        opt += f'_loss-{args.loss}'
+        if args.kd_loss!='' and not args.ce_only:
+            opt += f'_kd-loss-{args.kd_loss}'
+        if args.ce or args.ce_only:
+            opt += '_ce{}'.format('_only' if args.ce_only else '')
+
         if args.pretrain:
             opt += '_pretrain'
         if args.aux:
@@ -419,13 +426,26 @@ def main():
     loss_scale = args.loss_scale
     aux_loss_scale = args.aux_loss_scale
 
-    if args.loss=='kld':
-        criterion = nn.KLDivLoss(reduction='mean')
-    elif args.loss == 'smoothl1':
-        criterion = nn.SmoothL1Loss()
+    if args.kd_loss != '':
+        if args.kd_loss=='kld':
+            criterion = nn.KLDivLoss(reduction='mean')
+        elif args.kd_loss == 'smoothl1':
+            criterion = nn.SmoothL1Loss()
+        else:
+            assert args.kd_loss=='mse'
+            criterion = nn.MSELoss()
+
+        criterion.to(args.device, dtype)
     else:
-        assert(args.loss=='mse')
-        criterion = nn.MSELoss()
+        criterion=None
+        assert args.ce_only
+
+
+    if args.ce or args.ce_only:
+        CE = nn.CrossEntropyLoss()
+        CE.to(args.device)
+    else:
+        CE = None
 
     if args.aux:
         if args.aux == 'kld' :
@@ -444,7 +464,6 @@ def main():
     if args.order_weighted_loss:
         loss_scale *= 1000
 
-    criterion.to(args.device, dtype)
     # define loss function (criterion) and optimizer
     # valid_criterion = getattr(model, 'criterion', nn.CrossEntropyLoss)()
     # valid_criterion.to(args.device,dtype)
@@ -514,8 +533,7 @@ def main():
                 exp_summary.add(**summary)
                 exp_summary.save()
             exit(0)
-    #regime[0].update({'use_float_copy':True})
-    #model
+
     if args.use_softmax_scale:
         tau=torch.nn.Parameter(torch.tensor((1.0,), requires_grad=True))
         model.register_parameter('tau',tau)
@@ -577,22 +595,31 @@ def main():
         #     model.to(args.device)
         #     if epoch > 0:
         #         model,_,_=calibrate(model,args.dataset,transform,valid_criterion,val_loader=val_loader,logging=logging)
-        train_loss, train_prec1, train_prec5 = train(
-            train_loader, model, criterion, epoch, optimizer,teacher,
-            aux=aux,loss_scale=loss_scale,aux_loss_scale=aux_loss_scale,mixer=mixer,quant_freeze_steps=args.quant_freeze_steps,
-            dr_weight_freeze=not args.free_w_range,distributed=distributed)
+        if args.ce_only:
+            train_loss, train_prec1, train_prec5 = train(
+                train_loader, model, CE, epoch, optimizer,
+                loss_scale=loss_scale, mixer=mixer, quant_freeze_steps=args.quant_freeze_steps,
+                dr_weight_freeze=not args.free_w_range, distributed=distributed)
+        else:
+            train_loss, train_prec1, train_prec5 = train(
+                train_loader, model, criterion, epoch, optimizer, teacher, aux=aux, ce=CE, loss_scale=loss_scale,
+                aux_loss_scale=aux_loss_scale, mixer=mixer, quant_freeze_steps=args.quant_freeze_steps,
+                dr_weight_freeze=not args.free_w_range, distributed=distributed)
 
         if (epoch +1) % repeat == 0:
             # evaluate on validation set
             if is_not_master:
                 logging.debug('local rank {} done training'.format(args.local_rank))
                 continue
-            val_loss, val_prec1, val_prec5 = validate(
+            if args.ce_only:
+                val_loss, val_prec1, val_prec5 = validate(
+                    val_loader, model, CE, epoch)
+            else:
+                val_loss, val_prec1, val_prec5 = validate(
                 val_loader, model, valid_criterion, epoch,teacher=teacher)
             if distributed:
                 logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
-            #cleanup_proc=subprocess.Popen("sed -i '\'\"/\bSTREAM\b/d\"\'' {}/log.txt".format(save_path),shell=True)
             # remember best prec@1 and save checkpoint
             is_val_best=best_val_loss > val_loss
             if is_val_best:
@@ -614,12 +641,11 @@ def main():
                 'best_prec1': best_prec1,
                 'regime': regime
             }, is_best, path=save_path,save_freq=args.ckpt_freq)
-            #cleanup_proc.wait()
             logging.info('\n Epoch: {0}\t'
-                         'Training Loss {train_loss:.4f} \t'
+                         'Training Loss {train_loss:.4e} \t'
                          'Training Prec@1 {train_prec1:.3f} \t'
                          'Training Prec@5 {train_prec5:.3f} \t'
-                         'Validation Loss {val_loss:.4f} \t'
+                         'Validation Loss {val_loss:.4e} \t'
                          'Validation Prec@1 {val_prec1:.3f} \t'
                          'Validation Prec@5 {val_prec5:.3f} \n'
                          .format(epoch + 1, train_loss=train_loss, val_loss=val_loss,
@@ -641,10 +667,12 @@ def main():
             results.save()
             if distributed:
                 logging.debug('local rank {} done saving. save time: {}'.format(args.local_rank,time.time()-timer_save))
+
+    #calc stats for 5 best scores
     scores=results.results['val_error1'].to_numpy()
     scores.sort()
     scores=scores[:5]
-    #calc stats for 5 best scores
+
     smth_top1_avg,smth_top1_std=scores.mean(),scores.std()
     logging.info(f'Training-Summary:')
     logging.info(f'best-top1:      {best_prec1:.2f}\tval-loss {val_best:.4f}\ttrain-loss {train_best:.4f}\tepoch {best_epoch}')
@@ -671,7 +699,8 @@ def main():
 
     os.popen(f'firefox {save_path}/results.html &')
 
-def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False):
+def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,ce=None,
+            aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False):
     if aux:
         model = SubModules(model)
         teacher = SubModules(teacher) if teacher else None
@@ -688,8 +717,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                                                      device_ids=args.device_ids,
                                                      output_device=args.device_ids[0]) if mixer else None
     elif args.device_ids and len(args.device_ids) > 1 and not isinstance(model,nn.DataParallel):
-        #aux = torch.nn.DataParallel(aux) if aux else None
-        #criterion = torch.nn.DataParallel(criterion)
+        aux = torch.nn.DataParallel(aux) if aux else None
         model = torch.nn.DataParallel(model, args.device_ids)
         teacher = torch.nn.DataParallel(teacher, args.device_ids) if teacher else None
         mixer = torch.nn.DataParallel(mixer, args.device_ids) if mixer else None
@@ -806,6 +834,9 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         aux_loss_mtr.update(loss.item())
         loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
 
+        if ce:
+            loss = loss + ce(output,label)
+
         if args.ranking_loss and training:
             topk=5
             with torch.no_grad():
@@ -859,7 +890,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
                          'Time {batch_time.avg:.3f} ({batch_time.var:.3f})\t'
                          'Data {data_time.avg:.3f} ({data_time.var:.3f})\t'
-                         'Loss {loss.avg:.4f} ({loss.var:.3f}) \t'
+                         'Loss {loss.avg:.4e} ({loss.var:.3f}) \t'
                          'Prec@1 {top1.avg:.3f} ({top1.var:.3f}) \t'
                          'Prec@5 {top5.avg:.3f} ({top5.var:.3f})'.format(
                 epoch, i, len(data_loader),
@@ -872,7 +903,8 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 
     return losses.avg, top1.avg, top5.avg
 
-def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,aux_start = 0,loss_scale=1.0,aux_loss_scale=1.0,quant_freeze_steps=-1,mixer=None,dr_weight_freeze=True,distributed=False):
+def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,ce=None,aux_start = 0,loss_scale=1.0,
+          aux_loss_scale=1.0,quant_freeze_steps=-1,mixer=None,dr_weight_freeze=True,distributed=False):
     # switch to train mode
     model.train()
     if hasattr(data_loader.sampler, 'num_samples'):
@@ -902,8 +934,8 @@ def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,
                 p.requires_grad = False
 
     return forward(data_loader, model, criterion, epoch, training=True, optimizer=optimizer,teacher=teacher,
-                   aux=aux,aux_start=aux_start,loss_scale=loss_scale,aux_loss_scale=aux_loss_scale,quant_freeze_steps=quant_freeze_steps,
-                   mixer=mixer,distributed=distributed)
+                   aux=aux,ce=ce,aux_start=aux_start,loss_scale=loss_scale,aux_loss_scale=aux_loss_scale,
+                   quant_freeze_steps=quant_freeze_steps, mixer=mixer,distributed=distributed)
 
 
 def validate(data_loader, model, criterion, epoch,teacher=None):
