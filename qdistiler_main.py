@@ -158,6 +158,8 @@ parser.add_argument('--ce-only',action='store_true',
                     help='train with lable cross entropy only')
 parser.add_argument('--ce',action='store_true',
                     help='train with lable cross entropy')
+parser.add_argument('--uniform-aux-depth-scale',action='store_true',
+                    help='do not scale aux loss according to depth')
 ####Distributed
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of distributed processes')
@@ -604,7 +606,8 @@ def main():
             train_loss, train_prec1, train_prec5 = train(
                 train_loader, model, criterion, epoch, optimizer, teacher, aux=aux, ce=CE, loss_scale=loss_scale,
                 aux_loss_scale=aux_loss_scale, mixer=mixer, quant_freeze_steps=args.quant_freeze_steps,
-                dr_weight_freeze=not args.free_w_range, distributed=distributed)
+                dr_weight_freeze=not args.free_w_range, distributed=distributed,
+                aux_depth_scale=not args.uniform_aux_depth_scale)
 
         if (epoch +1) % repeat == 0:
             # evaluate on validation set
@@ -700,7 +703,8 @@ def main():
     os.popen(f'firefox {save_path}/results.html &')
 
 def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,ce=None,
-            aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False):
+            aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False,
+            aux_depth_scale=True):
     if aux:
         model = SubModules(model)
         teacher = SubModules(teacher) if teacher else None
@@ -717,7 +721,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                                                      device_ids=args.device_ids,
                                                      output_device=args.device_ids[0]) if mixer else None
     elif args.device_ids and len(args.device_ids) > 1 and not isinstance(model,nn.DataParallel):
-        aux = torch.nn.DataParallel(aux) if aux else None
+        #aux = torch.nn.DataParallel(aux) if aux else None
         model = torch.nn.DataParallel(model, args.device_ids)
         teacher = torch.nn.DataParallel(teacher, args.device_ids) if teacher else None
         mixer = torch.nn.DataParallel(mixer, args.device_ids) if mixer else None
@@ -787,10 +791,11 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                         a_o = output__
                         a_t = target__
 
-                    #mean aux loss over participating layers, deeper layers are weighed less to reduce gradient accumulation
-                    #loss = loss + 1/(k-aux_start +1) * aux(output,target)/(len(output_) - aux_start -1)
-
-                    loss = loss + aux(a_o,a_t)* 2*(k-aux_start +1)/(num_outputs_for_aux**2+num_outputs_for_aux)
+                    if aux_depth_scale:
+                        depth_scale=2*(k-aux_start +1)/(num_outputs_for_aux**2+num_outputs_for_aux)
+                    else:
+                        depth_scale=1.0
+                    loss = loss + aux(a_o, a_t)*depth_scale
 
                 #keep last module output for final loss
                 output_ = output_[-1]
@@ -904,7 +909,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
     return losses.avg, top1.avg, top5.avg
 
 def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,ce=None,aux_start = 0,loss_scale=1.0,
-          aux_loss_scale=1.0,quant_freeze_steps=-1,mixer=None,dr_weight_freeze=True,distributed=False):
+          aux_loss_scale=1.0,quant_freeze_steps=-1,mixer=None,dr_weight_freeze=True,distributed=False,aux_depth_scale=True):
     # switch to train mode
     model.train()
     if hasattr(data_loader.sampler, 'num_samples'):
@@ -933,9 +938,10 @@ def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,
             for p in conv_1_module.parameters():
                 p.requires_grad = False
 
-    return forward(data_loader, model, criterion, epoch, training=True, optimizer=optimizer,teacher=teacher,
-                   aux=aux,ce=ce,aux_start=aux_start,loss_scale=loss_scale,aux_loss_scale=aux_loss_scale,
-                   quant_freeze_steps=quant_freeze_steps, mixer=mixer,distributed=distributed)
+    return forward(data_loader, model, criterion, epoch, training=True, optimizer=optimizer, teacher=teacher,
+                   aux=aux, ce=ce,aux_start=aux_start,loss_scale=loss_scale, aux_loss_scale=aux_loss_scale,
+                   quant_freeze_steps=quant_freeze_steps, mixer=mixer, distributed=distributed,
+                   aux_depth_scale=aux_depth_scale)
 
 
 def validate(data_loader, model, criterion, epoch,teacher=None):
@@ -1005,6 +1011,7 @@ def pretrain(model,teacher,data,optimizer,criterion,freeze_prev=True,epochs=5,au
     for p in defrost_list:
         p.requires_grad = True
 
+#todo replace with forward hook?
 # sequential model with intermidiate output collection, usefull when using aux loss and runing data parallel model
 class SubModules(nn.Sequential):
     def __init__(self,model):
