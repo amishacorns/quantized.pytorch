@@ -36,6 +36,16 @@ def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
                 limit=None,shuffle_before_limit=False):
     train = (split == 'train')
+    if '+' in name:
+        ds=None
+        for ds_name in name.split('+'):
+            ds_=get_dataset(ds_name, split, transform, target_transform,download, limit=limit,download=download,
+                            shuffle_before_limit=shuffle_before_limit,datasets_path=__DATASETS_DEFAULT_PATH)
+            if ds is None:
+                ds=ds_
+            else:
+                ds += ds_
+        return ds
     if name.endswith('-raw'):
         if name[:-4] in ['cifar10','cifar100']:
             ds_dir_name = name[:-4]
@@ -51,7 +61,9 @@ def get_dataset(name, split='train', transform=None,
                     break
             assert ds_dir_name is not None
         else:
-            return get_dataset(name.split('-')[1], split, transform, target_transform, limit=limit)
+            return get_dataset(name.split('-')[1], split, transform, target_transform,download, limit=limit,
+                               download=download,shuffle_before_limit=shuffle_before_limit,
+                               datasets_path=__DATASETS_DEFAULT_PATH)
 
     else:
         ds_dir_name = name
@@ -99,7 +111,6 @@ def get_dataset(name, split='train', transform=None,
                 ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit)
             else:
                 ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit)
-
         return ds
     elif name.startswith('random-'):
         ds_name = name[7:]
@@ -113,7 +124,8 @@ def get_dataset(name, split='train', transform=None,
         if train:
             return RandomDatasetGenerator(data_shape,mean,std,limit=limit,transform=transform,train=train)
         else:
-            return get_dataset(name[7:],split,transform,target_transform,limit=limit)
+            return get_dataset(name[7:],split, transform, target_transform,download, limit=limit, download=download,
+                               shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
 
 
 def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=0):
