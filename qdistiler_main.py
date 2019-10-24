@@ -609,11 +609,8 @@ def main():
                 dr_weight_freeze=not args.free_w_range, distributed=distributed,
                 aux_depth_scale=not args.uniform_aux_depth_scale)
 
-        if (epoch +1) % repeat == 0:
+        if (epoch +1) % repeat == 0 and is_not_master == False:
             # evaluate on validation set
-            if is_not_master:
-                logging.debug('local rank {} done training'.format(args.local_rank))
-                continue
             if args.ce_only:
                 val_loss, val_prec1, val_prec5 = validate(
                     val_loader, model, CE, epoch)
@@ -668,39 +665,46 @@ def main():
                          legend=['training', 'validation'],
                          title='Error@5', ylabel='error %')
             results.save()
-            if distributed:
-                logging.debug('local rank {} done saving. save time: {}'.format(args.local_rank,time.time()-timer_save))
 
-    #calc stats for 5 best scores
-    scores=results.results['val_error1'].to_numpy()
-    scores.sort()
-    scores=scores[:5]
+        if distributed:
+            logging.info(
+                'local rank {} done training epoch {}.'.format(args.local_rank,epoch))
+            torch.distributed.barrier()
+    if is_not_master == False:
+        #calc stats for 5 best scores
+        scores=results.results['val_error1'].to_numpy()
+        scores.sort()
+        scores=scores[:5]
 
-    smth_top1_avg,smth_top1_std=scores.mean(),scores.std()
-    logging.info(f'Training-Summary:')
-    logging.info(f'best-top1:      {best_prec1:.2f}\tval-loss {val_best:.4f}\ttrain-loss {train_best:.4f}\tepoch {best_epoch}')
-    logging.info(f'best-loss-top1: {best_loss_top1:.2f}\tval-loss {best_val_loss:.4f}\ttrain-loss {best_loss_train:.4f}\tepoch {best_loss_epoch}')
-    logging.info(f'smoothed top1:\tmean {smth_top1_avg:0.4f}\tstd {smth_top1_std:0.4f}')
-    logging.info('regime-\n'+('{}\n'*len(regime)).format(*[p for p in regime]))
-    save_path=shutil.move(save_path, save_path + f'_top1_{best_prec1:.2f}_loss_{val_best:.4f}_e{best_epoch}')
-    logging.info(f'logdir-{save_path}')
-    if args.exp_group:
-        logging.info(f'appending experiment result summary to {args.exp_group} experiment')
-        exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
-                                 resume=1,params=None)
-        summary={'top1_smooth_mean':smth_top1_avg,'top1_smooth_std':smth_top1_std,
-                 'best_acc_top1': best_prec1, 'best_acc_val': val_best, 'best_acc_train': train_best,
-         'best_acc_epoch': best_epoch,
-         'best_loss_top1': best_loss_top1, 'best_loss_val': best_val_loss, 'best_loss_train': best_loss_train,
-         'best_loss_epoch': best_loss_epoch,'save_path':save_path}
-        summary.update(dict(args._get_kwargs()))
-        exp_summary.add(**summary)
-        exp_summary.save()
-        # results.plot(x='epoch', y=['train_loss', 'val_loss'],
-        #              legend=['training', 'validation'],
-        #              title='Loss', ylabel='loss')
+        smth_top1_avg,smth_top1_std=scores.mean(),scores.std()
+        logging.info(f'Training-Summary:')
+        logging.info(f'best-top1:      {best_prec1:.2f}\tval-loss {val_best:.4f}\ttrain-loss {train_best:.4f}\tepoch {best_epoch}')
+        logging.info(f'best-loss-top1: {best_loss_top1:.2f}\tval-loss {best_val_loss:.4f}\ttrain-loss {best_loss_train:.4f}\tepoch {best_loss_epoch}')
+        logging.info(f'smoothed top1:\tmean {smth_top1_avg:0.4f}\tstd {smth_top1_std:0.4f}')
+        logging.info('regime-\n'+('{}\n'*len(regime)).format(*[p for p in regime]))
+        save_path=shutil.move(save_path, save_path + f'_top1_{best_prec1:.2f}_loss_{val_best:.4f}_e{best_epoch}')
+        logging.info(f'logdir-{save_path}')
+        if args.exp_group:
+            logging.info(f'appending experiment result summary to {args.exp_group} experiment')
+            exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
+                                     resume=1,params=None)
+            summary={'top1_smooth_mean':smth_top1_avg,'top1_smooth_std':smth_top1_std,
+                     'best_acc_top1': best_prec1, 'best_acc_val': val_best, 'best_acc_train': train_best,
+             'best_acc_epoch': best_epoch,
+             'best_loss_top1': best_loss_top1, 'best_loss_val': best_val_loss, 'best_loss_train': best_loss_train,
+             'best_loss_epoch': best_loss_epoch,'save_path':save_path}
+            summary.update(dict(args._get_kwargs()))
+            exp_summary.add(**summary)
+            exp_summary.save()
+            # results.plot(x='epoch', y=['train_loss', 'val_loss'],
+            #              legend=['training', 'validation'],
+            #              title='Loss', ylabel='loss')
 
-    os.popen(f'firefox {save_path}/results.html &')
+        os.popen(f'firefox {save_path}/results.html &')
+    if distributed:
+        logging.info(
+            'local rank {} is done, waiting to exit'.format(args.local_rank))
+        torch.distributed.barrier()
 
 def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None,teacher=None,aux=None,ce=None,
             aux_start=0,loss_scale = 1.0,aux_loss_scale=1.0,quant_freeze_steps=0,mixer=None,distributed=False,
@@ -836,7 +840,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                 ).unsqueeze(0).to(target.device)
                 target = torch.mul(target,normalizing_sorting_scale)
             output = torch.mul(output,normalizing_sorting_scale)
-        aux_loss_mtr.update(loss.item())
+        aux_loss_mtr.update(float(loss))
         loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
 
         if ce:
