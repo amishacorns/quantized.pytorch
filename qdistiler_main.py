@@ -121,6 +121,8 @@ parser.add_argument('--steps-per-epoch', default=-1, type=int,
                          ' will cause training iterator to sample with replacement')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
+parser.add_argument('-c', '--batch-chunks', default=1, type=int,
+                    metavar='N', help='split mini-batch to N chunks (default: 1)')
 parser.add_argument('-r','--overwrite-regime',default=None, help='rewrite regime with external list of dicts "[{},{}...]"')
 ####MISC
 parser.add_argument('--pretrain', action='store_true',
@@ -758,140 +760,163 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
     else:
         steps_per_epoch = len(data_loader)
 
-    for i, (inputs, label) in enumerate(data_loader):
+    for i, (inp, lab) in enumerate(data_loader):
         if training:
             steps = epoch * steps_per_epoch + i
             if -1 < quant_freeze_steps < steps and _once:
                 logging.info('releasing model quant parameters')
-                freeze_quant_params(model, freeze=False, include_param_dyn_range=True, momentum=0.9999,logger=logging)
+                freeze_quant_params(model, freeze=False, include_param_dyn_range=True, momentum=0.9999, logger=logging)
                 _once = 0
         # measure data loading time
         data_time.update(time.time() - end)
+        inp = inp.to(args.device, dtype=dtype)
+        lab = lab.to(args.device)
+        for c, (inputs, labels) in enumerate(zip(inp.chunk(args.batch_chunks),lab.chunk(args.batch_chunks))):
+            aux_loss = torch.tensor(0.).to(args.device)
+            if mixer:
+                with torch.no_grad():
+                    inputs = mixer(inputs,[args.mixup_rate,inputs.size(0),True])
+            output_ = model(inputs)
 
-        inputs = inputs.to(args.device, dtype=dtype)
-        label = label.to(args.device)
-        if mixer:
-            with torch.no_grad():
-                inputs = mixer(inputs,[args.mixup_rate,inputs.size(0),True])
-        output_ = model(inputs)
-        loss = torch.tensor(0.0).to(args.device)
-        if teacher:
-            with torch.no_grad():
-                target_ = teacher(inputs)
-            if aux:
-                num_outputs_for_aux=(len(output_) - aux_start - 1)
-                aux_outputs, aux_targets=output_[aux_start:-1],target_[aux_start:-1]
+            if teacher:
+                with torch.no_grad():
+                    target_ = teacher(inputs)
+                if aux:
+                    aux_outputs, aux_targets=output_[aux_start:-1],target_[aux_start:-1]
 
-                for k,(output__,target__) in enumerate(zip(aux_outputs,aux_targets)):
-                    if isinstance(aux,nn.KLDivLoss) or isinstance(aux,nn.DataParallel) and isinstance(aux._modules['module'],nn.KLDivLoss):
-                        with torch.no_grad():
-                            ## divide by temp factor to increase entropy todo register as model learnable param
-                            a_t = F.softmax(target__,-1)
-                        a_o = F.log_softmax(output__,-1)
-                    else:
-                        a_o = output__
-                        a_t = target__
+                    for k,(output__,target__) in enumerate(zip(aux_outputs,aux_targets)):
+                        if isinstance(aux,nn.KLDivLoss) or isinstance(aux,nn.DataParallel) and isinstance(aux._modules['module'],nn.KLDivLoss):
+                            with torch.no_grad():
+                                ## divide by temp factor to increase entropy todo register as model learnable param
+                                a_t = F.softmax(target__,-1)
+                            a_o = F.log_softmax(output__,-1)
+                        else:
+                            a_o = output__
+                            a_t = target__
 
-                    if aux_depth_scale:
-                        depth_scale=2*(k-aux_start +1)/(num_outputs_for_aux**2+num_outputs_for_aux)
-                    else:
-                        depth_scale=1.0
-                    loss = loss + aux(a_o, a_t)*depth_scale
+                        if aux_depth_scale:
+                            num_outputs_for_aux = (len(output_) - aux_start - 1)
+                            depth_scale=2*(k-aux_start +1)/(num_outputs_for_aux**2+num_outputs_for_aux)
+                        else:
+                            depth_scale=1.0
 
-                #keep last module output for final loss
-                output_ = output_[-1]
-                target_ = target_[-1]
+                        aux_loss += aux(a_o, a_t)*depth_scale
 
-            if args.use_learned_temperature:
-                assert hasattr(model,'tau')
-                target_ /= model.tau
-                output_ /= model.tau
+                    aux_loss_mtr.update(float(aux_loss),inputs.size(0))
+                    #keep last module output for final loss
+                    output_ = output_[-1]
+                    target_ = target_[-1]
+
+
+                if args.use_learned_temperature:
+                    assert hasattr(model,'tau')
+                    target_ /= model.tau
+                    output_ /= model.tau
+                else:
+                    target_ /= args.fixed_distillation_temperature
+                    output_ /= args.fixed_distillation_temperature
+
+                if mixer and args.mix_target:
+                    target_ = mixer.mix_target(target_)
+
+                ## normal distillation extract target
+                if isinstance(criterion, nn.KLDivLoss):
+                    with torch.no_grad():
+                        target = F.softmax(target_, -1)
+                    output = F.log_softmax(output_, -1)
+                else:
+                    target = target_
+                    output = output_
             else:
-                target_ /= args.fixed_distillation_temperature
-                output_ /= args.fixed_distillation_temperature
+                ## use real labels as targets
+                target = labels
+                output = output_
 
             if mixer and args.mix_target:
-                target_ = mixer.mix_target(target_)
-            ## normal distillation extract target
-            if isinstance(criterion, nn.KLDivLoss):
                 with torch.no_grad():
-                    target = F.softmax(target_, -1)
-                output = F.log_softmax(output_, -1)
-            else:
-                target = target_
-                output = output_
-        else:
-            ## use real labels as targets
-            target = label
-            output = output_
+                    target = mixer.mix_target(target)
 
-        if mixer and args.mix_target:
-            with torch.no_grad():
-                target = mixer.mix_target(target)
-
-        if args.order_weighted_loss and training:
-            with torch.no_grad():
-                target,ids = torch.sort(target,descending=True)
-                ids_ = torch.cat([s + k * target.size(1) for k, s in enumerate(ids)])
-            output_flat = output.flatten()
-            output = output_flat[ids_].reshape((target.size(0),target.size(1)))
-            # using 1 / ni**2 scaling where ni is the ranking of the element i
-            # normalization with pi**2 / 6
-            with torch.no_grad():
-                #normalizing_sorting_scale=torch.sqrt(0.607927/(torch.arange(1,1001).to(target.device)**2).float()).unsqueeze(0)
-                normalizing_sorting_scale = torch.sqrt(
-                  1 / (torch.arange(1, 1001,dtype=torch.float)* torch.log(torch.tensor([target.size(1)],dtype=torch.float)))
-
-                ).unsqueeze(0).to(target.device)
-                target = torch.mul(target,normalizing_sorting_scale)
-            output = torch.mul(output,normalizing_sorting_scale)
-        aux_loss_mtr.update(float(loss))
-        loss = loss*aux_loss_scale + criterion(output, target) * loss_scale
-
-        if ce:
-            loss = loss + ce(output,label)
-
-        if args.ranking_loss and training:
-            topk=5
-            with torch.no_grad():
-                _,ids = torch.sort(target,descending=True)
-            output_flat = output.flatten()
-            x1,x2=None,None
-            for k in range(topk):
+            if args.order_weighted_loss and training:
                 with torch.no_grad():
-                    ids_top1= ids[:,k:k+1]
-                    ids_rest= ids[:,k+1:]
-                    #calculate flat ids for slicing
-                    ids_top1_= torch.cat([s + r * target.size(1) for r, s in enumerate(ids_top1)])
-                    ids_rest_ = torch.cat([s + r * target.size(1) for r, s in enumerate(ids_rest)])
-                if x1 is None:
-                    x1 = output_flat[ids_top1_].unsqueeze(1).repeat(1,target.size(1)-1)
-                    x2 = output_flat[ids_rest_].reshape((target.size(0),-1))
-                else:
-                    x1 = torch.cat(x1,output_flat[ids_top1_].unsqueeze(1).repeat(1, target.size(1) - k - 1))
-                    x2 = torch.cat(x2,output_flat[ids_rest_].reshape((target.size(0), -1)))
-            gt = torch.ones_like(x2)
-            ranking_loss = nn.MarginRankingLoss()(x1,x2,gt)
-            ranking_loss_mtr.update(ranking_loss.item())
-            loss = loss + ranking_loss
+                    target,ids = torch.sort(target,descending=True)
+                    ids_ = torch.cat([s + k * target.size(1) for k, s in enumerate(ids)])
+                output_flat = output.flatten()
+                output = output_flat[ids_].reshape((target.size(0),target.size(1)))
+                # using 1 / ni**2 scaling where ni is the ranking of the element i
+                # normalization with pi**2 / 6
+                with torch.no_grad():
+                    #normalizing_sorting_scale=torch.sqrt(0.607927/(torch.arange(1,1001).to(target.device)**2).float()).unsqueeze(0)
+                    normalizing_sorting_scale = torch.sqrt(
+                      1 / (torch.arange(1, 1001,dtype=torch.float)* torch.log(torch.tensor([target.size(1)],dtype=torch.float)))
 
-        if regularizer is not None:
-            loss += regularizer(model)
+                    ).unsqueeze(0).to(target.device)
+                    target = torch.mul(target,normalizing_sorting_scale)
+                output = torch.mul(output,normalizing_sorting_scale)
 
-        # measure accuracy and record loss
-        try:
-            prec1, prec5 = accuracy(output.detach(), label, topk=(1, 5))
-            top1.update(prec1.item(), inputs.size(0))
-            top5.update(prec5.item(), inputs.size(0))
-        except:
-            pass
-        losses.update(float(loss), inputs.size(0))
+            loss = aux_loss*aux_loss_scale + criterion(output, target) * loss_scale
+
+            if ce:
+                loss = loss + ce(output,labels)
+
+            if args.ranking_loss and training:
+                topk=5
+                with torch.no_grad():
+                    _,ids = torch.sort(target,descending=True)
+                output_flat = output.flatten()
+                x1,x2=None,None
+                for k in range(topk):
+                    with torch.no_grad():
+                        ids_top1= ids[:,k:k+1]
+                        ids_rest= ids[:,k+1:]
+                        #calculate flat ids for slicing
+                        ids_top1_= torch.cat([s + r * target.size(1) for r, s in enumerate(ids_top1)])
+                        ids_rest_ = torch.cat([s + r * target.size(1) for r, s in enumerate(ids_rest)])
+                    if x1 is None:
+                        x1 = output_flat[ids_top1_].unsqueeze(1).repeat(1,target.size(1)-1)
+                        x2 = output_flat[ids_rest_].reshape((target.size(0),-1))
+                    else:
+                        x1 = torch.cat(x1,output_flat[ids_top1_].unsqueeze(1).repeat(1, target.size(1) - k - 1))
+                        x2 = torch.cat(x2,output_flat[ids_rest_].reshape((target.size(0), -1)))
+                gt = torch.ones_like(x2)
+                ranking_loss = nn.MarginRankingLoss()(x1,x2,gt)
+                ranking_loss_mtr.update(float(ranking_loss),inputs.size(0))
+                loss = loss + ranking_loss
+
+            if args.batch_chunks > 1:
+                loss = loss / args.batch_chunks
+
+            if regularizer is not None and c==args.batch_chunks-1:
+                loss += regularizer(model)
+            losses.update(float(loss), inputs.size(0))
+
+            if training:
+                if c==0:
+                    optimizer.zero_grad()
+                ##accumulate gradients
+                loss.backward()
+            # measure accuracy and record loss
+            try:
+                prec1, prec5 = accuracy(output.detach(), labels, topk=(1, 5))
+                top1.update(prec1.item(), inputs.size(0))
+                top5.update(prec5.item(), inputs.size(0))
+            except:
+                pass
+
+        if i % args.print_freq == 0:
+            logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
+                         'Loss {loss.avg:.4e} ({loss.var:.3f}) \t'
+                         'Prec@1 {top1.avg:.3f} ({top1.var:.3f}) \t'
+                         'Prec@5 {top5.avg:.3f} ({top5.var:.3f})'.format(
+                epoch, i, len(data_loader),
+                phase='TRAINING' if training else 'EVALUATING',
+                steps=f'Train steps: {steps}\t' if training else '',
+                loss=losses, top1=top1, top5=top5)+
+                         f'\taux_loss {aux_loss_mtr.avg:0.4f}({aux_loss_mtr.var:0.3f})'
+                         f'\tranking loss {ranking_loss_mtr.avg:0.4f}({ranking_loss_mtr.var:0.3f})')
 
         if training:
+            #post gradient accumulation step
             optimizer.update(epoch, steps)
-            # compute gradient and do SGD step
-            optimizer.zero_grad()
-            loss.backward()
             optimizer.step()
         # elif teacher and i == 0:
         #     compare_activations(model,teacher,inputs[:64])
@@ -901,19 +926,9 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         end = time.time()
 
         if i % args.print_freq == 0:
-            logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
-                         'Time {batch_time.avg:.3f} ({batch_time.var:.3f})\t'
-                         'Data {data_time.avg:.3f} ({data_time.var:.3f})\t'
-                         'Loss {loss.avg:.4e} ({loss.var:.3f}) \t'
-                         'Prec@1 {top1.avg:.3f} ({top1.var:.3f}) \t'
-                         'Prec@5 {top5.avg:.3f} ({top5.var:.3f})'.format(
-                epoch, i, len(data_loader),
-                phase='TRAINING' if training else 'EVALUATING',
-                steps=f'Train steps: {steps}\t' if training else '',
-                batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5)+
-                         f'\taux_loss {aux_loss_mtr.avg:0.4f}({aux_loss_mtr.var:0.3f})'
-                         f'\tranking loss {ranking_loss_mtr.avg:0.4f}({ranking_loss_mtr.var:0.3f})')
+            logging.info('Time {batch_time.avg:.3f} ({batch_time.var:.3f})\t'
+                         'Data {data_time.avg:.3f} ({data_time.var:.3f})\t'.format(batch_time=batch_time,
+                                                                                   data_time=data_time))
 
     return losses.avg, top1.avg, top5.avg
 
