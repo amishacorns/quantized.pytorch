@@ -39,7 +39,7 @@ def get_dataset(name, split='train', transform=None,
     if '+' in name:
         ds=None
         for ds_name in name.split('+'):
-            ds_=get_dataset(ds_name, split, transform, target_transform,download, limit=limit,download=download,
+            ds_=get_dataset(ds_name, split, transform, target_transform,download, limit=limit,
                             shuffle_before_limit=shuffle_before_limit,datasets_path=__DATASETS_DEFAULT_PATH)
             if ds is None:
                 ds=ds_
@@ -62,7 +62,7 @@ def get_dataset(name, split='train', transform=None,
             assert ds_dir_name is not None
         else:
             return get_dataset(name.split('-')[1], split, transform, target_transform,download, limit=limit,
-                               download=download,shuffle_before_limit=shuffle_before_limit,
+                               shuffle_before_limit=shuffle_before_limit,
                                datasets_path=__DATASETS_DEFAULT_PATH)
 
     else:
@@ -124,7 +124,7 @@ def get_dataset(name, split='train', transform=None,
         if train:
             return RandomDatasetGenerator(data_shape,mean,std,limit=limit,transform=transform,train=train)
         else:
-            return get_dataset(name[7:],split, transform, target_transform,download, limit=limit, download=download,
+            return get_dataset(name[7:],split, transform, target_transform,download, limit=limit,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
 
 
