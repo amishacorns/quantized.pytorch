@@ -127,7 +127,9 @@ parser.add_argument('--pretrain', action='store_true',
                     help='preform layerwise pretraining session before full network distillation')
 parser.add_argument('--train-first-conv', action='store_true',
                     help='allow first conv to train')
-parser.add_argument('--use-softmax-scale', action='store_true',
+parser.add_argument('--use-learned-temperature', action='store_true',
+                    help='use trainable temperature parameter')
+parser.add_argument('--fixed-distillation-temperature', default=1.,type=float,
                     help='use trainable temperature parameter')
 
 ####Quant
@@ -269,7 +271,7 @@ def main():
             opt += '_float_opt'
         elif args.quant_freeze_steps and args.free_w_range:
             opt += '_free_weights'
-        if args.use_softmax_scale:
+        if args.use_learned_temperature:
             opt += '_tau'
         if args.dist_set_size:
             opt += f'_cls_lim_{args.dist_set_size}'
@@ -536,8 +538,8 @@ def main():
                 exp_summary.save()
             exit(0)
 
-    if args.use_softmax_scale:
-        tau=torch.nn.Parameter(torch.tensor((1.0,), requires_grad=True))
+    if args.use_learned_temperature:
+        tau=torch.nn.Parameter(torch.ones(1,model.fc.out_features), requires_grad=True)
         model.register_parameter('tau',tau)
 
     if args.quant_freeze_steps is None:
@@ -776,8 +778,6 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         if teacher:
             with torch.no_grad():
                 target_ = teacher(inputs)
-                if mixer and args.mix_target:
-                    target_ = mixer.mix_target(target_)
             if aux:
                 num_outputs_for_aux=(len(output_) - aux_start - 1)
                 aux_outputs, aux_targets=output_[aux_start:-1],target_[aux_start:-1]
@@ -786,9 +786,6 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                     if isinstance(aux,nn.KLDivLoss) or isinstance(aux,nn.DataParallel) and isinstance(aux._modules['module'],nn.KLDivLoss):
                         with torch.no_grad():
                             ## divide by temp factor to increase entropy todo register as model learnable param
-                            if args.use_softmax_scale:
-                                if k == len(output_) - 1:
-                                    target__ /= model.tau
                             a_t = F.softmax(target__,-1)
                         a_o = F.log_softmax(output__,-1)
                     else:
@@ -805,10 +802,18 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                 output_ = output_[-1]
                 target_ = target_[-1]
 
-            ## normal distilation extract target
+            if args.use_learned_temperature:
+                assert hasattr(model,'tau')
+                target_ /= model.tau
+                output_ /= model.tau
+            else:
+                target_ /= args.fixed_distillation_temperature
+                output_ /= args.fixed_distillation_temperature
+
+            if mixer and args.mix_target:
+                target_ = mixer.mix_target(target_)
+            ## normal distillation extract target
             if isinstance(criterion, nn.KLDivLoss):
-                if args.use_softmax_scale:
-                    target_ /= model.tau
                 with torch.no_grad():
                     target = F.softmax(target_, -1)
                 output = F.log_softmax(output_, -1)
@@ -816,7 +821,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                 target = target_
                 output = output_
         else:
-            # use real labels as targets
+            ## use real labels as targets
             target = label
             output = output_
 
