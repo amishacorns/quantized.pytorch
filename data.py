@@ -17,11 +17,13 @@ __DATASETS_DEFAULT_PATH = 'Datasets'
 _CIFAR10=_DS_META(nclasses=10,shape=(3,32,32),mean=[.491, .482, .446],std=[.247, .243, .261])
 _CIFAR100=_DS_META(nclasses=100,shape=(3,32,32),mean=[.491, .482, .446],std=[.247, .243, .261])
 _IMAGENET=_DS_META(nclasses=1000,shape=(3,224,224),mean=[0.485,0.456,0.406],std=[0.229,0.224,0.225])
+_SVHN=_DS_META(nclasses=10,shape=(3,32,32),mean=[0.437,0.444,0.473],std=[0.198,0.201,0.197])
 
 _DATASET_META_DATA={
     'cifar10':_CIFAR10,
     'cifar100':_CIFAR100,
-    'imagenet':_IMAGENET
+    'imagenet':_IMAGENET,
+    'SVHN':_SVHN
 }
 
 _IMAGINE_CONFIGS={
