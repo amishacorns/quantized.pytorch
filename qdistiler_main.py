@@ -88,7 +88,7 @@ parser.add_argument('--reset-weights', action='store_true',
 parser.add_argument('--no-quantize', action='store_true',
                     help='do not quantize student model')
 ###DATA
-parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 8)')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
@@ -254,6 +254,9 @@ def main():
 
         if args.kd_loss!='' and not args.ce_only:
             opt += f'_kd-loss-{args.kd_loss}'
+
+        if args.loss_scale != 1.:
+            opt += f'_loss_scale_{args.loss_scale}'
         if args.ce or args.ce_only:
             opt += '_ce{}'.format('_only' if args.ce_only else '')
 
@@ -273,8 +276,8 @@ def main():
             opt += '_float_opt'
         elif args.quant_freeze_steps and args.free_w_range:
             opt += '_free_weights'
-        if args.use_learned_temperature:
-            opt += '_tau'
+        if args.use_learned_temperature or args.fixed_distillation_temperature != 1.:
+            opt += '_tau_{}'.format('learned' if args.use_learned_temperature else args.fixed_distillation_temperature )
         if args.dist_set_size:
             opt += f'_cls_lim_{args.dist_set_size}'
 
@@ -405,13 +408,13 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_data,sampler=sampler,
         batch_size=args.batch_size, shuffle=(sampler is None),
-        num_workers=args.workers, pin_memory=False,drop_last=True)
+        num_workers=args.workers, pin_memory=not distributed,drop_last=True)
 
     val_data = get_dataset(val_dataset_name, 'val', transform['eval'])
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=args.batch_size*4, shuffle=False,
-        num_workers=args.workers, pin_memory=False,drop_last=False)
+        num_workers=args.workers, pin_memory=not distributed,drop_last=False)
 
     repeat = 1
     if args.steps_per_epoch < 0:
