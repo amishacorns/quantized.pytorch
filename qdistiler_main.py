@@ -75,6 +75,10 @@ parser.add_argument('--model_config', default='',
 parser.add_argument('--teacher', type=str, metavar='FILE',
                     help='path to teacher model checkpoint FILE')
 ####BN-MOD
+parser.add_argument('--freeze-bn', action='store_true',
+                    help='student model will not change batchnorm params (eval mode)')
+parser.add_argument('--freeze-bn-running-estimators', action='store_true',
+                    help='student model will not change batchnorm params (reload old values before eval) overwrites --freeze-bn')
 parser.add_argument('--absorb-bn-step', default=None, type=int,
                     help='limit training steps')
 parser.add_argument('--absorb-bn', action='store_true',
@@ -189,6 +193,13 @@ def main():
                 assert key in args, f'loaded argument {key} does not exist in current version'
                 setattr(args,key,value)
             print(args)
+
+    if args.dataset.startswith('random-') and not args.freeze_bn_running_estimators:
+        args.freeze_bn=True
+        print('freeze bn layers for random dataset')
+    else:
+        args.freeze_bn=False
+
     dtype = torch_dtypes.get(args.dtype)
     torch.manual_seed(args.seed)
     time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -236,12 +247,26 @@ def main():
             fc = '_fc_{}'.format(model_config['fc'].__str__().strip('\{\}').replace('\'','').replace(': ','').replace(', ',''))
         fl_layers = conv1 + fc
         # save all experiments with same setup in the same root dir including calibration checkpoint
+
+        if args.freeze_bn_running_estimators:
+            bn_mod_tag = '_freeze_bn_estimators'
+        elif args.freeze_bn:
+            bn_mod_tag = '_freeze_bn_eval'
+        elif args.otf:
+            bn_mod_tag='_OTF'
+        elif args.absorb_bn:
+            bn_mod_tag='_absorb_bn'
+        elif args.fresh_bn:
+            bn_mod_tag= '_fresh_bn'
+        else:
+            bn_mod_tag='_bn'
+
         args.save = '{net}{spec}_{gw}w{ga}a{fl}{bn_mod}'.format(
             net=args.model,spec=model_config['depth'],
             gw=model_config.get('weights_numbits','f32'),
             ga=model_config.get('activations_numbits','f32'),
             fl=fl_layers,
-            bn_mod=('_OTF' if args.otf else ('_absorb_bn' if args.absorb_bn else '_fresh_bn' if args.fresh_bn else '_bn')))
+            bn_mod=bn_mod_tag)
         # specific optimizations are stored per experiment
         regime_name = '_' + model_config.get('regime', '')
 
@@ -264,6 +289,10 @@ def main():
             opt += '_pretrain'
         if args.aux:
             opt += f'_aux-{args.aux}'
+            if args.uniform_aux_depth_scale:
+                opt+= '_uniform'
+            else:
+                opt+='_scaled'
         if args.mixup:
             opt += '_mixup'
             if args.mix_target:
@@ -390,7 +419,7 @@ def main():
     else:
         mixer = None
     train_data = get_dataset(train_dataset_name, 'train', transform['train'],limit=args.dist_set_size)
-
+    logging.info(f'train dataset {train_data}')
     if is_not_master and args.steps_per_epoch:
         ## this ensures that all procesees work on the same sampled sub set data but with different samples per batch
         logging.info('setting different seed per worker for random sampler use in distributed mode')
@@ -610,6 +639,9 @@ def main():
                 loss_scale=loss_scale, mixer=mixer, quant_freeze_steps=args.quant_freeze_steps,
                 dr_weight_freeze=not args.free_w_range, distributed=distributed)
         else:
+            if args.freeze_bn_running_estimators:
+                logging.info('saving initial bn parameters for all batch normalization')
+                set_bn_is_train(model,True,logger=logging,reset_running_estimators=True)
             train_loss, train_prec1, train_prec5 = train(
                 train_loader, model, criterion, epoch, optimizer, teacher, aux=aux, ce=CE, loss_scale=loss_scale,
                 aux_loss_scale=aux_loss_scale, mixer=mixer, quant_freeze_steps=args.quant_freeze_steps,
@@ -820,7 +852,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                     output_ /= args.fixed_distillation_temperature
 
                 if mixer and args.mix_target:
-                    target_ = mixer.mix_target(target_)
+                    target_ = mixer(target=target_)
 
                 ## normal distillation extract target
                 if isinstance(criterion, nn.KLDivLoss):
@@ -859,7 +891,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             loss = aux_loss*aux_loss_scale + criterion(output, target) * loss_scale
 
             if ce:
-                loss = loss + ce(output,labels)
+                loss = loss + ce(output,labels)*1e-5
 
             if args.ranking_loss and training:
                 topk=5
@@ -946,10 +978,13 @@ def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,
     if epoch * steps_per_epoch < quant_freeze_steps or quant_freeze_steps==-1:
         logging.info('freezing quant params{}'.format('' if dr_weight_freeze else ' NOT INCL WEIGHTS'))
         freeze_quant_params(model, freeze=True, include_param_dyn_range=dr_weight_freeze, logger=logging)
+    if args.freeze_bn:
+        logging.info('freezing all batch normalization')
+        set_bn_is_train(model,False,logger=logging)
 
     if teacher:
         if args.absorb_bn and not args.otf:
-            logging.info('freezing remaining batch normalization')
+            logging.info('bn absorbed, freezing remaining batch normalization')
             set_bn_is_train(model,False)
 
         if not args.train_first_conv:
@@ -973,6 +1008,9 @@ def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,
 
 def validate(data_loader, model, criterion, epoch,teacher=None):
     # switch to evaluate mode
+    if args.freeze_bn_running_estimators:
+        logging.info('restoring all batch normalization parameters')
+        set_bn_is_train(model,False,logger=logging,reload_running_estimators=True)
     model.eval()
     with torch.no_grad():
         return forward(data_loader, model, criterion, epoch,
@@ -1058,7 +1096,10 @@ def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_si
     set_measure_mode(model, True, logger=logging)
     if logging:
         logging.info("calibrating model to get quant params")
-    calibration_data = get_dataset(dataset, 'train', transform['train'],limit=sample_per_class)
+    calibration_data = get_dataset(dataset, 'train', transform['train'],limit=sample_per_class,shuffle_before_limit=False)
+    if logging:
+        logging.info(f'calibration dataset {calibration_data}')
+
     # calibration_data = limitDS(calibration_data, sample_per_class)
     if resample>0:
         cal_sampler = torch.utils.data.RandomSampler(calibration_data, replacement=True,

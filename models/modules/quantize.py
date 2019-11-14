@@ -513,11 +513,22 @@ def recursive_apply(model,func,*args):
         recursive_apply(m,func,*args)
 
 
-def set_bn_is_train(model,train,logger=None):
+def set_bn_is_train(model,train,logger=None,reload_running_estimators=False,reset_running_estimators=False):
     def func(m,*args):
         if is_bn(m):
             if logger:
                 logger.debug('{} set to {}'.format(m,'eval' if train else 'train'))
+            if reload_running_estimators or reset_running_estimators:
+                if (reload_running_estimators and not hasattr(m,'locked_running_mean')) or reset_running_estimators:
+                    if logger:
+                        logger.debug('{} set to {}'.format(m,'saving running estimators clones'))
+                    m.locked_running_mean=m.running_mean.data.clone()
+                    m.locked_running_var=m.running_var.data.clone()
+                else:
+                    if logger:
+                        logger.debug('{} set to {}'.format(m,'loading running estimators from clones'))
+                    m.running_mean.data=m.locked_running_mean.clone()
+                    m.running_var.data=m.locked_running_var.clone()
             m.train(train)
 
     recursive_apply(model,func)
