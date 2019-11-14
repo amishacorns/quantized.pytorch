@@ -74,11 +74,11 @@ def inception_color_preproccess(input_size, normalize=__imagenet_stats):
         transforms.Normalize(**normalize)
     ])
 
-
+from data import _DATASET_META_DATA
 def get_transform(name='imagenet', input_size=None,
                   scale_size=None, normalize=None, augment=True):
-    normalize = normalize or __imagenet_stats
     if 'imagenet' in name or name in ['imaginet','randomnet']:
+        normalize = normalize or __imagenet_stats
         scale_size = scale_size or 256
         input_size = input_size or 224
         if augment:
@@ -86,8 +86,10 @@ def get_transform(name='imagenet', input_size=None,
         else:
             return scale_crop(input_size=input_size,
                               scale_size=scale_size, normalize=normalize)
-    elif 'cifar' in name:
+    elif any([i in name for i in ['cifar100', 'cifar10', 'stl10', 'SVHN']]):
         input_size = input_size or 32
+        normalize = normalize or _DATASET_META_DATA.get(name,_DATASET_META_DATA['cifar10']).get_normalization()
+
         if augment:
             scale_size = scale_size or 40
             return pad_random_crop(input_size, scale_size=scale_size,
@@ -96,17 +98,21 @@ def get_transform(name='imagenet', input_size=None,
             scale_size = scale_size or 32
             return scale_crop(input_size=input_size,
                               scale_size=scale_size, normalize=normalize)
-    elif name == 'mnist':
-        normalize = {'mean': [0.5], 'std': [0.5]}
+    elif 'mnist' in name:
+        normalize = normalize or _DATASET_META_DATA.get(name, _DATASET_META_DATA['mnist']).get_normalization()
         input_size = input_size or 28
+        if name.endswith('_3c'):
+            pre_transform = lambda org_trans: transforms.Compose([transforms.Resize(input_size),lambda x:x.convert('RGB'),org_trans])
+        else:
+            pre_transform = lambda org_trans : org_trans
         if augment:
             scale_size = scale_size or 32
-            return pad_random_crop(input_size, scale_size=scale_size,
-                                   normalize=normalize)
+            return pre_transform(pad_random_crop(input_size, scale_size=scale_size,
+                                   normalize=normalize))
         else:
             scale_size = scale_size or 32
-            return scale_crop(input_size=input_size,
-                              scale_size=scale_size, normalize=normalize)
+            return pre_transform(scale_crop(input_size=input_size,
+                              scale_size=scale_size, normalize=normalize))
 
 
 class Lighting(object):

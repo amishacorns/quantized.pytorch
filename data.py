@@ -12,31 +12,37 @@ class _DS_META(_META):
     def __init__(self,**kwargs):
         super().__init__(**kwargs)
 
+    def get_normalization(self):
+        return {'mean': self.mean, 'std': self.std}
 
 __DATASETS_DEFAULT_PATH = 'Datasets'
 _CIFAR10=_DS_META(nclasses=10,shape=(3,32,32),mean=[.491, .482, .446],std=[.247, .243, .261])
 _CIFAR100=_DS_META(nclasses=100,shape=(3,32,32),mean=[.491, .482, .446],std=[.247, .243, .261])
+_STL10=_DS_META(nclasses=10,shape=(3,32,32),mean=[.491, .482, .446],std=[.247, .243, .261])
 _IMAGENET=_DS_META(nclasses=1000,shape=(3,224,224),mean=[0.485,0.456,0.406],std=[0.229,0.224,0.225])
 _SVHN=_DS_META(nclasses=10,shape=(3,32,32),mean=[0.437,0.444,0.473],std=[0.198,0.201,0.197])
+_MNIST=_DS_META(nclasses=10,shape=(3,32,32),mean=[0.5],std=[0.5])
+_MNIST_3C=_DS_META(nclasses=10,shape=(3,32,32),mean=[0.131]*3,std=[0.308]*3)
+
 
 _DATASET_META_DATA={
     'cifar10':_CIFAR10,
     'cifar100':_CIFAR100,
+    'stl10':_STL10,
     'imagenet':_IMAGENET,
-    'SVHN':_SVHN
+    'SVHN':_SVHN,
+    'mnist':_MNIST,
+    'mnist_3c':_MNIST_3C,
 }
 
-_IMAGINE_CONFIGS={
+_IMAGINE_CONFIGS=[
     'no_dd_kl','no_dd_mse','no_dd_sym',
-    'no_bn','dd-exp_kl','dd-ce_kl',
-    'no_dd_smooth_loss',
-    'smooth_loss',
-    'dd_only'
-}
+    'dd-exp_kl','dd-ce_kl',
+    'dd-exp', 'dd-ce']
 
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
-                limit=None,shuffle_before_limit=False):
+                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None):
     train = (split == 'train')
     if '+' in name:
         ds=None
@@ -60,6 +66,7 @@ def get_dataset(name, split='train', transform=None,
                 idx=name.find(i_cfg)
                 if idx >0:
                     ds_dir_name=os.path.join(name[:idx-1],i_cfg,name[idx+len(i_cfg)+1:])
+                    print(ds_dir_name)
                     break
             assert ds_dir_name is not None
         else:
@@ -82,7 +89,7 @@ def get_dataset(name, split='train', transform=None,
                                  transform=transform,
                                  target_transform=target_transform,
                                  download=download)
-    elif name == 'mnist':
+    elif name == 'mnist' or name == 'mnist_3c':
         return datasets.MNIST(root=root,
                               train=train,
                               transform=transform,
@@ -94,7 +101,17 @@ def get_dataset(name, split='train', transform=None,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
-    elif name == 'stl10':
+    elif 'stl10' in name:
+        if train and name.endswith('train_test'):
+            return datasets.STL10(root=root,
+                              split='train',
+                              transform=transform,
+                              target_transform=target_transform,
+                              download=download) + datasets.STL10(root=root,
+                              split='test',
+                              transform=transform,
+                              target_transform=target_transform,
+                              download=download)
         return datasets.STL10(root=root,
                               split=split,
                               transform=transform,
@@ -110,9 +127,9 @@ def get_dataset(name, split='train', transform=None,
                                     target_transform=target_transform)
         if limit:
             if 'no_dd' in name:
-                ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit)
+                ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
             else:
-                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit)
+                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
         return ds
     elif name.startswith('random-'):
         ds_name = name[7:]
@@ -130,11 +147,13 @@ def get_dataset(name, split='train', transform=None,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
 
 
-def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=0):
+def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=None):
     assert isinstance(dataset,datasets.DatasetFolder)
+
     if shuffle:
         import random
         random.seed(seed)
+        print(f'shufflling with seed{seed}')
     samps = []
     if per_class:
         num_classes = len(dataset.classes)
