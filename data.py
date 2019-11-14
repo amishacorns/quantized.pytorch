@@ -66,7 +66,7 @@ def get_dataset(name, split='train', transform=None,
                 idx=name.find(i_cfg)
                 if idx >0:
                     ds_dir_name=os.path.join(name[:idx-1],i_cfg,name[idx+len(i_cfg)+1:])
-                    print(ds_dir_name)
+                    #print(ds_dir_name)
                     break
             assert ds_dir_name is not None
         else:

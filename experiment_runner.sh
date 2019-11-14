@@ -18,15 +18,15 @@ RUNNING_PROCS=()
 #set -e
 #general settings
 #script accepts experiment ÍD argument
-WRN28_10_C100_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
+WRN28_10_C100_PATH=results/wresnet28-10_ba_m10_cifar100/checkpoint.pth.tar
 R44_C100_PATH=results/resnet44_ba_m40_cifar100/model_best.pth.tar
 R44_C10_PATH=results/resnet44_cifar10/model_best.pth.tar
-R18_IMGNT_PATH=''
+R18_IMGNT_PATH=/home/mharoush/.torch/models/resnet18-5c106cde.pth
 ##### default settings
 #STEP_LIMIT="--steps-limit 16000"
 DEVICE_ID_C=(0 1 2 3)
 EXP_RUNNER_LOGDIR='exp_runner_logs'
-N_EXP_PER_GPU=2
+N_EXP_PER_GPU=1
 EXP=${1:-1}
 DATASET_C=('cifar10-raw')
 DATA_SIZE_C=('@')
@@ -40,6 +40,9 @@ AUX_SCALE_C=(0.01)
 BATCH_SIZE=512
 W_BITS=2
 ACT_BITS=4
+CV_FC_A=4
+CV_FC_W=4
+STEPS_PER_EPOCH=200
 W_RANGE_MOD='--free-w-range'
 T_W_PATH=$R44_C10_PATH
 EXT_MODEL_CFG=
@@ -53,97 +56,203 @@ x=$DEVICE_ID_C
 for i in ${DEVICE_ID_C[@]:1}; do x=$x,$i; done
 export CUDA_VISIBLE_DEVICES=$x
 
+#if [ $EXP -eq 1 ]
+#then
+#    ##### EXP=1 - find best lr per loss function
+#    EXP_G='loss_and_lr'
+#    LOSS_C=('mse' )
+#    #LR_C=(50 5 2) loss diverged under these values
+#    # best 90.9 0.6951928
+#    LR_C=(0.6951928)
+#    #####
+#elif [ $EXP -eq 11 ]
+#then
+#    ##### EXP=1 - find best lr per loss function
+#    EXP_G='loss_and_lr'
+#    LOSS_C=('smoothl1')
+#    #LR_C=(50 5 ) loss diverged under these values
+#    # best 90.13 0.6951928
+#    #####
+#elif [ $EXP -eq 12 ]
+#then
+#    ##### EXP=1 - find best lr per loss function
+#    EXP_G='loss_and_lr'
+#    LOSS_C=('kld')
+#    LR_C=(100 70 30) #best 91.24 50
+#    #####
+#
+#elif [ $EXP -eq 2 ]
+#then
+#    ##### EXP=2 -compare results of different batch normalization schemes
+#    EXP_G='loss_and_lr'
+#    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
+#    LOSS_C=('mse')
+#    LR_C=(0.6951928)
+#    #####
+#elif [ $EXP -eq 21 ]
+#then
+#    ##### EXP=2 -compare results of different batch normalization schemes
+#    EXP_G='loss_and_lr'
+#    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
+#    LOSS_C=('smoothl1')
+#    LR_C=(1.)
+#    #####
+#elif [ $EXP -eq 22 ]
+#then
+#    ##### EXP=2 -compare results of different batch normalization schemes
+#    EXP_G='loss_and_lr'
+#    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
+#    LOSS_C=('kld')
+#    LR_C=(100)
+#    #####
+#elif [ $EXP -eq 3 ]
+#then
+#    ##### EXP=3 - compare aux losses + mixup
+#    EXP_G='aux_and_mixup'
+#    BN_MOD_C=('@','--fresh-bn') #todo use best from exp 2
+#    AUX_C=('mse' 'smoothl1' 'cos') #todo search over loss/aux scales?
+#    LOSS_C=('mse')
+#    MIXUP_C=('@' '--mixup') #todo test on main loss only
+#    LR_C=(0.7)
+#    #####
+#elif [ $EXP -eq 301 ]
+#then
+#    ##### EXP=3 - compare aux losses + mixup
+#    EXP_G='aux_and_mixup'
+#    BN_MOD_C=('@','--fresh-bn') #todo use best from exp 2
+#    AUX_C=('kld') #todo search over loss/aux scales?
+#    LOSS_C=('mse')
+#    MIXUP_C=('@' '--mixup') #todo test on main loss only
+#    LR_C=(0.7)
+#    #####
+#elif [ $EXP -eq 31 ]
+#then
+#    ##### EXP=3 - compare aux losses + mixup
+#    EXP_G='aux_and_mixup'
+#    BN_MOD_C=('@') #todo use best from exp 2
+#    AUX_C=('kld' ) #todo search over loss/aux scales?
+#    AUX_SCALE_C=(0.6 0.3 0.06 0.01 0.005)
+#    LOSS_C=('kld')
+#    MIXUP_C=('@' '--mixup')
+#    LR_C=(100)
+#    #####
+#elif [ $EXP -eq 311 ]
+#then
+#    ##### EXP=3 - compare aux losses + mixup
+#    EXP_G='aux_and_mixup'
+#    AUX_C=('mse' 'smoothl1' 'cos')
+#    LOSS_C=('kld')
+#    AUX_SCALE_C=(0.01 0.005) #mse tried 0.1, 0.05
+#    MIXUP_C=('@' '--mixup')
+#    LR_C=(100)
+#    #####
 if [ $EXP -eq 1 ]
 then
-    ##### EXP=1 - find best lr per loss function
-    EXP_G='loss_and_lr'
-    LOSS_C=('mse' )
-    #LR_C=(50 5 2) loss diverged under these values
-    # best 90.9 0.6951928
-    LR_C=(0.6951928)
-    #####
+    ##### EXP=1 - cifar10 dataset alternatives
+    DATASET_C=('random-cifar10' 'imagine-cifar10-r44-no_dd_kl_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' \
+                'imagine-cifar10-r44-dd-exp_r1000_k5s1')
+    EXP_G='abs@cifar10_datasets_final'
+    BN_MOD_C=('@') #todo best from exp 2 --fresh-bn
+    DATA_SIZE_C=(50 4000)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01) #todo best from exp3
+    LOSS_C=('kld') #todo best from exp3
+    LR_C=(100)
+    MIXUP_C=('--mixup')
+    BATCH_SIZE=512
+    W_BITS=2
+    ACT_BITS=4
+    CV_FC_A=4
+    CV_FC_W=4
+    SEED_C=(1)
+    N_EXP_PER_GPU=2
+#elif [ $EXP -eq 11 ]
+#then
+#    ##### EXP=1 cifar10 dataset alternatives
+#    DATASET_C=('random-cifar10' 'imagine-cifar10-r44-no_dd_kl_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' \
+#                'imagine-cifar10-r44-dd-exp_r1000_k5s1')
+#    EXP_G='abs@cifar10'
+#    BN_MOD_C=('@')
+#    DATA_SIZE_C=(4000 50)
+#    AUX_C=('smoothl1')
+#    AUX_SCALE_C=(0.01) #todo best from exp3
+#    LOSS_C=('kld') #todo best from exp3
+#    LR_C=(100)
+#    MIXUP_C=('--mixup')
+#    BATCH_SIZE=512
+#    W_BITS=2
+#    ACT_BITS=4
+#    CV_FC_A=4
+#    CV_FC_W=4
+#    SEED_C=(1)
+#    N_EXP_PER_GPU=2
 elif [ $EXP -eq 11 ]
 then
-    ##### EXP=1 - find best lr per loss function
-    EXP_G='loss_and_lr'
-    LOSS_C=('smoothl1')
-    #LR_C=(50 5 ) loss diverged under these values
-    # best 90.13 0.6951928
-    #####
-elif [ $EXP -eq 12 ]
-then
-    ##### EXP=1 - find best lr per loss function
-    EXP_G='loss_and_lr'
-    LOSS_C=('kld')
-    LR_C=(100 70 30) #best 91.24 50
-    #####
+    ##### EXP=1 - data impact raw
+    DATASET_C=('cifar10-raw' 'imagine-cifar10-r44-no_dd_kl_r1000' 'imagine-cifar10-r44-no_dd_kl_r500' \
+                'imagine-cifar10-r44-no_dd_kl_r100' 'imagine-cifar10-r44-no_dd_kl_r50' \
+                'imagine-cifar10-r44-no_dd_kl_r20'  'imagine-cifar10-r44-no_dd_kl_r10')
+    EXP_G='abs@cifar10_data_size_final'
+    EXT_FLAGS="--calibration-set-size 5 --shuffle-calibration-steps 200"
+    BN_MOD_C=('@') #todo best from exp 2 --fresh-bn
+    DATA_SIZE_C=(50 100 500 1000 2000 4000 1 10)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01) #todo best from exp3
+    LOSS_C=('kld') #todo best from exp3
+    LR_C=(100)
+    MIXUP_C=('--mixup')
+    BATCH_SIZE=512
+    W_BITS=2
+    ACT_BITS=4
+    CV_FC_A=4
+    CV_FC_W=4
+    SEED_C=(2 3 4 5 6)
+    N_EXP_PER_GPU=1
 
 elif [ $EXP -eq 2 ]
 then
-    ##### EXP=2 -compare results of different batch normalization schemes
-    EXP_G='loss_and_lr'
-    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
-    LOSS_C=('mse')
-    LR_C=(0.6951928)
-    #####
-elif [ $EXP -eq 21 ]
-then
-    ##### EXP=2 -compare results of different batch normalization schemes
-    EXP_G='loss_and_lr'
-    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
-    LOSS_C=('smoothl1')
-    LR_C=(1.)
-    #####
-elif [ $EXP -eq 22 ]
-then
-    ##### EXP=2 -compare results of different batch normalization schemes
-    EXP_G='loss_and_lr'
-    BN_MOD_C=('--fresh-bn') #,'--absorb-bn')
-    LOSS_C=('kld')
+    EXP_G='abs@wr28-10-cifar100_final'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' \
+                'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' \
+                'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--calibration-set-size 50 --shuffle-calibration-steps 200" #"--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    DEPTH=28
+    DATA_SIZE_C=(50 200)
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01) #todo best from exp3
+    LOSS_C=('kld') #todo best from exp3
     LR_C=(100)
-    #####
+    MIXUP_C=('--mixup')
+    SEED_C=(1)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=1
+    W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=4
+    CV_FC_W=4
 elif [ $EXP -eq 3 ]
 then
-    ##### EXP=3 - compare aux losses + mixup
-    EXP_G='aux_and_mixup'
-    BN_MOD_C=('@','--fresh-bn') #todo use best from exp 2
-    AUX_C=('mse' 'smoothl1' 'cos') #todo search over loss/aux scales?
-    LOSS_C=('mse')
-    MIXUP_C=('@' '--mixup') #todo test on main loss only
-    LR_C=(0.7)
-    #####
-elif [ $EXP -eq 301 ]
-then
-    ##### EXP=3 - compare aux losses + mixup
-    EXP_G='aux_and_mixup'
-    BN_MOD_C=('@','--fresh-bn') #todo use best from exp 2
-    AUX_C=('kld') #todo search over loss/aux scales?
-    LOSS_C=('mse')
-    MIXUP_C=('@' '--mixup') #todo test on main loss only
-    LR_C=(0.7)
-    #####
-elif [ $EXP -eq 31 ]
-then
-    ##### EXP=3 - compare aux losses + mixup
-    EXP_G='aux_and_mixup'
-    BN_MOD_C=('@') #todo use best from exp 2
-    AUX_C=('kld' ) #todo search over loss/aux scales?
-    AUX_SCALE_C=(0.6 0.3 0.06 0.01 0.005)
-    LOSS_C=('kld')
-    MIXUP_C=('@' '--mixup')
-    LR_C=(100)
-    #####
-elif [ $EXP -eq 311 ]
-then
-    ##### EXP=3 - compare aux losses + mixup
-    EXP_G='aux_and_mixup'
-    AUX_C=('mse' 'smoothl1' 'cos')
-    LOSS_C=('kld')
-    AUX_SCALE_C=(0.01 0.005) #mse tried 0.1, 0.05
-    MIXUP_C=('@' '--mixup')
-    LR_C=(100)
-    #####
-
+    EXP_G='abs@r18-imagenet_final'
+    N_EXP_PER_GPU=1
+    DATASET_C=('imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000_k5s1' 'imagine-imagenet-r18_dd-exp_r1000_k5s1')
+    EXT_FLAGS=  #"--recalibrate --calibration-set-size 10 --shuffle-calibration-steps 200"
+    T_W_PATH=$R18_IMGNT_PATH
+    AUX_C=('smoothl1')
+    AUX_SCALE_C=(0.01) #todo best from exp3
+    MIXUP_C=('--mixup')
+    LR_C=(999)
+    DATA_SIZE_C=(10)
+    STEPS_PER_EPOCH=400
+    DEPTH=18
+    BATCH_SIZE=128
+    W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
+    SEED_C=(1)
 elif [ $EXP -eq 4 ]
 then
     ##### EXP=4 - compare data impact mixup
@@ -186,77 +295,218 @@ then
     #####
 elif [ $EXP -eq 5 ]
 then
-    EXP_G='quality_calibration'
+    EXP_G='abs@quality_calibration_r44-cifar10_2W4A'
     #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
-    DATASET_C=('cifar10-raw' 'imagine-cifar10-r44-dd_r100' 'imagine-cifar10-r44-dd_r500' 'imagine-cifar10-r44-dd_r1000' 'imagine-cifar10-r44-no_dd_r100' 'imagine-cifar10-r44-no_dd_r500' 'imagine-cifar10-r44-no_dd_r1000')
-    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
+    DATASET_C=('imagine-cifar10-r44-dd-exp_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-no_dd_sym_r1000')    #'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000' 'imagine-cifar10-r44-dd-exp_r1000' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-dd-exp_r1000' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000' )
+    # 'imagine-cifar10-r44-dd-exp_r1000' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-dd-exp_r1000' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000' )
+    EXT_FLAGS="--recalibrate --calibration-set-size 50 --shuffle-calibration-steps 200"
     BATCH_SIZE=256
-    W_BITS=4
+    W_BITS=2
+    ACT_BITS=4
+    CV_FC_A=4
+    CV_FC_W=4
     SEED_C=(1 2 3 4 5)
-    N_EXP_PER_GPU=4
+    N_EXP_PER_GPU=3
+    MIXUP_C=('@')
+
 elif [ $EXP -eq 501 ]
 then
-    EXP_G='quality_calibration'
+    EXP_G='abs@quality_calibration_r44-cifar10'
     #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
-    DATASET_C=('imagine-cifar10-r44-no_bn_r100')
-    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
+    DATASET_C=('imagine-cifar10-r44-dd-exp_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-no_dd_sym_r1000')    #'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000' 'imagine-cifar10-r44-dd-exp_r1000' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-dd-exp_r1000' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000' )
+    #'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000' 'imagine-cifar10-r44-dd-exp_r1000' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-dd-exp_r1000' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000' )
+    EXT_FLAGS="--recalibrate --calibration-set-size 50 --shuffle-calibration-steps 200"
     BATCH_SIZE=256
     W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
     SEED_C=(1 2 3 4 5)
-    N_EXP_PER_GPU=4
+    N_EXP_PER_GPU=3
+    MIXUP_C=('@')
 elif [ $EXP -eq 502 ]
 then
-    EXP_G='quality_calibration'
+    EXP_G='abs@quality_calibration_r44-cifar10'
     #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
-    DATASET_C=('random-cifar10')
-    EXT_FLAGS="--recalibrate --calibration-set-size 50000 --shuffle-calibration-steps 200"
+    DATASET_C=('imagine-cifar10-r44-dd-exp_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-no_dd_sym_r1000')    #'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000' 'imagine-cifar10-r44-dd-exp_r1000' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-dd-exp_r1000' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000' )
+    EXT_FLAGS="--recalibrate --calibration-set-size 50 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    W_BITS=8
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
+    SEED_C=(1 2 3 4 5)
+    N_EXP_PER_GPU=3
+    MIXUP_C=('@')
+elif [ $EXP -eq 503 ]
+then
+    EXP_G='abs@quality_calibration_r44-cifar10'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('imagine-cifar10-r44-dd-exp_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'cifar10-raw' 'random-cifar10' 'imagine-cifar10-r44-no_dd_sym_r1000')
+    EXT_FLAGS="--recalibrate --calibration-set-size 50 --shuffle-calibration-steps 200"
     BATCH_SIZE=256
     W_BITS=4
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
     SEED_C=(1 2 3 4 5)
-    N_EXP_PER_GPU=4
+    N_EXP_PER_GPU=3
+    MIXUP_C=('@')
+elif [ $EXP -eq 51 ]
+then
+    EXP_G='abs@quality_calibration_wr28-10-cifar100'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' 'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' 'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    DEPTH=28
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=3
+    W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=4
+    CV_FC_W=4
+    MIXUP_C=('@')
+
 elif [ $EXP -eq 511 ]
 then
-    EXP_G='quality_calibration_cifar100'
-    N_EXP_PER_GPU=2
+    EXP_G='abs@quality_calibration_wr28-10-cifar100'
     #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
-    DATASET_C=('random-cifar100')
-    EXT_FLAGS="--recalibrate --calibration-set-size 5000 --shuffle-calibration-steps 200"
-    DATA_SIZE_C=(5000)
-    AUX_C=('smoothl1')
-    AUX_SCALE_C=(0.01)
-    LR_C=(50)
-    SEED_C=(1 2 3 4 5)
-    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
-    EXT_MODEL_CFG=",'width':[160,320,640]"
-    DEPTH=28
-    W_RANGE_MOD=
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' 'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' 'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
     BATCH_SIZE=256
-    W_BITS=4
+    DEPTH=28
     SEED_C=(1 2 3 4 5)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=3
+    W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
+    MIXUP_C=('@')
 elif [ $EXP -eq 512 ]
 then
-    EXP_G='quality_calibration_cifar100'
-    N_EXP_PER_GPU=2
+    EXP_G='abs@quality_calibration_wr28-10-cifar100'
     #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
-    DATASET_C=('crossover@cifar100@imagine-cifar10-r44-no_dd_r1000' 'crossover@cifar100@imagine-cifar10-r44-dd_r1000' 'crossover@cifar100@imagine-cifar10-r44-no_bn_r100')
-    EXT_FLAGS="--recalibrate --calibration-set-size 500 --shuffle-calibration-steps 200"
-    DATA_SIZE_C=(5000)
-    AUX_C=('smoothl1')
-    AUX_SCALE_C=(0.01)
-    LR_C=(50)
-    SEED_C=(1 2 3 4 5)
-    T_W_PATH=results/wresnet28-10_ba_m10/checkpoint.pth.tar
-    EXT_MODEL_CFG=",'width':[160,320,640]"
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' 'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' 'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
     DEPTH=28
-    W_RANGE_MOD=
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=3
+    W_BITS=8
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
+    MIXUP_C=('@')
+elif [ $EXP -eq 513 ]
+then
+    EXP_G='abs@quality_calibration_wr28-10-cifar100'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' 'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' 'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    DEPTH=28
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=3
+    W_BITS=4
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
+    MIXUP_C=('@')
+elif [ $EXP -eq 514 ]
+then
+    EXP_G='abs@quality_calibration_wr28-10-cifar100'
+    #'cifar10-raw' 'imagine-cifar10-r44-r1000' 'imagine-cifar10-r44-r5000' 'imagine-cifar10-r44-r10000' 'imagine-cifar10-r44-r15000' 'imagine-cifar10-r44-r20000'
+    DATASET_C=('cifar100-raw' 'random-cifar100' 'imagine-cifar100-wr28-10-no_dd_kl_r1000' 'imagine-cifar100-wr28-10-dd-exp_kl_r1000_k5s0.375' 'imagine-cifar100-wr28-10-dd-exp_r1000_k5s0.375')
+    EXT_FLAGS="--recalibrate --calibration-set-size 5 --shuffle-calibration-steps 200"
+    BATCH_SIZE=256
+    DEPTH=28
+    SEED_C=(1 2 3 4 5)
+    T_W_PATH=$WRN28_10_C100_PATH
+    EXT_MODEL_CFG=",'width':[160,320,640]"
+    N_EXP_PER_GPU=3
+    W_BITS=8
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
+    MIXUP_C=('@')
+elif [ $EXP -eq 52 ]
+then
+    EXP_G='abs@quality_calibration_r18-imagenet_new'
+    N_EXP_PER_GPU=1
+    DATASET_C=('imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000_k5s1' 'imagine-imagenet-r18_dd-exp_r1000_k5s1')
+    EXT_FLAGS="--recalibrate --calibration-set-size 10 --shuffle-calibration-steps 200"
+    T_W_PATH=$R18_IMGNT_PATH
+    DEPTH=18
     BATCH_SIZE=256
     W_BITS=4
+    ACT_BITS=4
+    CV_FC_A=8
+    CV_FC_W=8
+    SEED_C=(1 2 3 4 5)
+    MIXUP_C=('@')
+
+elif [ $EXP -eq 521 ]
+then
+    EXP_G='abs@quality_calibration_r18-imagenet_new'
+    N_EXP_PER_GPU=1
+    DATASET_C=('imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000_k5s1' 'imagine-imagenet-r18_dd-exp_r1000_k5s1')
+    #'imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000')
+    EXT_FLAGS="--recalibrate --calibration-set-size 10 --shuffle-calibration-steps 200"
+    T_W_PATH=$R18_IMGNT_PATH
+    DEPTH=18
+    BATCH_SIZE=256
+    W_BITS=4
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
+    SEED_C=(1 2 3 4 5)
+    MIXUP_C=('@')
+
+elif [ $EXP -eq 522 ]
+then
+    EXP_G='abs@quality_calibration_r18-imagenet_new'
+    N_EXP_PER_GPU=1
+    DATASET_C=('imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000_k5s1' 'imagine-imagenet-r18_dd-exp_r1000_k5s1')
+    EXT_FLAGS="--recalibrate --calibration-set-size 10 --shuffle-calibration-steps 200"
+    T_W_PATH=$R18_IMGNT_PATH
+    DEPTH=18
+    BATCH_SIZE=256
+    W_BITS=8
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
+    SEED_C=(1 2 3 4 5)
+    MIXUP_C=('@')
+
+elif [ $EXP -eq 523 ]
+then
+    EXP_G='abs@quality_calibration_r18-imagenet_8w8a'
+    N_EXP_PER_GPU=1
+    DATASET_C=('imagine-imagenet-r18-dd-exp_r1000')
+    #'imagenet' 'random-imagenet' 'imagine-imagenet-r18-no_dd_kl_r1000' 'imagine-imagenet-r18_dd-exp_kl_r1000')
+    EXT_FLAGS="--recalibrate --calibration-set-size 10 --shuffle-calibration-steps 200"
+    T_W_PATH=$R18_IMGNT_PATH
+    DEPTH=18
+    BATCH_SIZE=256
+    W_BITS=8
+    ACT_BITS=8
+    CV_FC_A=8
+    CV_FC_W=8
     SEED_C=(1 2 3 4 5)
 elif [ $EXP -eq 6 ]
 then
-    EXP_G='quality_distilation'
-    DATASET_C=('imagine-cifar10-r44-r1k' 'imagine-cifar10-r44-r5k' 'imagine-cifar10-r44-r10k' 'imagine-cifar10-r44-r15k')
-    DATA_SIZE_C=(4000 5000 6000)
+    EXP_G='abs@cifar10_distilation'
+    DATASET_C=('cifar10-raw' 'imagine-cifar10-r44-no_dd_sym_r1000' 'imagine-cifar10-r44-dd-exp_kl_r1000_k5s1' 'imagine-cifar10-r44-dd-exp_r1000_k5s1' )
+    DATA_SIZE_C=(50)
 elif [ $EXP -eq 0 ]
 then
     EXP_G='compare_gen_methods'
@@ -405,18 +655,18 @@ do
             echo lr_scale: $LR
             echo aux_scale: $AUX_S
 
-            M_CFG="{'depth': $DEPTH, 'regime':'sgd_cos_staggerd_1', 'conv1':{'a': 4,'w':4},'fc':{'a': 4,'w':4}, 'activations_numbits':$ACT_BITS,'weights_numbits':$W_BITS, 'bias_quant':False $LR_ $EXT_MODEL_CFG}"
+            M_CFG="{'depth': $DEPTH, 'regime':'sgd_cos_staggerd_1', 'conv1':{'a': $CV_FC_A,'w':$CV_FC_W},'fc':{'a': $CV_FC_A,'w':$CV_FC_W}, 'activations_numbits':$ACT_BITS,'weights_numbits':$W_BITS, 'bias_quant':False $LR_ $EXT_MODEL_CFG}"
             echo '>' start experiment $EXP_COUNT' / '$TOT_EXP_TO_RUN, cfg: $M_CFG
             eval python qdistiler_main.py --model resnet --model_config '"$M_CFG"'  --teacher $T_W_PATH --dataset $DATASET \
-            --train-first-conv --steps-per-epoch 200 --quant-freeze-steps -1 --b $BATCH_SIZE --device_ids $GPU_ID $W_RANGE_MOD \
-            $SIZE_ --exp-group $EXP_G $AUX_ --loss $LOSS $STEP_LIMIT $BN_MOD_ $AUX_S_ $MIX_\
+            --train-first-conv --steps-per-epoch $STEPS_PER_EPOCH --quant-freeze-steps -1 -b $BATCH_SIZE --device_ids $GPU_ID $W_RANGE_MOD \
+            $SIZE_ --exp-group $EXP_G $AUX_ --kd-loss $LOSS $STEP_LIMIT $BN_MOD_ $AUX_S_ $MIX_\
             $EXT_FLAGS --print-freq 100 --seed $SEED 2> $EXP_RUNNER_LOGDIR/$EXP'_'$EXP_COUNT'_stderr.log' &
             EXP_PROC="$!"
             echo "> pid for exp $EXP_COUNT $EXP_PROC"
             let EXP_COUNT=$EXP_COUNT+1
             RUNNING_PROCS+=("$EXP_PROC")
             #sleep to avoid result dir overwrite
-            sleep 5
+            sleep 10
 
             let GPU_ID=$GPU_ID+1
             let GPU_ID=$GPU_ID%${#DEVICE_ID_C[@]}

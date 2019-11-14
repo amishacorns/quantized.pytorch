@@ -1016,7 +1016,7 @@ def resnet(**config):
             model = ResNet_imagenet(**config)
         return model
 
-    elif dataset == 'cifar10':
+    elif dataset in ['cifar10', 'mnist_3c','SVHN','stl10']:
         config.setdefault('num_classes', 10)
         config.setdefault('depth', 44)
         return ResNet_cifar(block=BasicBlock, **config)
