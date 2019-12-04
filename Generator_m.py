@@ -193,6 +193,51 @@ _MODEL_CONFIGS={
 
 }
 
+
+class GenLoader():
+    def __init__(self, input_data, nclasses, target_mode='random', limit=10):
+        self.data = input_data
+        self.nclasses = nclasses
+        self.target_mode = target_mode
+        self.limit = limit
+
+    class GenIterator():
+        _TARGET_MODES = ['random', 'running']
+
+        def __init__(self, input_data, nclasses, target_mode='random', limit=10):
+            assert target_mode in GenLoader.GenIterator._TARGET_MODES
+            self.data = input_data
+            self.nclasses = nclasses
+            self.target_mode = target_mode
+            self.iter = 0
+            self.iter_limit = limit
+
+        def reset_buffer(self):
+            # reset buffer
+            with th.no_grad():
+                self.data.detach()
+                self.data.normal_()
+
+        def __next__(self):
+            self.reset_buffer()
+            if self.iter > self.iter_limit:
+                raise StopIteration
+            if self.target_mode == 'running':
+                target = (th.arange(self.shape[0], device=self.data.device) + self.iter * self.data.shape[
+                    0]) % self.nclasses
+            else:
+                # random mode should normally be used unless batch size is much larger then number of classes
+                target = th.randint(0, self.nclasses, (self.data.shape[0],), device=self.data.device)
+            self.iter += 1
+            return self.data, target
+
+        def __len__(self):
+            return self.iter_limit
+
+    def __iter__(self):
+        return GenLoader.GenIterator(self.data, self.nclasses, self.target_mode, self.limit)
+
+
 class GussianSmoothingLoss(nn.Module):
     def __init__(self,sigma=1,kernel_size=3,channels=3):
         super(GussianSmoothingLoss,self).__init__()
@@ -863,15 +908,19 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
 
             if (inputs.shape[2:]) != inp_shape[1:]:
                 inputs = nn.functional.interpolate(inputs, mode='bilinear', size=inp_shape[1:])
+
             if mixer:
-                inputs = mixer(inputs)
+                inputs = mixer(inputs, [0.5, inputs.size(0), True])
+                labels = mixer(target=labels)
+
             out = model(inputs)
 
-            if args.measure and args.record_output_stats:
+            if args.measure:
                 soft_out = F.softmax(out.detach() / args.output_temp).cpu().numpy()
                 output_meter.update(soft_out.mean(0))
                 output_meter_hard.update(hot_one_map[soft_out.argmax(1)].mean(0))
-                CE_meter.update(CE(out.detach(), labels))
+                if labels.max()<= out.size(-1):
+                    CE_meter.update(CE(out.detach(), labels))
 
             ## model activations statistics loss
             if args.calc_stats_loss:
@@ -905,6 +954,10 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             if args.use_dd_loss:
                 if args.dd_loss_mode == 'exp':
                     ## exponentioal dd loss contribution decays as logit norm grows
+                    # if mixer:
+                    #     labels=out.gather(1, labels.unsqueeze(1).nonzero())
+                    #     loss = (th.exp(-().mean() * args.cls_scale)))
+                    # else:
                     loss = (th.exp(-(out.gather(1, labels.unsqueeze(1)).mean() * args.cls_scale)))
                 elif args.dd_loss_mode == 'ce':
                     loss = CE(out, labels) * args.cls_scale
@@ -991,11 +1044,8 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             loss_stat_avg.reset()
             loss_smoothness.reset()
 
+    final_results = f'BNloss_{args.stats_loss_mode}-{loss_stat_avg.avg:.3f}_prior-{loss_smoothness.avg:.3f}_top1-{top1.avg * 100:.2f}_CE-{CE_meter.avg:.3f}'
     if args.measure:
-        final_results = f'BNloss_{args.stats_loss_mode}-{loss_stat_avg.avg:.3f}_prior-{loss_smoothness.avg:.3f}_top1-{top1.avg * 100:.2f}_CE-{CE_meter.avg:.3f}'
-        print(final_results)
-
-    if args.measure and args.record_output_stats:
         t_name = f'model-'
         if args.preset != '':
             t_name += args.preset
@@ -1031,16 +1081,17 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             ax.bar([str(i.item()) for i in id], val, width=1)
         ax.legend(t_tags)
         fig.set_size_inches(12, 9)
-        # if FID:
-        #     fid, _ = FID(report=True)
-        #     fid.sqrt_()
-        #     regs['fid_ref_desc'] = FID.ref_path[:-4]
-        #     final_results += '_' + FID_ref_desc + f'_score-{fid.item():.3f}'
-        regs['final_results'] = final_results
-        th.save(regs, f'Summary_{t_name}.pth')
         save_fig_path = t_name + final_results
         fig.savefig(save_fig_path + '.jpg')
-        print(t_name)
+        if FID:
+            fid, _ = FID(report=True)
+            fid.sqrt_()
+            regs['fid_ref_desc'] = FID.ref_path[:-4]
+            final_results += '_' + FID.ref_path[:-4] + f'_score-{fid.item():.3f}'
+        regs['final_results'] = final_results
+        th.save(regs, f'Summary_{t_name}.pth')
+
+        print(final_results)
 
 
 def main():
@@ -1058,7 +1109,6 @@ def main():
         args.dataset=cfg.dataset
         args.model_config=cfg.model_config
         args.model=cfg.model
-        factory_method=cfg.factory_method
         meta = cfg.ds_meta
         args.exp_tag=args.preset+args.preset_sub_model+args.exp_tag
         #last_layer_fetcher=getattr(cfg,'get_final_layer',None)
@@ -1087,7 +1137,7 @@ def main():
     num_parameters = sum([l.nelement() for l in model.parameters()])
     print(f"number of parameters: {num_parameters}")
 
-
+    ### todo: simplify by absorbing all bn parameters and returning the list of affine transformation parameters
     ## absorb batch normalization so layers statistics are normalized. we want to track the batch statistics for
     # the loss function for each iteration, setting momentum to 1 lets us access this information
     if args.calc_stats_loss:
@@ -1124,19 +1174,10 @@ def main():
             if is_bn(m):
                 m.register_forward_hook(layer_stats_hook(stat_list,device))
 
-    # layer_norm_c={}
-    # collect = False
-    # if args.masking:
-    #     measure_model=model.clone()
-    #     for m in measure_model.modules():
-    #         if is_bn(m):
-    #             m.register_forward_hook(layer_c_norm_hook(layer_norm_c,device,collect))
-
     if args.mixup:
-        print('WARNING - measuring with INPUT MIXING!')
-        mixup = MixUp()
-        mixup.to(device)
-        mixer = lambda inputs: mixup(inputs, [0.5, inputs.size(0), True])
+        print('WARNING - running with INPUT MIXING!')
+        mixer = MixUp()
+        mixer.to(device)
     else:
         mixer = None
 
@@ -1236,47 +1277,6 @@ def main():
 
     dream_image = th.nn.Parameter(th.randn((args.batch_size,) + gen_shape, device=device))
 
-    class GenLoader():
-        def __init__(self,input_data,nclasses,target_mode='random',limit=10):
-            self.data=input_data
-            self.nclasses=nclasses
-            self.target_mode=target_mode
-            self.limit = limit
-
-        class GenIterator():
-            _TARGET_MODES = ['random', 'running']
-            def __init__(self, input_data, nclasses, target_mode='random', limit=10):
-                assert target_mode in GenLoader.GenIterator._TARGET_MODES
-                self.data = input_data
-                self.nclasses = nclasses
-                self.target_mode = target_mode
-                self.iter = 0
-                self.iter_limit = limit
-
-            def reset_buffer(self):
-                # reset buffer
-                with th.no_grad():
-                    self.data.detach()
-                    self.data.normal_()
-
-            def __next__(self):
-                self.reset_buffer()
-                if self.iter> self.iter_limit:
-                    raise StopIteration
-                if self.target_mode == 'running':
-                    target = (th.arange(self.shape[0], device=self.data.device) + self.iter * self.data.shape[0]) % self.nclasses
-                else:
-                    #random mode should normally be used unless batch size is much larger then number of classes
-                    target = th.randint(0, self.nclasses, (self.data.shape[0],), device=self.data.device)
-                self.iter+=1
-                return self.data,target
-
-            def __len__(self):
-                return self.iter_limit
-
-        def __iter__(self):
-            return GenLoader.GenIterator(self.data,self.nclasses,self.target_mode,self.limit)
-
     if args.SGD:
         optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
     else:
@@ -1289,158 +1289,9 @@ def main():
 
     forward(model, train_loader, inp_shape, args, device, b_aug, input_stats, optimizer_im, smooth_loss, cont_loss, stat_list,
             mixer=mixer, FID=FID,save_path=save_path,time_stamp=exp_start_time_stamp,log=log)
-    #
-    # def generate():
-    #     n_iter = (args.n_samples_to_generate * args.nclasses) // args.batch_size
-    #
-    #     batch_time = AverageMeter()
-    #     generator_time = AverageMeter()
-    #     top1 = AverageMeter()
-    #     top5 = AverageMeter()
-    #     loss_avg = AverageMeter()
-    #     loss_cont_avg = AverageMeter()
-    #     loss_stat_avg = AverageMeter()
-    #     loss_smoothness = AverageMeter()
-    #     end = time.time()
-    #
-    #     for e in range(n_iter):
-    #         if args.use_dd_loss and args.batch_size < max(args.nclasses,64):
-    #             ## choose random targets
-    #             print('selecting random targets for generation')
-    #             label_ = th.randint(0,args.nclasses,(args.batch_size,),device=dream_image.device)
-    #         else:
-    #             label_ =(th.arange(args.batch_size,device=dream_image.device) + e * args.batch_size)%args.nclasses
-    #         for n_replay in range(args.replay_latent):
-    #             with th.no_grad():
-    #                 dream_image.data.mul_(255).add_(0.5).clamp_(15, 255).floor_().div_(255)
-    #             input = dream_image
-    #             prior_loss = th.zeros(1).to(device)
-    #             loss_stat = th.zeros(1).to(device)
-    #             loss = th.zeros(1).to(device)
-    #
-    #             if (input.shape[2:])!= inp_shape[1:]:
-    #                 #print('interpolating')
-    #                 input = nn.functional.interpolate(input,mode ='bilinear' ,size=inp_shape[1:])
-    #
-    #             if args.calc_smooth_loss:
-    #                 loss_smooth = smooth_loss(input).mean()
-    #                 if n_replay in args.smooth_scale_decay:
-    #                     args.smooth_scale=args.smooth_scale*args.smooth_scale_decay[n_replay]
-    #                     print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
-    #                 loss_smoothness.update(loss_smooth.item())
-    #                 prior_loss = prior_loss + loss_smooth*args.smooth_scale
-    #
-    #             if args.calc_cont_loss:
-    #                 loss_cont = cont_loss(input)
-    #                 loss_cont_avg.update(loss_cont.item())
-    #                 prior_loss = prior_loss + loss_cont
-    #
-    #
-    #             input = (input - mean) / std
-    #             if b_aug:
-    #                 fake, label=b_aug(input,label_)
-    #             else:
-    #                 fake, label = input, label_
-    #             if args.DEBUG_SHOW:
-    #                 plot_grid(fake)
-    #
-    #             generator_time.update(time.time() - end)
-    #             out = model(fake)
-    #
-    #             optimizer_im.zero_grad()
-    #             ## maximize class neuron (without reducing other classes scores)
-    #             if args.use_dd_loss:
-    #                 if args.dd_loss_mode=='exp':
-    #                     ## exponentioal dd loss contribution decays as logit norm grows
-    #                     loss = (th.exp(-(out.gather(1,label.unsqueeze(1)).mean()*args.cls_scale)))
-    #                 elif args.dd_loss_mode=='ce':
-    #                     loss = F.cross_entropy(out,label)*args.cls_scale
-    #                 else:
-    #                     ## linear loss
-    #                     loss = -out.gather(1, label.unsqueeze(1)).mean()*args.cls_scale
-    #
-    #
-    #             if args.use_prior_loss:
-    #                 loss = loss + prior_loss
-    #
-    #             ## model activations statistics loss
-    #             if args.calc_stats_loss:
-    #                 # norm to compare to the 0,1 input statistics
-    #                 loss_stat = calc_stats_loss(loss_stat,input,stat_list,args.stats_loss_mode)
-    #
-    #             if args.use_stats_loss:
-    #                 loss = loss + loss_stat*args.stat_scale
-    #
-    #             loss.backward()
-    #             optimizer_im.step()
-    #             batch_time.update(time.time() - end)
-    #             end = time.time()
-    #
-    #             loss_avg.update(loss.item(), args.batch_size)
-    #             loss_stat_avg.update(loss_stat.item())
-    #             t1, t5 = accuracy(out.detach(), label.detach(), (1, 5))
-    #             top1.update(t1.item()/100)
-    #             top5.update(t5.item()/100)
-    #             if n_replay + 1 in args.lr_drop_replays:
-    #                 print('lowering lr at replay {}'.format(n_replay+1))
-    #                 for p_g in optimizer_im.param_groups:
-    #                     p_g['lr']*=1e-1
-    #             if n_replay + 1 in args.snapshots_replay:
-    #                 print('saving deep dreams')
-    #                 snapshot_path=os.path.join(save_path,f'r{n_replay + 1}')
-    #                 save_batched_images(dream_image,label_,snapshot_path,f'{time_stamp}{e}',(10,5) if e<5 else None,f'snapshot_e{e}r{n_replay+1}')
-    #
-    #             if n_replay % args.report_freq == 0 or n_replay in args.snapshots_replay:
-    #                 if e==0:
-    #                     log.add(replay=n_replay,loss=loss_avg.avg,loss_smooth=loss_smoothness.avg,loss_cont=loss_cont_avg.avg,loss_stats=loss_stat_avg.avg,top1=1-top1.avg)
-    #                 print(
-    #                     f'iteration {e}/{n_iter}\t replay {n_replay}\t time {batch_time.avg:.2f}, generator time '
-    #                     f'{generator_time.avg:.2f} global loss {loss_avg.avg:.4f}, statistics loss '
-    #                     f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
-    #                     f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-    #
-    #         #end of train loop
-    #         print(
-    #             f'iteration {e} replay {n_replay + 1}, time {batch_time.avg:.3f}, generator time '
-    #             f'{generator_time.avg:.3f} global loss {loss_avg.avg:.4f}, statistics loss '
-    #             f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
-    #             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-    #
-    #         with th.no_grad():
-    #             # reset dream
-    #             print('resetting deep dream!')
-    #             # if args.use_dd_loss:
-    #             #     save_image(dream_image[:n_classes*10].detach().cpu(), f'{save_path}/class_aligned_sample_e{e}r{n_replay+1}.png',nrow=n_classes)
-    #             dream_image.detach()
-    #             dream_image.data.normal_()
-    #             print('resetting optimizer deep dreams')
-    #             if args.SGD:
-    #                 optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
-    #             else:
-    #                 optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
-    #         # reset stats
-    #         batch_time.reset()
-    #         generator_time.reset()
-    #         top1.reset()
-    #         top5.reset()
-    #         loss_avg.reset()
-    #         loss_cont_avg.reset()
-    #         loss_stat_avg.reset()
-    #         loss_smoothness.reset()
-    #         if e==0:
-    #             #log.plot(x='replay',y=['loss','loss_stats','loss_smooth','loss_cont','top1'],title=exp_tag,legend=['Global Loss','Statistics Loss','Smoothing Loss','Continuity Loss','Top1 Error'])
-    #             log.plot(x='replay',y=['loss_stats','top1'],title=exp_tag+'accuracy vs stats',legend=['Statistics Loss','Top1 Error'])
-    #             log.plot(x='replay',y=['loss_stats','loss_smooth'],title=exp_tag+'stats vs smoothness',legend=['Statistics Loss','Gaussian Smoothing Loss'])
-    #             log.save()
-    #
-    # generate()
 
 def save_batched_images(input_batch,label,root_path,prefix='',plot_sample_shape=None,plot_sample_name='sample'):
     with th.no_grad():
-        # clamped = input_batch.flatten(1, -1)
-        # clamped = clamped - clamped.min(-1, keepdim=True)[0]
-        # clamped = clamped.div(clamped.max(-1, keepdim=True)[0])
-        # input_batch = clamped.view_as(input_batch)
         for i, s in enumerate(input_batch):
             # save class to file
             buffer = s.clone()
