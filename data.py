@@ -42,7 +42,7 @@ _IMAGINE_CONFIGS=[
 
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
-                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None):
+                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None,class_ids=None):
     train = (split == 'train')
     if '+' in name:
         ds=None
@@ -129,7 +129,7 @@ def get_dataset(name, split='train', transform=None,
             if 'no_dd' in name:
                 ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
             else:
-                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
+                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
         return ds
     elif name.startswith('random-'):
         ds_name = name[7:]
@@ -147,7 +147,7 @@ def get_dataset(name, split='train', transform=None,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
 
 
-def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=None):
+def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=None,class_ids=None):
     assert isinstance(dataset,datasets.DatasetFolder)
 
     if shuffle:
@@ -155,16 +155,17 @@ def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed
         random.seed(seed)
         print(f'shufflling with seed{seed}')
     samps = []
-    if per_class:
-        num_classes = len(dataset.classes)
-        #samp_reg_per_class=[[]]*num_classes
+    if per_class or class_ids is not None:
         samp_reg_per_class={}
         for s in dataset.samples:
             if s[1] in samp_reg_per_class:
                 if shuffle or len(samp_reg_per_class[s[1]])<n_samples:
                     samp_reg_per_class[s[1]]+=[s]
+            elif class_ids is not None and s[1] not in class_ids:
+                continue
             else:
                 samp_reg_per_class[s[1]]=[s]
+
         for k in samp_reg_per_class.keys():
             if shuffle:
                 samps += random.sample(samp_reg_per_class[k],n_samples)
