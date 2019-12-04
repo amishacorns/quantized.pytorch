@@ -28,7 +28,7 @@ from scipy import linalg
 from matplotlib import pyplot as plt
 from data import get_dataset
 from preprocess import get_transform
-_VERSION=14
+_VERSION=15
 import os
 ############## cfg
 def settings():
@@ -50,7 +50,8 @@ def settings():
     measure_steps=0 #500
     measure_ds_limit=0
     measure_seed=0
-    measure_mixup=0
+    mixup=0
+    record_output_stats=0
     measure_fid=''
     fid_batch_size=512
     fid_self=False
@@ -233,7 +234,7 @@ class ContinuityLoss(nn.Module):
             # s = th.cat([lateral1, horizontal1], -1)
             # t = th.cat([lateral2, horizontal2], -1)
             diag=0
-        return (hor+diag+hor).pow(self.beta).sum()
+        return (hor+lat+diag).pow(self.beta).sum()
         #return self.criterion(s,t)
 
 
@@ -274,7 +275,7 @@ class RandCropResize(nn.Module):
         # img = th.nn.functional.upsample(img_,size=img.shape[1:],mode='bilinear').squeeze()
         im = []
         for i, (y1_, y2_, x1_, x2_) in enumerate(zip(y1, y2, x1, x2)):
-            im += [th.nn.functional.upsample(img[i:i + 1, :, y1_: y2_, x1_: x2_], size=img.shape[2:])]
+            im += [th.nn.functional.interpolate(img[i:i + 1, :, y1_: y2_, x1_: x2_], size=img.shape[2:],mode='bilinear')]
         img=th.cat(im)
         #mask = mask.expand_as(img)
         #img = img * mask
@@ -555,6 +556,8 @@ def np_calculate_activation_statistics(features):
     return mu, sigma
     
 class InceptionDistance(nn.Module):
+    #todo: FID results do not match previously reported scores, statistics as well as matrix factorization are almost
+    # identical to numpy reference
     debug_diff = lambda x, y: abs(x - y.cpu().numpy()).mean()
 
     def __init__(self,model=None,ref_inputs=None,accumulate=False,model_grad=False,input_size=None,ref_path=None):
@@ -778,80 +781,60 @@ def fgsm_attack(image, epsilon, data_grad):
     #perturbed_image = th.clamp(perturbed_image, 0, 1)
     return perturbed_image
 
-
 def forward(model, data_loader, inp_shape, args, device , batch_augment = None,normalize_inputs=None,
-                      optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,latent_replays=1):
-    if args.measure_mixup:
-        print('WARNING - measuring with INPUT MIXING!')
-        mixup = MixUp()
-        mixup.to(device)
-        mixer = lambda inputs: mixup(inputs, [0.5, inputs.size(0), True])
-    else:
-        mixer = None
+            optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,
+            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None):
 
-    if args.measure_fid != '':
-        fid_ref_dataset=get_dataset(args.measure_fid, args.split_fid,
-                                    transform=get_transform(args.measure_fid,augment=False),
-                                    limit=args.measure_ds_limit)
-        print('FID reference dataset',fid_ref_dataset)
-        fid_ref_loader = th.utils.data.DataLoader(fid_ref_dataset,
-            batch_size=args.fid_batch_size, shuffle=True,
-            num_workers=8, pin_memory=False, drop_last=False)
-
-        #tot_ref_examples=min(len(fid_ref_dataset), len(fid_ref_loader) * args.fid_batch_size)
-        FID_ref_desc=f'fid:ref-{args.measure_fid}-{args.fid_split}_lim-{args.measure_ds_limit}'
-
-        if args.fid_self==True:
-            m_name=args.model+'-'+args.model_cfg.get('depth','')
-            FID_ref_desc = f'_source-{m_name}-{args.dataset}'
-            FID=InceptionDistance(model=model,input_size=args.input_shape[1:],accumulate=True,ref_path=FID_ref_desc)
-        else:
-            FID_ref_desc += '_source-inceptionV3-imagenet'
-            FID=InceptionDistance(input_size=(299,299),accumulate=True,ref_path=FID_ref_desc)
-
-        FID.to(device)
-        FID.measure_or_load_ref_stats(fid_ref_loader)
-    else:
-        FID=None
-    CE=nn.CrossEntropyLoss().to(device)
-    CE_meter=AverageMeter()
-    output_meter=AverageMeter()
-    output_meter_hard=AverageMeter()
+    CE = nn.CrossEntropyLoss().to(device)
+    CE_meter = AverageMeter()
+    output_meter = AverageMeter()
+    output_meter_hard = AverageMeter()
+    batch_time = AverageMeter()
+    generator_time = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
     loss_avg = AverageMeter()
     loss_cont_avg = AverageMeter()
     loss_stat_avg = AverageMeter()
     loss_smoothness = AverageMeter()
-    confusion= ConfusionMeter()
-    n_out=args.nclasses
-    hot_one_map=np.eye(n_out)
-    for step, (inputs, labels) in enumerate(data_loader):
-        labels = labels.to(device)
-        inputs = inputs.to(device)
-        if optimizer is None and args.measure_ds_limit>0 and step*inputs.size(0)>=args.measure_ds_limit*n_out:
+    confusion = ConfusionMeter()
+    hot_one_map = np.eye(args.nclasses)
+    n_iter = (args.n_samples_to_generate * args.nclasses) // args.batch_size
+    end = time.time()
+    for step, (inputs_, labels_) in enumerate(data_loader):
+        labels_ = labels_.to(device)
+        inputs_ = inputs_.to(device)
+        if optimizer is None and args.measure_ds_limit > 0 and step * inputs_.size(0) >= args.measure_ds_limit * args.nclasses:
             break
 
-        if FID:
-            with th.no_grad():
-                FID(inputs,report=False)
-                #print('FID:',FId.item())
+        ##currently broken
+        # if FID:
+        #    with th.no_grad():
+        #        #aggregate target dataset activations
+        #        FID(inputs,report=False)
+        #        print('FID:',FId.item())
         if adversarial:
-            adv_targets=(labels+th.randint_like(labels,1,n_out-2))%n_out
-            #adv_targets=adv_targets.to(device)
-            inputs.requires_grad=True
-            inputs.retain_grad()
-            inp_ptr=inputs
+            ## choose arbitrary adv_targets
+            ##todo optional: choose adv_targets closest to predicted class instead of arbitrary assignment
+            adv_targets = (labels_ + th.randint_like(labels_, 1, args.nclasses - 2)) % args.nclasses
+            inputs_.requires_grad = True
+            inputs_.retain_grad()
+            inp_ptr = inputs_
         else:
-            adv_targets=None
+            adv_targets = None
+        if not time_stamp:
+            time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-        for n_replay in range(latent_replays):
+        for n_replay in range(args.replay_latent):
+            if optimizer:
+                with th.no_grad():
+                    inputs_.data.mul_(255).add_(0.5).clamp_(15, 255).floor_().div_(255)
             prior_loss = th.zeros(1).to(device)
             loss_stat = th.zeros(1).to(device)
             loss = th.zeros(1).to(device)
 
             if smooth_loss:
-                loss_smooth = smooth_loss(inputs)
+                loss_smooth = smooth_loss(inputs_)
                 if optimizer and n_replay in args.smooth_scale_decay:
                     args.smooth_scale = args.smooth_scale * args.smooth_scale_decay[n_replay]
                     print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
@@ -859,114 +842,147 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                 prior_loss = prior_loss + loss_smooth * args.smooth_scale
 
             if cont_loss:
-                loss_cont = cont_loss(inputs)
+                loss_cont = cont_loss(inputs_)
                 loss_cont_avg.update(loss_cont.item())
                 prior_loss = prior_loss + loss_cont
 
             if normalize_inputs:
-                inputs = (inputs - normalize_inputs['mean']) / normalize_inputs['std']
+                inputs = (inputs_ - normalize_inputs['mean']) / normalize_inputs['std']
+            else:
+                inputs = inputs_
             if batch_augment:
-                inputs, labels = batch_augment(inputs, labels,adv_targets)
+                inputs, labels = batch_augment(inputs, labels_, adv_targets)
                 if adv_targets:
-                    labels, adv_targets=labels
-            # if args.DEBUG_SHOW:
-            #     plot_grid(fake)
+                    labels, adv_targets = labels
+            else:
+                labels = labels_
+
+
+            if args.DEBUG_SHOW:
+                plot_grid(inputs)
 
             if (inputs.shape[2:]) != inp_shape[1:]:
-                inputs = nn.functional.interpolate(inputs,mode='bilinear', size=inp_shape[1:])
+                inputs = nn.functional.interpolate(inputs, mode='bilinear', size=inp_shape[1:])
             if mixer:
-                inputs=mixer(inputs)
+                inputs = mixer(inputs)
             out = model(inputs)
 
-            soft_out = F.softmax(out.detach()/args.output_temp).cpu().numpy()
-            output_meter.update(soft_out.mean(0))
-            output_meter_hard.update(hot_one_map[soft_out.argmax(1)].mean(0))
+            if args.measure and args.record_output_stats:
+                soft_out = F.softmax(out.detach() / args.output_temp).cpu().numpy()
+                output_meter.update(soft_out.mean(0))
+                output_meter_hard.update(hot_one_map[soft_out.argmax(1)].mean(0))
+                CE_meter.update(CE(out.detach(), labels))
+
             ## model activations statistics loss
             if args.calc_stats_loss:
                 # norm to compare to the 0,1 input statistics
-                loss_stat = calc_stats_loss(loss_stat, inputs, stat_list,args.stats_loss_mode)
+                loss_stat = calc_stats_loss(loss_stat, inputs, stat_list, args.stats_loss_mode)
 
-            ## maximize class neuron (without reducing other classes scores)
             if adversarial:
-                loss = adversarial(out,labels)#adv_targets)
-                loss.backward()
+                adv_loss = adversarial(out, labels)  # adv_targets)
+                adv_loss.backward()
                 data_grad = inp_ptr.grad.data
                 # Call FGSM Attack
                 with th.no_grad():
-                    perturbed_data = fgsm_attack(inp_ptr, args.epsilon, th.cat([data_grad]*(len(inputs)//len(inp_ptr))))
+                    perturbed_data = fgsm_attack(inp_ptr, args.epsilon,
+                                                 th.cat([data_grad] * (len(inputs) // len(inp_ptr))))
                     if args.DEBUG_SHOW:
                         plot_grid(inputs, denorm_meta=_DATASET_META_DATA[args.dataset])
                         plot_grid(perturbed_data, denorm_meta=_DATASET_META_DATA[args.dataset])
                     fooled_out = model(perturbed_data)
-                    fooled_stats_loss = calc_stats_loss(th.zeros(1,device=device),perturbed_data,stat_list,mode=args.stats_loss_mode)
+                    fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), perturbed_data, stat_list,
+                                                        mode=args.stats_loss_mode)
                     t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
                     t1_, t5_ = accuracy(fooled_out.detach(), labels.detach(), (1, 5))
-                    fooled_t1,fooled_t5=accuracy(fooled_out.detach(), adv_targets.detach(), (1, 5))
-                    print('top1 before {}\ttop1 after {}\ttop1 fooled {}\t||\tstats pre {}\tstats post {}'.format(t1.item(),t1_.item(),fooled_t5.item(),loss_stat.item(),fooled_stats_loss.item()))
+                    fooled_t1, fooled_t5 = accuracy(fooled_out.detach(), adv_targets.detach(), (1, 5))
+                    print('top1 before {}\ttop1 after {}\ttop1 fooled {}\t||\tstats pre {}\tstats post {}'.format(
+                        t1.item(), t1_.item(), fooled_t5.item(), loss_stat.item(), fooled_stats_loss.item()))
                     model.zero_grad()
+                    # keep adversarials measures to report mean adversarial stats loss value and confusion
                     loss_stat = fooled_stats_loss
+                    out = fooled_out
 
             if args.use_dd_loss:
-                if args.use_dd_loss == 2:
+                if args.dd_loss_mode == 'exp':
                     ## exponentioal dd loss contribution decays as logit norm grows
                     loss = (th.exp(-(out.gather(1, labels.unsqueeze(1)).mean() * args.cls_scale)))
+                elif args.dd_loss_mode == 'ce':
+                    loss = CE(out, labels) * args.cls_scale
                 else:
                     ## linear loss
                     loss = -out.gather(1, labels.unsqueeze(1)).mean() * args.cls_scale
-                # add small inverted CE loss to reduce confidence
-                # loss_ce = criterion(out,label) * 100
-                # loss = loss + 1/loss_cel
+
+                # add small CE loss to reduce confidence (may add artifacts to reduce confusion with similar classes)
+                # loss_ce = criterion(out,label) * 0.001
+                # loss = loss + loss_ce
 
             if args.use_prior_loss:
                 loss = loss + prior_loss
 
             if args.use_stats_loss:
                 loss = loss + loss_stat * args.stat_scale
+
+            ## update metrics
+            batch_time.update(time.time() - end)
+            end = time.time()
+            loss_avg.update(loss.item(), args.batch_size)
+            loss_stat_avg.update(loss_stat.item())
+            t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
+            confusion.update(out.detach(), labels.detach())
+            top1.update(t1.item() / 100)
+            top5.update(t5.item() / 100)
+
             if optimizer:
                 optimizer.zero_grad()
+                loss.backward()
                 if n_replay in args.lr_drop_replays:
                     print('lowering lr at replay {}'.format(n_replay))
                     for p_g in optimizer.param_groups:
                         p_g['lr'] *= 1e-1
-                loss.backward()
+
                 optimizer.step()
-            CE_meter.update(CE(out.detach(),labels))
-            loss_avg.update(loss.item(), args.batch_size)
-            loss_stat_avg.update(loss_stat.item())
-            t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
-            confusion.update(out.detach(),labels.detach())
-            top1.update(t1.item() / 100)
-            top5.update(t5.item() / 100)
+                ## save snapshot samples
 
-            # if n_replay + 1 in args.snapshots_replay:
-            #     if (n_replay + 1) % args.report_freq != 0:
-            #         print(
-            #             f'replay {n_replay}\t global loss {loss_avg.avg:.4f}, '
-            #             f'statistics loss {loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
-            #             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
+                if n_replay + 1 in args.snapshots_replay:
+                    print(
+                        f'replay {(n_replay + 1)}\t global loss {loss_avg.avg:.4f}, '
+                        f'statistics loss {loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
+                        f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}'
+                    )
+                    print('saving deep dreams')
+                    snapshot_path = os.path.join(save_path, f'r{n_replay + 1}')
+                    save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_r{n_replay + 1}',
+                                        (10, 5) if step < 5 else None, f'snapshot_e{step}r{n_replay + 1}')
 
-                # snapshot_path = os.path.join(save_path, f'r{n_replay + 1}')
-                # save_batched_images(dream_image, label_, snapshot_path, f'{time_stamp}{e}', (10, 5),
-                #                     f'snapshot_e{e}r{n_replay + 1}')
+                if n_replay % args.report_freq == 0 or n_replay in args.snapshots_replay:
+                    if step == 0 and log:
+                        log.add(replay=n_replay, loss=loss_avg.avg, loss_smooth=loss_smoothness.avg,
+                                loss_cont=loss_cont_avg.avg, loss_stats=loss_stat_avg.avg, top1=1 - top1.avg)
+                    print(
+                        f'iteration {step}/{n_iter}\t replay {n_replay}\t time {batch_time.avg:.2f}, generator time '
+                        f'{generator_time.avg:.2f} global loss {loss_avg.avg:.4f}, statistics loss '
+                        f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
+                        f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
 
-            if n_replay % args.report_freq == 0:
-                # if e == 0:
-                #     log.add(replay=n_replay, loss=loss_avg.avg, loss_smooth=loss_smoothness.avg, loss_cont=loss_cont_avg.avg,
-                #             loss_stats=loss_stat_avg.avg, top1=1 - top1.avg)
-                print(
-                    f'replay {n_replay}\t global loss {loss_avg.avg:.4f}, statistics loss '
-                    f'{loss_stat.item()} ({loss_stat_avg.avg:.4f}), smoothness {loss_smoothness.avg:.4f}, '
-                    f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-
-            # end of train loop
-
-        print(
-            f'global loss {loss_avg.avg:.4f}, statistics loss '
+        print(f'global loss {loss_avg.avg:.4f}, statistics loss '
             f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
 
         # reset stats
-        if optimizer and latent_replays>1:
+        if step == 0 and log:
+            # log.plot(x='replay',y=['loss','loss_stats','loss_smooth','loss_cont','top1'],title=exp_tag,legend=['Global Loss','Statistics Loss','Smoothing Loss','Continuity Loss','Top1 Error'])
+            log.plot(x='replay', y=['loss_stats', 'top1'], title='accuracy vs stats',
+                     legend=['Statistics Loss', 'Top1 Error'])
+            log.plot(x='replay', y=['loss_stats', 'loss_smooth'], title='stats vs smoothness',
+                     legend=['Statistics Loss', 'Gaussian Smoothing Loss'])
+            log.save()
+
+        if optimizer and args.replay_latent> 1:
+            print('resetting optimizer')
+            if args.SGD:
+                optimizer = optim.SGD([data_loader.data], lr=args.lr, momentum=0.9)
+            else:
+                optimizer = optim.Adam([data_loader.data], lr=args.lr, betas=args.betas)
             print('RESETTING METRICS')
             top1.reset()
             top5.reset()
@@ -975,56 +991,57 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             loss_stat_avg.reset()
             loss_smoothness.reset()
 
-    mean_output = th.tensor(output_meter.avg,requires_grad=False)
-    mean_output_hard = th.tensor(output_meter_hard.avg,requires_grad=False)
-    #print('total classes with lower than mean - std',(mean_output_hard<mean_output_hard.mean()-mean_output_hard.std()).sum())
-    t_name=f'model-'
-    if args.preset!='':
-        t_name+=args.preset
-    else:
-        t_name +=args.model
+    if args.measure:
+        final_results = f'BNloss_{args.stats_loss_mode}-{loss_stat_avg.avg:.3f}_prior-{loss_smoothness.avg:.3f}_top1-{top1.avg * 100:.2f}_CE-{CE_meter.avg:.3f}'
+        print(final_results)
 
-    t_name+= f'_measure-{args.measure}-{args.split}_bs-{args.batch_size}_seed-{args.measure_seed}'
-    if args.measure_ds_limit > 0 :
-        t_name += f'_lim-{args.measure_ds_limit}'
-    if mixer:
-        t_name += '_mixup'
+    if args.measure and args.record_output_stats:
+        t_name = f'model-'
+        if args.preset != '':
+            t_name += args.preset
+        else:
+            t_name += args.model
+        t_name += f'_measure-{args.measure}-{args.split}_bs-{args.batch_size}_seed-{args.measure_seed}'
+        if args.measure_ds_limit > 0:
+            t_name += f'_lim-{args.measure_ds_limit}'
+        if mixer:
+            t_name += '_mixup'
+        mean_output = th.tensor(output_meter.avg, requires_grad=False)
+        mean_output_hard = th.tensor(output_meter_hard.avg, requires_grad=False)
+        tensors = [mean_output, mean_output_hard, confusion.confusion, confusion.per_class_accuracy]
+        t_tags = ['soft', 'hard', 'confusion', 'per_class_accuracy']
+        regs = {}
+        for t, n in zip(tensors, t_tags):
+            regs[n] = t
+        if args.split == 'val':
+            fig1, ax1 = plt.subplots()
+            # ax1.set_ylim(0, 6/args.nclasses)
+            ax1.set_title(t_name + '-worst per class accuracy')
+            val, id = regs['per_class_accuracy'].sort()
+            ax1.bar([str(i.item()) for i in id[:10]], val[:10], width=1)
+            ax1.legend(t_tags)
+            fig1.set_size_inches(12, 9)
+            fig1.savefig(t_name + '_worst_per_class_accuracy.jpg')
+        fig, ax = plt.subplots()
+        ax.set_ylim(0, 4 / args.nclasses)
+        ax.set_title(t_name)
+        for t, n in zip(tensors[:2], t_tags[:2]):
+            # th.save(t, f'{t_name}_{n}.pth')
+            val, id = t.sort(descending=True)
+            ax.bar([str(i.item()) for i in id], val, width=1)
+        ax.legend(t_tags)
+        fig.set_size_inches(12, 9)
+        # if FID:
+        #     fid, _ = FID(report=True)
+        #     fid.sqrt_()
+        #     regs['fid_ref_desc'] = FID.ref_path[:-4]
+        #     final_results += '_' + FID_ref_desc + f'_score-{fid.item():.3f}'
+        regs['final_results'] = final_results
+        th.save(regs, f'Summary_{t_name}.pth')
+        save_fig_path = t_name + final_results
+        fig.savefig(save_fig_path + '.jpg')
+        print(t_name)
 
-    tensors=[mean_output,mean_output_hard,confusion.confusion,confusion.per_class_accuracy]
-    t_tags=['soft','hard','confusion','per_class_accuracy']
-    regs={}
-    for t,n in zip(tensors,t_tags):
-        regs[n]=t
-    if args.split=='val':
-        fig1, ax1 = plt.subplots()
-        #ax1.set_ylim(0, 6/args.nclasses)
-        ax1.set_title(t_name + '-worst per class accuracy')
-        val,id=regs['per_class_accuracy'].sort()
-        ax1.bar([str(i.item()) for i in id[:10]], val[:10], width=1)
-        ax1.legend(t_tags)
-        fig1.set_size_inches(12, 9)
-        fig1.savefig(t_name + '_worst_per_class_accuracy.jpg')
-    fig, ax = plt.subplots()
-    ax.set_ylim(0, 4/args.nclasses)
-    ax.set_title(t_name)
-    for t,n in zip(tensors[:2],t_tags[:2]):
-        #th.save(t, f'{t_name}_{n}.pth')
-        val, id = t.sort(descending=True)
-        ax.bar([str(i.item()) for i in id], val, width=1)
-    ax.legend(t_tags)
-    fig.set_size_inches(12, 9)
-    final_results = f'BNloss_{args.stats_loss_mode}-{loss_stat_avg.avg:.3f}_prior-{loss_smoothness.avg:.3f}_top1-{top1.avg*100:.2f}_CE-{CE_meter.avg:.3f}'
-    if FID:
-        fid,_=FID(report=True)
-        fid.sqrt_()
-        regs['fid_ref_desc']=FID_ref_desc
-        final_results+= '_'+FID_ref_desc+ f'_score-{fid.item():.3f}'
-    regs['final_results']=final_results
-    th.save(regs,f'Summary_{t_name}.pth')
-    save_fig_path = t_name+final_results
-    fig.savefig(save_fig_path + '.jpg')
-    print(t_name)
-    print(final_results)
 
 def main():
     args=parser.parse_args()
@@ -1052,12 +1069,14 @@ def main():
         meta = _DATASET_META_DATA[args.model_config.get('dataset',args.dataset)]
 
     #last_layer_fetcher = last_layer_fetcher or lambda m: list(m._modules.values())[-1]
-    time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    exp_start_time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
     args.nclasses = meta.nclasses
     inp_shape = meta.shape
     mean = th.tensor(meta.mean, requires_grad=False).reshape((1, 3, 1, 1)).to(device)
     std = th.tensor(meta.std, requires_grad=False).reshape((1, 3, 1, 1)).to(device)
+    input_stats = {'mean':mean,'std':std}
+
     smooth_loss=None
     cont_loss=None
 
@@ -1113,11 +1132,45 @@ def main():
     #         if is_bn(m):
     #             m.register_forward_hook(layer_c_norm_hook(layer_norm_c,device,collect))
 
-    print(args.measure)
-    if args.measure != '':
-        #data loader MUST SHUFFLE the data for bnstat-measurement to be reliable! fix seed for score reproduction
-        th.random.manual_seed(args.measure_seed)
+    if args.mixup:
+        print('WARNING - measuring with INPUT MIXING!')
+        mixup = MixUp()
+        mixup.to(device)
+        mixer = lambda inputs: mixup(inputs, [0.5, inputs.size(0), True])
+    else:
+        mixer = None
 
+    if args.measure_fid != '':
+        fid_ref_dataset = get_dataset(args.measure_fid, args.split_fid,
+                                      transform=get_transform(args.measure_fid, augment=False),
+                                      limit=args.measure_ds_limit)
+        print('FID reference dataset', fid_ref_dataset)
+        fid_ref_loader = th.utils.data.DataLoader(fid_ref_dataset,
+                                                  batch_size=args.fid_batch_size, shuffle=True,
+                                                  num_workers=8, pin_memory=False, drop_last=False)
+
+        # tot_ref_examples=min(len(fid_ref_dataset), len(fid_ref_loader) * args.fid_batch_size)
+        FID_ref_desc = f'fid:ref-{args.measure_fid}-{args.fid_split}_lim-{args.measure_ds_limit}'
+
+        if args.fid_self == True:
+            m_name = args.model + '-' + args.model_cfg.get('depth', '')
+            FID_ref_desc = f'_source-{m_name}-{args.dataset}'
+            FID = InceptionDistance(model=model, input_size=args.input_shape[1:], accumulate=True,
+                                    ref_path=FID_ref_desc)
+        else:
+            FID_ref_desc += '_source-inceptionV3-imagenet'
+            FID = InceptionDistance(input_size=(299, 299), accumulate=True, ref_path=FID_ref_desc)
+
+        FID.to(device)
+        FID.measure_or_load_ref_stats(fid_ref_loader)
+    else:
+        FID = None
+    ## measure
+    if args.measure != '':
+        args.replay_latent=1
+
+        #data loader MUST SHUFFLE the data for bnstat-measurement!
+        th.random.manual_seed(args.measure_seed)
         ds=get_dataset(args.measure, args.split,
                        get_transform(args.measure, augment=False,input_size=inp_shape[1:]),
                        limit=args.measure_ds_limit)
@@ -1136,12 +1189,14 @@ def main():
             adversarial_l=nn.CrossEntropyLoss()
             adversarial_l.to(device)
             forward(model, train_loader, inp_shape, args, device, None, None, None, smooth_loss, cont_loss,
-                    stat_list,adversarial=adversarial_l)
+                    stat_list,adversarial=adversarial_l,mixer=mixer,FID=FID)
         else:
             with th.no_grad():
-                forward(model,train_loader,inp_shape,args,device,None,None,None,smooth_loss,cont_loss,stat_list)
+                forward(model,train_loader,inp_shape,args,device,None,None,None,smooth_loss,cont_loss,stat_list,mixer=mixer,FID=FID)
         exit(0)
+
     #### gen
+    #todo need to create a special iterator for generation
     exp_tag = f'v{_VERSION}'
     if args.SGD:
         exp_tag += f'_SGD'
@@ -1157,11 +1212,10 @@ def main():
             exp_tag += f'_smooth_k{args.smooth_kernel}_s{args.smooth_sigma}'
         if args.calc_cont_loss:
             exp_tag += '_cont_loss'
-
     if args.gen_resize_ratio !=1.0:
         exp_tag+= f'gen_ration_{args.gen_resize_ratio}'
 
-    save_path=os.path.join(args.result_root_dir,args.dataset,args.model+'{}'.format(args.model_config.get('depth','')),exp_tag,time_stamp)
+    save_path=os.path.join(args.result_root_dir,args.dataset,args.model+'{}'.format(args.model_config.get('depth','')),exp_tag,exp_start_time_stamp)
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     print('save path',save_path)
@@ -1171,160 +1225,215 @@ def main():
 
     if args.replay_latent not in args.snapshots_replay:
         args.snapshots_replay.append(args.replay_latent)
+
+    #generate samples with a smaller size then the expected input, this is an additional image scaling prior
     if args.gen_resize_ratio !=1:
         gen_shape=list(inp_shape)
         gen_shape[1:]= [int(i/args.gen_resize_ratio + 0.5) for i in gen_shape[1:]]
         gen_shape=tuple(gen_shape)
     else:
         gen_shape=inp_shape
+
     dream_image = th.nn.Parameter(th.randn((args.batch_size,) + gen_shape, device=device))
+
+    class GenLoader():
+        def __init__(self,input_data,nclasses,target_mode='random',limit=10):
+            self.data=input_data
+            self.nclasses=nclasses
+            self.target_mode=target_mode
+            self.limit = limit
+
+        class GenIterator():
+            _TARGET_MODES = ['random', 'running']
+            def __init__(self, input_data, nclasses, target_mode='random', limit=10):
+                assert target_mode in GenLoader.GenIterator._TARGET_MODES
+                self.data = input_data
+                self.nclasses = nclasses
+                self.target_mode = target_mode
+                self.iter = 0
+                self.iter_limit = limit
+
+            def reset_buffer(self):
+                # reset buffer
+                with th.no_grad():
+                    self.data.detach()
+                    self.data.normal_()
+
+            def __next__(self):
+                self.reset_buffer()
+                if self.iter> self.iter_limit:
+                    raise StopIteration
+                if self.target_mode == 'running':
+                    target = (th.arange(self.shape[0], device=self.data.device) + self.iter * self.data.shape[0]) % self.nclasses
+                else:
+                    #random mode should normally be used unless batch size is much larger then number of classes
+                    target = th.randint(0, self.nclasses, (self.data.shape[0],), device=self.data.device)
+                self.iter+=1
+                return self.data,target
+
+            def __len__(self):
+                return self.iter_limit
+
+        def __iter__(self):
+            return GenLoader.GenIterator(self.data,self.nclasses,self.target_mode,self.limit)
 
     if args.SGD:
         optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
     else:
         optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
-    n_iter = (args.n_samples_to_generate * args.nclasses) // args.batch_size
 
-    batch_time = AverageMeter()
-    generator_time = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-    loss_avg = AverageMeter()
-    loss_cont_avg = AverageMeter()
-    loss_stat_avg = AverageMeter()
-    loss_smoothness = AverageMeter()
-    end = time.time()
+    train_loader = GenLoader(dream_image,nclasses=args.nclasses,
+                             target_mode='random' if args.use_dd_loss and args.batch_size < max(args.nclasses,64)
+                             else 'running',
+                             limit=int((args.n_samples_to_generate * args.nclasses) / args.batch_size)+0.5)
 
-    for e in range(n_iter):
-        # if args.use_dd_loss and args.batch_size < max(args.nclasses,64):
-        #     ## choose random targets
-        #     print('selecting random targets for generation')
-        #     label_ = th.randint(0,args.nclasses,(args.batch_size,),device=dream_image.device)
-        # else:
-        #     label_ =(th.arange(args.batch_size,device=dream_image.device) + e * args.batch_size)%args.nclasses
-        label_ = (th.arange(args.batch_size, device=dream_image.device) + e * args.batch_size) % args.nclasses
-        for n_replay in range(args.replay_latent):
-            with th.no_grad():
-                dream_image.data.mul_(255).add_(0.5).clamp_(15, 255).floor_().div_(255)
-            input = dream_image
-            prior_loss = th.zeros(1).to(device)
-            loss_stat = th.zeros(1).to(device)
-            loss = th.zeros(1).to(device)
-
-            if (input.shape[2:])!= inp_shape[1:]:
-                #print('interpolating')
-                input = nn.functional.interpolate(input,mode ='bilinear' ,size=inp_shape[1:])
-
-            if args.calc_smooth_loss:
-                loss_smooth = smooth_loss(input).mean()
-                if n_replay in args.smooth_scale_decay:
-                    args.smooth_scale=args.smooth_scale*args.smooth_scale_decay[n_replay]
-                    print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
-                loss_smoothness.update(loss_smooth.item())
-                prior_loss = prior_loss + loss_smooth*args.smooth_scale
-
-            if args.calc_cont_loss:
-                loss_cont = cont_loss(input)
-                loss_cont_avg.update(loss_cont.item())
-                prior_loss = prior_loss + loss_cont
-
-
-            input = (input - mean) / std
-            if b_aug:
-                fake, label=b_aug(input,label_)
-            else:
-                fake, label = input, label_
-            if args.DEBUG_SHOW:
-                plot_grid(fake)
-
-            generator_time.update(time.time() - end)
-            out = model(fake)
-
-            optimizer_im.zero_grad()
-            ## maximize class neuron (without reducing other classes scores)
-            if args.use_dd_loss:
-                if args.dd_loss_mode=='exp':
-                    ## exponentioal dd loss contribution decays as logit norm grows
-                    loss = (th.exp(-(out.gather(1,label.unsqueeze(1)).mean()*args.cls_scale)))
-                elif args.dd_loss_mode=='ce':
-                    loss = F.cross_entropy(out,label)*args.cls_scale
-                else:
-                    ## linear loss
-                    loss = -out.gather(1, label.unsqueeze(1)).mean()*args.cls_scale
-
-
-            if args.use_prior_loss:
-                loss = loss + prior_loss
-
-            ## model activations statistics loss
-            if args.calc_stats_loss:
-                # norm to compare to the 0,1 input statistics
-                loss_stat = calc_stats_loss(loss_stat,input,stat_list,args.stats_loss_mode)
-
-            if args.use_stats_loss:
-                loss = loss + loss_stat*args.stat_scale
-
-            loss.backward()
-            optimizer_im.step()
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            loss_avg.update(loss.item(), args.batch_size)
-            loss_stat_avg.update(loss_stat.item())
-            t1, t5 = accuracy(out.detach(), label.detach(), (1, 5))
-            top1.update(t1.item()/100)
-            top5.update(t5.item()/100)
-            if n_replay + 1 in args.lr_drop_replays:
-                print('lowering lr at replay {}'.format(n_replay+1))
-                for p_g in optimizer_im.param_groups:
-                    p_g['lr']*=1e-1
-            if n_replay + 1 in args.snapshots_replay:
-                print('saving deep dreams')
-                snapshot_path=os.path.join(save_path,f'r{n_replay + 1}')
-                save_batched_images(dream_image,label_,snapshot_path,f'{time_stamp}{e}',(10,5) if e<5 else None,f'snapshot_e{e}r{n_replay+1}')
-
-            if n_replay % args.report_freq == 0 or n_replay in args.snapshots_replay:
-                if e==0:
-                    log.add(replay=n_replay,loss=loss_avg.avg,loss_smooth=loss_smoothness.avg,loss_cont=loss_cont_avg.avg,loss_stats=loss_stat_avg.avg,top1=1-top1.avg)
-                print(
-                    f'iteration {e}/{n_iter}\t replay {n_replay}\t time {batch_time.avg:.2f}, generator time '
-                    f'{generator_time.avg:.2f} global loss {loss_avg.avg:.4f}, statistics loss '
-                    f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
-                    f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-
-        #end of train loop
-        print(
-            f'iteration {e} replay {n_replay + 1}, time {batch_time.avg:.3f}, generator time '
-            f'{generator_time.avg:.3f} global loss {loss_avg.avg:.4f}, statistics loss '
-            f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
-            f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-
-        with th.no_grad():
-            # reset dream
-            print('resetting deep dream!')
-            # if args.use_dd_loss:
-            #     save_image(dream_image[:n_classes*10].detach().cpu(), f'{save_path}/class_aligned_sample_e{e}r{n_replay+1}.png',nrow=n_classes)
-            dream_image.detach()
-            dream_image.data.normal_()
-            print('resetting optimizer deep dreams')
-            if args.SGD:
-                optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
-            else:
-                optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
-        # reset stats
-        batch_time.reset()
-        generator_time.reset()
-        top1.reset()
-        top5.reset()
-        loss_avg.reset()
-        loss_cont_avg.reset()
-        loss_stat_avg.reset()
-        loss_smoothness.reset()
-        if e==0:
-            #log.plot(x='replay',y=['loss','loss_stats','loss_smooth','loss_cont','top1'],title=exp_tag,legend=['Global Loss','Statistics Loss','Smoothing Loss','Continuity Loss','Top1 Error'])
-            log.plot(x='replay',y=['loss_stats','top1'],title=exp_tag+'accuracy vs stats',legend=['Statistics Loss','Top1 Error'])
-            log.plot(x='replay',y=['loss_stats','loss_smooth'],title=exp_tag+'stats vs smoothness',legend=['Statistics Loss','Gaussian Smoothing Loss'])
-            log.save()
+    forward(model, train_loader, inp_shape, args, device, b_aug, input_stats, optimizer_im, smooth_loss, cont_loss, stat_list,
+            mixer=mixer, FID=FID,save_path=save_path,time_stamp=exp_start_time_stamp,log=log)
+    #
+    # def generate():
+    #     n_iter = (args.n_samples_to_generate * args.nclasses) // args.batch_size
+    #
+    #     batch_time = AverageMeter()
+    #     generator_time = AverageMeter()
+    #     top1 = AverageMeter()
+    #     top5 = AverageMeter()
+    #     loss_avg = AverageMeter()
+    #     loss_cont_avg = AverageMeter()
+    #     loss_stat_avg = AverageMeter()
+    #     loss_smoothness = AverageMeter()
+    #     end = time.time()
+    #
+    #     for e in range(n_iter):
+    #         if args.use_dd_loss and args.batch_size < max(args.nclasses,64):
+    #             ## choose random targets
+    #             print('selecting random targets for generation')
+    #             label_ = th.randint(0,args.nclasses,(args.batch_size,),device=dream_image.device)
+    #         else:
+    #             label_ =(th.arange(args.batch_size,device=dream_image.device) + e * args.batch_size)%args.nclasses
+    #         for n_replay in range(args.replay_latent):
+    #             with th.no_grad():
+    #                 dream_image.data.mul_(255).add_(0.5).clamp_(15, 255).floor_().div_(255)
+    #             input = dream_image
+    #             prior_loss = th.zeros(1).to(device)
+    #             loss_stat = th.zeros(1).to(device)
+    #             loss = th.zeros(1).to(device)
+    #
+    #             if (input.shape[2:])!= inp_shape[1:]:
+    #                 #print('interpolating')
+    #                 input = nn.functional.interpolate(input,mode ='bilinear' ,size=inp_shape[1:])
+    #
+    #             if args.calc_smooth_loss:
+    #                 loss_smooth = smooth_loss(input).mean()
+    #                 if n_replay in args.smooth_scale_decay:
+    #                     args.smooth_scale=args.smooth_scale*args.smooth_scale_decay[n_replay]
+    #                     print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
+    #                 loss_smoothness.update(loss_smooth.item())
+    #                 prior_loss = prior_loss + loss_smooth*args.smooth_scale
+    #
+    #             if args.calc_cont_loss:
+    #                 loss_cont = cont_loss(input)
+    #                 loss_cont_avg.update(loss_cont.item())
+    #                 prior_loss = prior_loss + loss_cont
+    #
+    #
+    #             input = (input - mean) / std
+    #             if b_aug:
+    #                 fake, label=b_aug(input,label_)
+    #             else:
+    #                 fake, label = input, label_
+    #             if args.DEBUG_SHOW:
+    #                 plot_grid(fake)
+    #
+    #             generator_time.update(time.time() - end)
+    #             out = model(fake)
+    #
+    #             optimizer_im.zero_grad()
+    #             ## maximize class neuron (without reducing other classes scores)
+    #             if args.use_dd_loss:
+    #                 if args.dd_loss_mode=='exp':
+    #                     ## exponentioal dd loss contribution decays as logit norm grows
+    #                     loss = (th.exp(-(out.gather(1,label.unsqueeze(1)).mean()*args.cls_scale)))
+    #                 elif args.dd_loss_mode=='ce':
+    #                     loss = F.cross_entropy(out,label)*args.cls_scale
+    #                 else:
+    #                     ## linear loss
+    #                     loss = -out.gather(1, label.unsqueeze(1)).mean()*args.cls_scale
+    #
+    #
+    #             if args.use_prior_loss:
+    #                 loss = loss + prior_loss
+    #
+    #             ## model activations statistics loss
+    #             if args.calc_stats_loss:
+    #                 # norm to compare to the 0,1 input statistics
+    #                 loss_stat = calc_stats_loss(loss_stat,input,stat_list,args.stats_loss_mode)
+    #
+    #             if args.use_stats_loss:
+    #                 loss = loss + loss_stat*args.stat_scale
+    #
+    #             loss.backward()
+    #             optimizer_im.step()
+    #             batch_time.update(time.time() - end)
+    #             end = time.time()
+    #
+    #             loss_avg.update(loss.item(), args.batch_size)
+    #             loss_stat_avg.update(loss_stat.item())
+    #             t1, t5 = accuracy(out.detach(), label.detach(), (1, 5))
+    #             top1.update(t1.item()/100)
+    #             top5.update(t5.item()/100)
+    #             if n_replay + 1 in args.lr_drop_replays:
+    #                 print('lowering lr at replay {}'.format(n_replay+1))
+    #                 for p_g in optimizer_im.param_groups:
+    #                     p_g['lr']*=1e-1
+    #             if n_replay + 1 in args.snapshots_replay:
+    #                 print('saving deep dreams')
+    #                 snapshot_path=os.path.join(save_path,f'r{n_replay + 1}')
+    #                 save_batched_images(dream_image,label_,snapshot_path,f'{time_stamp}{e}',(10,5) if e<5 else None,f'snapshot_e{e}r{n_replay+1}')
+    #
+    #             if n_replay % args.report_freq == 0 or n_replay in args.snapshots_replay:
+    #                 if e==0:
+    #                     log.add(replay=n_replay,loss=loss_avg.avg,loss_smooth=loss_smoothness.avg,loss_cont=loss_cont_avg.avg,loss_stats=loss_stat_avg.avg,top1=1-top1.avg)
+    #                 print(
+    #                     f'iteration {e}/{n_iter}\t replay {n_replay}\t time {batch_time.avg:.2f}, generator time '
+    #                     f'{generator_time.avg:.2f} global loss {loss_avg.avg:.4f}, statistics loss '
+    #                     f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
+    #                     f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
+    #
+    #         #end of train loop
+    #         print(
+    #             f'iteration {e} replay {n_replay + 1}, time {batch_time.avg:.3f}, generator time '
+    #             f'{generator_time.avg:.3f} global loss {loss_avg.avg:.4f}, statistics loss '
+    #             f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
+    #             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
+    #
+    #         with th.no_grad():
+    #             # reset dream
+    #             print('resetting deep dream!')
+    #             # if args.use_dd_loss:
+    #             #     save_image(dream_image[:n_classes*10].detach().cpu(), f'{save_path}/class_aligned_sample_e{e}r{n_replay+1}.png',nrow=n_classes)
+    #             dream_image.detach()
+    #             dream_image.data.normal_()
+    #             print('resetting optimizer deep dreams')
+    #             if args.SGD:
+    #                 optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
+    #             else:
+    #                 optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
+    #         # reset stats
+    #         batch_time.reset()
+    #         generator_time.reset()
+    #         top1.reset()
+    #         top5.reset()
+    #         loss_avg.reset()
+    #         loss_cont_avg.reset()
+    #         loss_stat_avg.reset()
+    #         loss_smoothness.reset()
+    #         if e==0:
+    #             #log.plot(x='replay',y=['loss','loss_stats','loss_smooth','loss_cont','top1'],title=exp_tag,legend=['Global Loss','Statistics Loss','Smoothing Loss','Continuity Loss','Top1 Error'])
+    #             log.plot(x='replay',y=['loss_stats','top1'],title=exp_tag+'accuracy vs stats',legend=['Statistics Loss','Top1 Error'])
+    #             log.plot(x='replay',y=['loss_stats','loss_smooth'],title=exp_tag+'stats vs smoothness',legend=['Statistics Loss','Gaussian Smoothing Loss'])
+    #             log.save()
+    #
+    # generate()
 
 def save_batched_images(input_batch,label,root_path,prefix='',plot_sample_shape=None,plot_sample_name='sample'):
     with th.no_grad():
