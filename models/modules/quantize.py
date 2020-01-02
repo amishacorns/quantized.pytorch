@@ -5,6 +5,11 @@ import torch.nn.functional as F
 import math
 import matplotlib.pyplot as plt
 from utils.absorb_bn import absorb_bn,absorb_bn_step
+from utils.partial_class import partial_class
+from inspect import signature
+from copy import deepcopy
+from utils.module_rewriter import ReWriter
+from collections import OrderedDict
 import pdb
 ## DEBUG FLAGS
 _DEBUG_BN_PLOT = 0
@@ -266,9 +271,9 @@ class QConv2d(nn.Conv2d,QuantNode):
     """docstring for QConv2d."""
 
     def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, groups=1, bias=True, num_bits=8, num_bits_weight=None, num_bits_grad=None, biprecision=False,bias_quant=True,per_channel=True):
+                 stride=1, padding=0, dilation=1, groups=1, bias=True, num_bits=8, num_bits_weight=None, num_bits_grad=None, biprecision=False,bias_quant=True,per_channel=True,**kwargs):
         super(QConv2d,self).__init__(in_channels, out_channels, kernel_size,
-                                      stride, padding, dilation, groups, bias)
+                                      stride, padding, dilation, groups, bias,**kwargs)
         QuantNode.__init__(self)
 
         self.num_bits = num_bits
@@ -350,8 +355,8 @@ class QConv2d(nn.Conv2d,QuantNode):
 class QLinear(nn.Linear,QuantNode):
     """docstring for QConv2d."""
 
-    def __init__(self, in_features, out_features, bias=True, num_bits=8, num_bits_weight=None, num_bits_grad=None, biprecision=False,bias_quant= True,per_channel = True):
-        super(QLinear,self).__init__(in_features, out_features, bias)
+    def __init__(self, in_features, out_features, bias=True, num_bits=8, num_bits_weight=None, num_bits_grad=None, biprecision=False,bias_quant= True,per_channel = True,**kwargs):
+        super(QLinear,self).__init__(in_features, out_features, bias,**kwargs)
         QuantNode.__init__(self)
         self.num_bits = num_bits
         self.num_bits_weight = num_bits_weight or num_bits
@@ -659,3 +664,43 @@ def get_bn_folding_module(base_module,bn_module,
             return out
 
     return QFold
+
+
+class QReWriter(ReWriter):
+    _SUPPORTED_MODULES = [torch.nn.modules.conv.Conv2d,
+                           torch.nn.modules.Linear,
+                           torch.nn.modules.BatchNorm2d
+                           ]
+    _DEFUALT_ACT_NBITS=8
+    _DEFUALT_WEIGHT_NBITS=8
+    _DEFUALT_GRAD_NBITS=None
+    _DEFAULT_BIAS_QUANT=False
+    _BASIC_MATCHER_FN=lambda C: lambda m,n: isinstance(m, C)
+
+    def __init__(self,**config):
+        super().__init__()
+        def _create_partial_class_from_cfg(cfg):
+            return partial_class(cfg['qop'], num_bits=cfg.get('activation_numbit',self.activation_numbit),
+                                 num_bits_weight=cfg.get('weights_numbits', self.weights_numbits),
+                                 num_bits_grad=cfg.get('gradient_numbits', self.gradient_numbits),
+                                 bias_quant=cfg.get('bias_quant', self.bias_quant))
+
+        self.activation_numbit = config.get('activations_numbits', type(self)._DEFUALT_ACT_NBITS)
+        self.weights_numbits = config.get('weights_numbits', type(self)._DEFUALT_WEIGHT_NBITS)
+        self.gradient_numbits = config.get('grad_numbits', type(self)._DEFUALT_GRAD_NBITS)
+        self.bias_quant = config.get('bias_quant', type(self)._DEFAULT_BIAS_QUANT)
+
+        #self._fallback_matchers = [type(self)._BASIC_MATCHER_FN(C) for C in type(self)._SUPPORTED_MODULES]
+        self._default_cfgs.update({
+            'default_conv2d': {'qop': QConv2d, 'quantize': True, 'matcher_fn': self._fallback_matchers[0]},
+            'default_linear': {'qop': QLinear, 'quantize': True, 'matcher_fn': self._fallback_matchers[1]},
+            'default_bn': {'quantize': False, 'matcher_fn': self._fallback_matchers[2]}
+        })
+        cfg_groups=config.get('cfg_groups',OrderedDict())
+        cfg_groups.update(self._default_cfgs)
+
+        ## eg. first and last fc layers quant configs, matcher gets the modules' long name and the module itself
+        # and returns True if belongs to the group :
+        for group_name,group_cfgs in cfg_groups.items():
+            if group_cfgs['quantize']:
+                self.group_fns[group_name]=group_cfgs['matcher_fn'],_create_partial_class_from_cfg(group_cfgs)
