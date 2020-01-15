@@ -1,36 +1,32 @@
-import torch as th
-import torch.nn as nn
-import torchvision as tv
-from ast import literal_eval
-import models
-from torchvision.utils  import  save_image
-from utils.log import ResultsLog
-from utils.absorb_bn import is_bn,search_absorbe_bn
-from utils.misc import View,GaussianSmoothing
-from torch import optim
-import matplotlib.pyplot as plt
-from utils.meters import AverageMeter,accuracy,ConfusionMeter
 import os
-import torch.nn.functional as F
-import time
-from datetime import datetime
-from PIL import Image
-import torch.backends.cudnn as cudnn
-cudnn.benchmark=True
-import argparse
+import models
 import shutil
 import sys
-from data import _DATASET_META_DATA
-from utils.misc import _META,AutoArgParser
-from utils.mixup import MixUp
+import time
+from datetime import datetime
+import torch as th
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+from torch import optim
+import torchvision as tv
+from torchvision.utils  import save_image
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy import linalg
-from matplotlib import pyplot as plt
-from data import get_dataset
+from PIL import Image
+from ast import literal_eval
+
+from data import _DATASET_META_DATA, get_dataset
+from utils.log import ResultsLog
+from utils.absorb_bn import is_bn, search_absorbe_bn
+from utils.misc import _META, AutoArgParser, GaussianSmoothing
+from utils.meters import AverageMeter, accuracy, ConfusionMeter
+from utils.mixup import MixUp
 from preprocess import get_transform
 _VERSION=15
-import os
 ############## cfg
+cudnn.benchmark=True
 def settings():
     preset = ''
     preset_sub_model = ''
@@ -223,7 +219,7 @@ class GenLoader():
             if self.iter > self.iter_limit:
                 raise StopIteration
             if self.target_mode == 'running':
-                target = (th.arange(self.shape[0], device=self.data.device) + self.iter * self.data.shape[
+                target = (th.arange(self.data.shape[0], device=self.data.device) + self.iter * self.data.shape[
                     0]) % self.nclasses
             else:
                 # random mode should normally be used unless batch size is much larger then number of classes
@@ -844,6 +840,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
     loss_smoothness = AverageMeter()
     confusion = ConfusionMeter()
     hot_one_map = np.eye(args.nclasses)
+    hot_one_map_th=th.tensor(hot_one_map,device=device)
     n_iter = (args.n_samples_to_generate * args.nclasses) // args.batch_size
     end = time.time()
     for step, (inputs_, labels_) in enumerate(data_loader):
@@ -883,7 +880,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                 if optimizer and n_replay in args.smooth_scale_decay:
                     args.smooth_scale = args.smooth_scale * args.smooth_scale_decay[n_replay]
                     print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
-                loss_smoothness.update(loss_smooth.item())
+                loss_smoothness.update(loss_smooth.mean().item())
                 prior_loss = prior_loss + loss_smooth * args.smooth_scale
 
             if cont_loss:
@@ -911,7 +908,6 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
 
             if mixer:
                 inputs = mixer(inputs, [0.5, inputs.size(0), True])
-                labels = mixer(target=labels)
 
             out = model(inputs)
 
@@ -952,12 +948,14 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                     out = fooled_out
 
             if args.use_dd_loss:
-                if args.dd_loss_mode == 'exp':
+                if args.dd_loss_mode=='kl':
+                    if mixer:
+                        targets = mixer(target=labels, n_class=args.nclasses)
+                    else:
+                        targets = labels
+                    loss = F.kl_div(F.log_softmax(out),targets,reduction='mean')*10 #*args.cls_scale
+                elif args.dd_loss_mode == 'exp':
                     ## exponentioal dd loss contribution decays as logit norm grows
-                    # if mixer:
-                    #     labels=out.gather(1, labels.unsqueeze(1).nonzero())
-                    #     loss = (th.exp(-().mean() * args.cls_scale)))
-                    # else:
                     loss = (th.exp(-(out.gather(1, labels.unsqueeze(1)).mean() * args.cls_scale)))
                 elif args.dd_loss_mode == 'ce':
                     loss = CE(out, labels) * args.cls_scale
@@ -1254,7 +1252,7 @@ def main():
         if args.calc_cont_loss:
             exp_tag += '_cont_loss'
     if args.gen_resize_ratio !=1.0:
-        exp_tag+= f'gen_ration_{args.gen_resize_ratio}'
+        exp_tag+= f'_gen_ration_{args.gen_resize_ratio}'
 
     save_path=os.path.join(args.result_root_dir,args.dataset,args.model+'{}'.format(args.model_config.get('depth','')),exp_tag,exp_start_time_stamp)
     if not os.path.exists(save_path):
