@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 from scipy import linalg
 from PIL import Image
 from ast import literal_eval
-
+from apex import amp
+from apex.parallel import SyncBatchNorm,convert_syncbn_model
 from data import _DATASET_META_DATA, get_dataset
 from utils.log import ResultsLog
 from utils.absorb_bn import is_bn, search_absorbe_bn
@@ -40,6 +41,8 @@ def settings():
         dataset=''
         model_config=''
         model=''
+    use_amp=True
+    sync_bn=True
     result_root_dir = 'results'
     exp_tag=''
     measure='' #'imagine-cifar10-r44-dd_only_r500'
@@ -824,8 +827,7 @@ def fgsm_attack(image, epsilon, data_grad):
 
 def forward(model, data_loader, inp_shape, args, device , batch_augment = None,normalize_inputs=None,
             optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,
-            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None):
-
+            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None,use_amp=True):
     CE = nn.CrossEntropyLoss().to(device)
     CE_meter = AverageMeter()
     output_meter = AverageMeter()
@@ -985,7 +987,11 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
 
             if optimizer:
                 optimizer.zero_grad()
-                loss.backward()
+                if use_amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
                 if n_replay in args.lr_drop_replays:
                     print('lowering lr at replay {}'.format(n_replay))
                     for p_g in optimizer.param_groups:
@@ -1034,6 +1040,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                 optimizer = optim.SGD([data_loader.data], lr=args.lr, momentum=0.9)
             else:
                 optimizer = optim.Adam([data_loader.data], lr=args.lr, betas=args.betas)
+                _,optimizer=amp.initialize(nn.Module(),optimizer,opt_level='O1')
             print('RESETTING METRICS')
             top1.reset()
             top5.reset()
@@ -1143,6 +1150,26 @@ def main():
         search_absorbe_bn(model,remove_bn=False,keep_modifiers=True)
     freeze_params(model)
     model.eval()
+    if args.measure == '':
+        # generate samples with a smaller size then the expected input, this is an additional image scaling prior
+        if args.gen_resize_ratio != 1:
+            gen_shape = list(inp_shape)
+            gen_shape[1:] = [int(i / args.gen_resize_ratio + 0.5) for i in gen_shape[1:]]
+            gen_shape = tuple(gen_shape)
+        else:
+            gen_shape = inp_shape
+        dream_image = th.nn.Parameter(th.randn((args.batch_size,) + gen_shape, device=device))
+        if args.SGD:
+            optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
+        else:
+            optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
+
+        if args.use_amp and optimizer_im:
+            #print(f'using amp {amp_opt}')
+            model, optimizer = amp.initialize(model, optimizer_im, opt_level='O1')
+            if args.sync_bn:
+                print('converting batch norms')
+                model = convert_syncbn_model(model)
 
     if args.calc_cont_loss:
         cont_loss=ContinuityLoss()
@@ -1169,7 +1196,7 @@ def main():
     stat_list = []
     if args.calc_stats_loss:
         for m in model.modules():
-            if is_bn(m):
+            if is_bn(m) or isinstance(m,SyncBatchNorm):
                 m.register_forward_hook(layer_stats_hook(stat_list,device))
 
     if args.mixup:
@@ -1264,21 +1291,6 @@ def main():
 
     if args.replay_latent not in args.snapshots_replay:
         args.snapshots_replay.append(args.replay_latent)
-
-    #generate samples with a smaller size then the expected input, this is an additional image scaling prior
-    if args.gen_resize_ratio !=1:
-        gen_shape=list(inp_shape)
-        gen_shape[1:]= [int(i/args.gen_resize_ratio + 0.5) for i in gen_shape[1:]]
-        gen_shape=tuple(gen_shape)
-    else:
-        gen_shape=inp_shape
-
-    dream_image = th.nn.Parameter(th.randn((args.batch_size,) + gen_shape, device=device))
-
-    if args.SGD:
-        optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
-    else:
-        optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
 
     train_loader = GenLoader(dream_image,nclasses=args.nclasses,
                              target_mode='random' if args.use_dd_loss and args.batch_size < max(args.nclasses,64)
