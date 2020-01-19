@@ -1163,8 +1163,7 @@ def main():
     if args.calc_stats_loss:
         print('partially absorbing batch normalization parameters')
         search_absorbe_bn(model,remove_bn=False,keep_modifiers=True)
-    freeze_params(model)
-    model.eval()
+
     if args.measure == '':
         # generate samples with a smaller size then the expected input, this is an additional image scaling prior
         if args.gen_resize_ratio != 1:
@@ -1189,6 +1188,9 @@ def main():
         if args.sync_bn:
             print('converting batch norms',args.sync_bn)
             model = convert_syncbn_model(model)
+
+    freeze_params(model)
+    model.eval()
 
     if args.calc_cont_loss:
         cont_loss=ContinuityLoss()
