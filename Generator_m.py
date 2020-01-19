@@ -8,6 +8,7 @@ import torch as th
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch import optim
 import torchvision as tv
 from torchvision.utils  import save_image
@@ -41,8 +42,8 @@ def settings():
         dataset=''
         model_config=''
         model=''
-    use_amp=True
-    sync_bn=True
+    use_amp=0
+    sync_bn=0
     result_root_dir = 'results'
     exp_tag=''
     measure='' #'imagine-cifar10-r44-dd_only_r500'
@@ -185,7 +186,7 @@ _MODEL_CONFIGS={
     'wr28-10_cifar100':_R28_10_C100,
     'r18_imagenet':_R18_IMGNT,
     'r18_q4w4a_imagenet':_R18_IMGNT_Q4W4A,
-    'densenet121':_DNS121_IMGNT,
+    'densenet121_imagenet':_DNS121_IMGNT,
     'mobilenet_v2_imagenet':_MBL2_IMGNT,
     'vgg_16-bn_imagenet':_VGG16_BN_IMGNT,
     'vgg_11-bn_imagenet': _VGG11_BN_IMGNT,
@@ -827,7 +828,7 @@ def fgsm_attack(image, epsilon, data_grad):
 
 def forward(model, data_loader, inp_shape, args, device , batch_augment = None,normalize_inputs=None,
             optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,
-            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None,use_amp=True):
+            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None,use_amp=False):
     CE = nn.CrossEntropyLoss().to(device)
     CE_meter = AverageMeter()
     output_meter = AverageMeter()
@@ -872,21 +873,23 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
         for n_replay in range(args.replay_latent):
             if optimizer:
                 with th.no_grad():
-                    inputs_.data.mul_(255).add_(0.5).clamp_(15, 255).floor_().div_(255)
+                    inputs_.data.mul_(255).add_(0.5).clamp_(0, 255).floor_().div_(255)
+                #inputs = inputs_/inputs_.norm() #var((0,2,3),keepdim=True)
+
             prior_loss = th.zeros(1).to(device)
             loss_stat = th.zeros(1).to(device)
             loss = th.zeros(1).to(device)
 
             if smooth_loss:
-                loss_smooth = smooth_loss(inputs_)
+                loss_smooth = smooth_loss(inputs_).mean()
                 if optimizer and n_replay in args.smooth_scale_decay:
                     args.smooth_scale = args.smooth_scale * args.smooth_scale_decay[n_replay]
                     print(f'reducing blur by factor {args.smooth_scale_decay[n_replay]}')
-                loss_smoothness.update(loss_smooth.mean().item())
+                loss_smoothness.update(loss_smooth.item())
                 prior_loss = prior_loss + loss_smooth * args.smooth_scale
 
             if cont_loss:
-                loss_cont = cont_loss(inputs_)
+                loss_cont = cont_loss(inputs_).mean()
                 loss_cont_avg.update(loss_cont.item())
                 prior_loss = prior_loss + loss_cont
 
@@ -894,13 +897,13 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                 inputs = (inputs_ - normalize_inputs['mean']) / normalize_inputs['std']
             else:
                 inputs = inputs_
+
             if batch_augment:
                 inputs, labels = batch_augment(inputs, labels_, adv_targets)
                 if adv_targets:
                     labels, adv_targets = labels
             else:
                 labels = labels_
-
 
             if args.DEBUG_SHOW:
                 plot_grid(inputs)
@@ -974,7 +977,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
 
             if args.use_stats_loss:
                 loss = loss + loss_stat * args.stat_scale
-
+            #loss=loss.mean()
             ## update metrics
             batch_time.update(time.time() - end)
             end = time.time()
@@ -997,6 +1000,17 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                     for p_g in optimizer.param_groups:
                         p_g['lr'] *= 1e-1
 
+                # with th.no_grad():
+                #     g_norm=inputs_.grad.norm()
+                #     print('grad norm,input norm')
+                #     print(g_norm, inputs_.norm())
+                #     r_noise=th.randn_like(inputs_.grad)
+                #     r_noise/=r_noise.norm()
+                #     grad_to_noise_scale=0.5/np.log(n_replay+1)
+                #     inputs_.grad+=g_norm*grad_to_noise_scale*r_noise
+                #     if (n_replay + 1)%args.report_freq == 0:
+                #         print(inputs_.grad.norm(),grad_to_noise_scale)
+                    #clip_grad_norm_(inputs,3)
                 optimizer.step()
                 ## save snapshot samples
 
@@ -1040,6 +1054,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                 optimizer = optim.SGD([data_loader.data], lr=args.lr, momentum=0.9)
             else:
                 optimizer = optim.Adam([data_loader.data], lr=args.lr, betas=args.betas)
+            if use_amp:
                 _,optimizer=amp.initialize(nn.Module(),optimizer,opt_level='O1')
             print('RESETTING METRICS')
             top1.reset()
@@ -1158,18 +1173,22 @@ def main():
             gen_shape = tuple(gen_shape)
         else:
             gen_shape = inp_shape
+
         dream_image = th.nn.Parameter(th.randn((args.batch_size,) + gen_shape, device=device))
         if args.SGD:
+            print('using SGD')
             optimizer_im = optim.SGD([dream_image], lr=args.lr, momentum=0.9)
         else:
-            optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)
+            print('using ADAM')
+            optimizer_im = optim.Adam([dream_image], lr=args.lr, betas=args.betas)#,weight_decay=1e-8)
 
         if args.use_amp and optimizer_im:
             #print(f'using amp {amp_opt}')
             model, optimizer = amp.initialize(model, optimizer_im, opt_level='O1')
-            if args.sync_bn:
-                print('converting batch norms')
-                model = convert_syncbn_model(model)
+
+        if args.sync_bn:
+            print('converting batch norms',args.sync_bn)
+            model = convert_syncbn_model(model)
 
     if args.calc_cont_loss:
         cont_loss=ContinuityLoss()
@@ -1298,7 +1317,7 @@ def main():
                              limit=int((args.n_samples_to_generate * args.nclasses) / args.batch_size)+0.5)
 
     forward(model, train_loader, inp_shape, args, device, b_aug, input_stats, optimizer_im, smooth_loss, cont_loss, stat_list,
-            mixer=mixer, FID=FID,save_path=save_path,time_stamp=exp_start_time_stamp,log=log)
+            mixer=mixer, FID=FID,save_path=save_path,time_stamp=exp_start_time_stamp,log=log,use_amp=args.use_amp)
 
 def save_batched_images(input_batch,label,root_path,prefix='',plot_sample_shape=None,plot_sample_name='sample'):
     with th.no_grad():
