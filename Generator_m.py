@@ -26,7 +26,7 @@ from utils.misc import _META, AutoArgParser, GaussianSmoothing
 from utils.meters import AverageMeter, accuracy, ConfusionMeter
 from utils.mixup import MixUp
 from preprocess import get_transform
-_VERSION=15
+_VERSION=16
 ############## cfg
 cudnn.benchmark=True
 def settings():
@@ -86,7 +86,8 @@ def settings():
     DEBUG_SHOW = 0
     gen_resize_ratio=1.0
     masking = False
-    SGD=1
+    SGD=0
+    target_stats=0
     return locals()
 
 parser=AutoArgParser()
@@ -256,7 +257,7 @@ class GussianSmoothingLoss(nn.Module):
 
 
 class ContinuityLoss(nn.Module):
-    def __init__(self,criterion=nn.MSELoss(reduction=None),diag=True,beta=0.33):
+    def __init__(self,criterion=nn.MSELoss(reduction=None),diag=True,beta=0.1):
         super(ContinuityLoss,self).__init__()
         self.criterion=criterion
         self.beta=beta
@@ -447,7 +448,7 @@ class AugmentBatch(nn.Module):
 
 def freeze_params(model):
     for param in model.parameters(True):
-        param.require_grad = False
+        param.requires_grad = False
 
 
 def Gaussian_KL(mu1,sigma1,mu2,sigma2):
@@ -466,8 +467,18 @@ def Gaussian_sym_KLNorm(mu,sigma,eps=1e-3):
     return 0.5*(sigma_p2+mu_p2+inverse_sigma_p2+(1+mu_p2)*inverse_sigma_p2) - 1
 
 
-def calc_stats_loss(loss_stat,inputs,stat_list,mode='kl'):
-    in_mu, in_std = inputs.mean((0, 2, 3)), inputs.transpose(1, 0).contiguous().view((3, -1)).std(1)
+def calc_stats_loss(loss_stat,inputs,stat_dict,mode='kl',verbose=0):
+    def _get_stats_from_dict(stats_dict):
+        stat_list = []
+        for k, v in stats_dict.items():
+            mean = v[0] / v[2]
+            std = (v[1] / (v[2] - 1) - mean.pow(2)).sqrt()
+            stat_list.append((mean, std))
+        stats_dict.clear()
+        return stat_list
+
+    stat_list = _get_stats_from_dict(stat_dict)
+    in_mu, in_std = inputs.mean((0, 2, 3)), inputs.std((0,2,3))
     stat_list.append((in_mu,in_std))
     if mode == 'mse':
         for m, v in stat_list:
@@ -478,16 +489,19 @@ def calc_stats_loss(loss_stat,inputs,stat_list,mode='kl'):
             if mode=='kl':
                 kl = Gaussian_KLNorm(m,v).mean()
             elif mode== 'sym':
-                kl = 0.5*Gaussian_sym_KLNorm(m,v).mean()
-            with th.no_grad():
-                if kl/len(stat_list)> 0.5:
-                    mse_error_mu=m.pow(2).mean()
-                    mse_error_sigma=(v-1).pow(2).mean()
-                    print(f'high divergence in layer {i}: {kl/len(stat_list)}\nmse: mu-{mse_error_mu}\tsigma-{mse_error_sigma}')
+                kl = Gaussian_sym_KLNorm(m,v).mean()
+            if verbose > 0:
+                with th.no_grad():
+                    zero_sigma = (v < 1e-8).sum()
+                    if zero_sigma > 0 or kl > 5*loss_stat/i:
+                        mu=m.mean()
+                        sigma=(v).mean()
+                        print(f'high divergence in layer {i}: {kl}'
+                              f'\nmu:{mu:0.4f}\tsigma:{sigma:0.4f}\tsmall sigma:{zero_sigma}/{len(v)}')
             loss_stat=loss_stat+kl
 
     ret_val=loss_stat / len(stat_list)
-    stat_list.clear ()
+    stat_list.clear()
     return ret_val
 
 
@@ -501,6 +515,19 @@ def plot_grid(image_tensor,samples= 16,nrow=4,denorm_meta=None):
     plt.imshow(g.permute((1, 2, 0)))
     #plt.waitforbuttonpress()
     pass
+
+# collects stats accross devices as well
+def layer_stats_hook_dict(stat_dict,trance_name,device):
+    def stat_record(m,inputs,outputs):
+        sum = inputs[0].sum((0,2,3)).to(device)
+        sum_p2 = inputs[0].pow(2).sum((0,2,3)).to(device)
+        n=inputs[0].shape[0]*inputs[0].shape[2]*inputs[0].shape[3]
+        if trance_name not in stat_dict:
+            stat_dict[trance_name]=(sum,sum_p2,n)
+        else:
+            sum_, sum_p2_, n_ = stat_dict[trance_name]
+            stat_dict[trance_name]=(sum+sum_, sum_p2+sum_p2_,n+n_)
+    return stat_record
 
 
 def layer_stats_hook(stat_list,device):
@@ -829,6 +856,10 @@ def fgsm_attack(image, epsilon, data_grad):
 def forward(model, data_loader, inp_shape, args, device , batch_augment = None,normalize_inputs=None,
             optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,
             mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None,use_amp=False):
+    # for m in model.modules():
+    #     assert m.training == False
+    # for n,p in model.named_parameters():
+    #     assert p.requires_grad==False,n
     CE = nn.CrossEntropyLoss().to(device)
     CE_meter = AverageMeter()
     output_meter = AverageMeter()
@@ -871,11 +902,17 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
         for n_replay in range(args.replay_latent):
-            if optimizer:
+            if optimizer and n_replay % 20 == 0:
                 with th.no_grad():
-                    inputs_.data.mul_(255).add_(0.5).clamp_(0, 255).floor_().div_(255)
-                #inputs = inputs_/inputs_.norm() #var((0,2,3),keepdim=True)
+                    #inputs_.div_(inputs_.norm()) #var((0,2,3),keepdim=True)
+                    #inputs_.data.div_(inputs_.data.min()-inputs_.data.max())
+                    # inputs_.data.mul_(255).add_(0.5).clamp_(0, 255).floor_().div_(255)
+                    # inputs_.add_(-inputs_.min())
+                    # inputs_.div_(inputs_.max())
+                    inputs_.mul_(255).add_(0.5).clamp_(0, 255).floor_().div_(255)
 
+
+            #inputs_ = inputs_.sigmoid()
             prior_loss = th.zeros(1).to(device)
             loss_stat = th.zeros(1).to(device)
             loss = th.zeros(1).to(device)
@@ -1035,6 +1072,13 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                         f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
                         f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
 
+            if args.target_stats > loss_stat:
+                print('reached stats target')
+                snapshot_path = os.path.join(save_path, f't_stat{args.target_stats:0.2f}')
+                save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_r{n_replay + 1}',
+                                    (10, 5) if step < 1 else None, f'snapshot_e{step}r{n_replay + 1}')
+                break
+
         print(f'global loss {loss_avg.avg:.4f}, statistics loss '
             f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
@@ -1160,6 +1204,8 @@ def main():
     ### todo: simplify by absorbing all bn parameters and returning the list of affine transformation parameters
     ## absorb batch normalization so layers statistics are normalized. we want to track the batch statistics for
     # the loss function for each iteration, setting momentum to 1 lets us access this information
+    if args.use_stats_loss:
+        args.calc_stats_loss=1
     if args.calc_stats_loss:
         print('partially absorbing batch normalization parameters')
         search_absorbe_bn(model,remove_bn=False,keep_modifiers=True)
@@ -1189,9 +1235,6 @@ def main():
             print('converting batch norms',args.sync_bn)
             model = convert_syncbn_model(model)
 
-    freeze_params(model)
-    model.eval()
-
     if args.calc_cont_loss:
         cont_loss=ContinuityLoss()
         cont_loss.to(device)
@@ -1204,6 +1247,16 @@ def main():
     else:
         b_aug=None
 
+    from collections import OrderedDict
+    stat_list = OrderedDict()
+    if args.calc_stats_loss:
+    #     for m in model.modules():
+    #         if is_bn(m) or isinstance(m,SyncBatchNorm):
+    #             m.register_forward_hook(layer_stats_hook(stat_list,device))
+        for n, m in model.named_modules():
+            if is_bn(m):
+                m.register_forward_hook(layer_stats_hook_dict(stat_list, n, device))
+
     if len(device_id)>1:
         if args.calc_smooth_loss:
             smooth_loss=th.nn.DataParallel(smooth_loss,device_id)
@@ -1212,20 +1265,15 @@ def main():
         b_aug=None if b_aug is None else th.nn.DataParallel(b_aug,device_id)
         model = nn.DataParallel(model, device_id)
 
-    if args.use_stats_loss:
-        args.calc_stats_loss=1
-    stat_list = []
-    if args.calc_stats_loss:
-        for m in model.modules():
-            if is_bn(m) or isinstance(m,SyncBatchNorm):
-                m.register_forward_hook(layer_stats_hook(stat_list,device))
-
     if args.mixup:
         print('WARNING - running with INPUT MIXING!')
         mixer = MixUp()
         mixer.to(device)
     else:
         mixer = None
+
+    freeze_params(model)
+    model.eval()
 
     if args.measure_fid != '':
         fid_ref_dataset = get_dataset(args.measure_fid, args.split_fid,
@@ -1323,6 +1371,7 @@ def main():
 
 def save_batched_images(input_batch,label,root_path,prefix='',plot_sample_shape=None,plot_sample_name='sample'):
     with th.no_grad():
+        #input_batch = input_batch.sigmoid()
         for i, s in enumerate(input_batch):
             # save class to file
             buffer = s.clone()
