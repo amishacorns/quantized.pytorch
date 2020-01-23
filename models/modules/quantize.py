@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import math
 import matplotlib.pyplot as plt
 from utils.absorb_bn import absorb_bn,absorb_bn_step
+from utils.misc import get_lambda_module_class
 from utils.partial_class import partial_class
 from inspect import signature
 from copy import deepcopy
@@ -679,8 +680,8 @@ class QReWriter(ReWriter):
 
     def __init__(self,**config):
         super().__init__()
-        def _create_partial_class_from_cfg(cfg):
-            return partial_class(cfg['qop'], num_bits=cfg.get('activation_numbit',self.activation_numbit),
+        def _create_quantized_partial_class_from_cfg(cfg):
+            return partial_class(cfg['replace_op'], num_bits=cfg.get('activation_numbit',self.activation_numbit),
                                  num_bits_weight=cfg.get('weights_numbits', self.weights_numbits),
                                  num_bits_grad=cfg.get('gradient_numbits', self.gradient_numbits),
                                  bias_quant=cfg.get('bias_quant', self.bias_quant))
@@ -689,18 +690,35 @@ class QReWriter(ReWriter):
         self.weights_numbits = config.get('weights_numbits', type(self)._DEFUALT_WEIGHT_NBITS)
         self.gradient_numbits = config.get('grad_numbits', type(self)._DEFUALT_GRAD_NBITS)
         self.bias_quant = config.get('bias_quant', type(self)._DEFAULT_BIAS_QUANT)
+        self.remove_bn = config.get('remove_bn', False)
 
         #self._fallback_matchers = [type(self)._BASIC_MATCHER_FN(C) for C in type(self)._SUPPORTED_MODULES]
         self._default_cfgs.update({
-            'default_conv2d': {'qop': QConv2d, 'quantize': True, 'matcher_fn': self._fallback_matchers[0]},
-            'default_linear': {'qop': QLinear, 'quantize': True, 'matcher_fn': self._fallback_matchers[1]},
-            'default_bn': {'quantize': False, 'matcher_fn': self._fallback_matchers[2]}
+            'default_conv2d': {'replace_op': QConv2d, 'replace': torch.nn.modules.conv.Conv2d,
+                               'matcher_fn': self._fallback_matchers[0], 'quantized':True},
+            'default_linear': {'replace_op': QLinear, 'replace': torch.nn.modules.linear.Linear,
+                               'matcher_fn': self._fallback_matchers[1], 'quantized':True}
         })
+        if self.remove_bn:
+            #todo consider merging bn absorbtion logic
+            pass_through_module = get_lambda_module_class(lambda x:x)
+            self._default_cfgs['remove_bn']={'replace': torch.nn.modules.BatchNorm2d,
+                                              'replace_op': pass_through_module,
+                                              'matcher_fn': self._fallback_matchers[2],
+                                              'quantized':False, 'builder_fn': lambda ref_module : pass_through_module()
+                                              }
         cfg_groups=config.get('cfg_groups',OrderedDict())
         cfg_groups.update(self._default_cfgs)
 
         ## eg. first and last fc layers quant configs, matcher gets the modules' long name and the module itself
         # and returns True if belongs to the group :
         for group_name,group_cfgs in cfg_groups.items():
-            if group_cfgs['quantize']:
-                self.group_fns[group_name]=group_cfgs['matcher_fn'],_create_partial_class_from_cfg(group_cfgs)
+            if group_cfgs['replace'] and group_cfgs['quantized']:
+                #if quantization is used we can auto generate quantized builders via partial class
+                self.group_fns[group_name] = group_cfgs['matcher_fn'], \
+                                             group_cfgs.get('builder_fn',
+                                             self.gen_builder_fn(_create_quantized_partial_class_from_cfg(group_cfgs)))
+            else:
+                #expect user to provide the builder method that builds a replacement module i.e.
+                # new_module=builder_fn(ref_module)
+                self.group_fns[group_name] = group_cfgs['matcher_fn'], group_cfgs['builder_fn']

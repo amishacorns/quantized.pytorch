@@ -18,7 +18,7 @@ from utils.mixup import MixUp
 import models
 from data import get_dataset
 from torchvision.transforms import Compose
-
+from torchvision import models as tvmodels
 from preprocess import get_transform,RandomNoise,Cutout,ImgGhosting
 from utils.log import setup_logging, ResultsLog, save_checkpoint
 from utils.meters import AverageMeter, accuracy
@@ -27,13 +27,16 @@ from utils.misc import torch_dtypes,CosineSimilarityChannelWiseLoss
 from datetime import datetime
 from ast import literal_eval
 from models.modules.quantize import set_measure_mode,set_bn_is_train,freeze_quant_params,\
-    set_global_quantization_method,QuantMeasure,is_bn,overwrite_params,set_quant_mode
+    set_global_quantization_method,QuantMeasure,is_bn,overwrite_params,set_quant_mode, QReWriter
 _DEFUALT_W_NBITS = 4
 _DEFUALT_A_NBITS = 8
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
+model_names = sorted(name for name in tvmodels.__dict__
+                     if name.islower() and not name.startswith("__")
+                     and callable(tvmodels.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ConvNet Training')
 ###GENERAL
@@ -120,6 +123,10 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--steps-limit', default=None, type=int,
                     help='limit training steps')
+parser.add_argument('--regime', default='default', type=str,
+                    help='default regime name')
+parser.add_argument('--lr', default=1e-1, type=float,
+                    help='default regime base learning rate')
 parser.add_argument('--steps-per-epoch', default=-1, type=int,
                     help='number of steps per epoch, value greater than 0'
                          ' will cause training iterator to sample with replacement')
@@ -178,6 +185,74 @@ parser.add_argument('--dist-init', default='env://', type=str,
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 
+def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(10,1e-8),cos_drops=[(15,1),(40,1e-2)]):
+    from utils.regime import cosine_anneal_lr
+    def _pop_if_list(l):
+        if type(l)==list:
+            v=l.pop(0)
+        else:
+            v=l
+        return v
+
+    def _build_phase(lr_start,epoch_start,lr_end,epoch_end,regime_steps_per_epoch,**kwargs):
+        regime_phase={'step': epoch_start * regime_steps_per_epoch}
+        regime_phase.update(kwargs)
+        if lr_start-lr_end==0:
+            regime_phase.update({'lr':lr_start})
+        else:
+            epochs=epoch_end-epoch_start
+            regime_phase.update({'step_lambda': cosine_anneal_lr(lr_start, lr_end, epoch_start * model.regime_steps_per_epoch,
+                                         epoch_end * model.regime_steps_per_epoch, epochs - 1)})
+        return regime_phase
+
+    model.regime_epochs = 80
+    model.regime_steps_per_epoch = 400
+    #start epoch,epochs,lr modifier
+    #cos_drops=[(15,1),(40,1e-2)]
+    ## reference settings to fix training regime length in update steps
+    model.quant_freeze_steps = -1
+    model.absorb_bn_step = -1
+    model.regime = []
+    lr_start = lr
+    epoch_start=0
+    # todo regime construction can be reduced to a single loop over num_epochs,lr_scales tuples
+    if warmup:
+        ramp_up_epochs,warmup_scale=warmup
+        model.regime += [_build_phase(lr_start*warmup_scale,epoch_start,
+                                      lr_start             ,ramp_up_epochs*model.regime_steps_per_epoch,
+                                      model.regime_steps_per_epoch,
+                                      optimizer='SGD',
+                                      momentum=_pop_if_list(momentum),
+                                      dampning=_pop_if_list(dampning))]
+        epoch_start+=ramp_up_epochs
+    #set drops
+    for epochs,lr_md in cos_drops:
+        lr_end=lr_start*lr_md
+        epoch_end=epoch_start+epochs
+        model.regime +=[_build_phase(lr_start,epoch_start,
+                                     lr_end,epoch_end,
+                                     model.regime_steps_per_epoch,
+                                     optimizer='SGD',
+                                     momentum=_pop_if_list(momentum),
+                                     dampning=_pop_if_list(dampning))]
+        lr_start=lr_end
+        epoch_start=epoch_end
+    # attach final phase
+    model.regime+=[_build_phase(lr_start,epoch_start,
+                                lr_start,None,
+                                model.regime_steps_per_epoch,
+                                optimizer='SGD',
+                                momentum=_pop_if_list(momentum),
+                                dampning=_pop_if_list(dampning))]
+
+
+
+def freeze_dropout(model):
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout) or isinstance(m, torch.nn.Dropout2d):
+            print(m)
+            m.eval()
+
 def main():
     global args, best_prec1, dtype
     best_prec1 = 0
@@ -218,7 +293,11 @@ def main():
 
     # create model config
     logging.info("creating model %s", args.model)
-    model_builder = models.__dict__[args.model]
+    model_builder = models.__dict__.get(args.model,getattr(tvmodels,args.model))
+    if hasattr(tvmodels,args.model):
+        from_model_zoo=True
+    else:
+        from_model_zoo=False
     train_dataset_name=args.dataset
     val_dataset_name=args.dataset
     model_ds_config = args.dataset
@@ -232,21 +311,28 @@ def main():
     elif 'cifar10' in args.dataset:
         model_ds_config='cifar10'
 
-    model_config = {'input_size': args.input_size, 'dataset':  model_ds_config}
-
     if args.model_config is not '':
-        model_config = dict(model_config, **literal_eval(args.model_config))
+        model_config = literal_eval(args.model_config)
+    else:
+        model_config = {}
 
+    if from_model_zoo:
+        quantize_settings = model_config.pop('quantize', {})
+    else:
+        model_config.update({'input_size': args.input_size, 'dataset':  model_ds_config})
+        quantize_settings = model_config
     if args.evaluate:
         args.results_dir = '/tmp'
+
     if args.save is '':
-        conv1,fc = '', ''
+        ## quantization configuration
+        # get first and last layer configuration strings
+        conv1,fc = '', '',
         if model_config.get('conv1'):
             conv1 = '_conv1_{}'.format(model_config['conv1'].__str__().strip('\{\}').replace('\'','').replace(': ','').replace(', ',''))
         if model_config.get('fc'):
             fc = '_fc_{}'.format(model_config['fc'].__str__().strip('\{\}').replace('\'','').replace(': ','').replace(', ',''))
         fl_layers = conv1 + fc
-        # save all experiments with same setup in the same root dir including calibration checkpoint
 
         if args.freeze_bn_running_estimators:
             bn_mod_tag = '_freeze_bn_estimators'
@@ -261,21 +347,22 @@ def main():
         else:
             bn_mod_tag='_bn'
 
+        # save all experiments with same setup in the same root dir including calibration checkpoint
         args.save = '{net}{spec}_{gw}w{ga}a{fl}{bn_mod}'.format(
-            net=args.model,spec=model_config['depth'],
-            gw=model_config.get('weights_numbits','f32'),
-            ga=model_config.get('activations_numbits','f32'),
+            net=args.model,spec=model_config.get('depth',''),
+            gw=quantize_settings.get('weights_numbits','f32'),
+            ga=quantize_settings.get('activations_numbits','f32'),
             fl=fl_layers,
             bn_mod=bn_mod_tag)
         # specific optimizations are stored per experiment
-        regime_name = '_' + model_config.get('regime', '')
-
         if args.overwrite_regime:
-            opt = '_custom'+ regime_name
-        elif regime_name == '_':
-            opt = '_default'
+            regime_name = 'custom'
+            regime = literal_eval(args.overwrite_regime)
         else:
-            opt = regime_name
+            regime_name = model_config.get('regime') or args.regime
+            regime = None
+
+        opt = '_' + regime_name + f'_lr_{args.lr}'
 
         if args.kd_loss!='' and not args.ce_only:
             opt += f'_kd-loss-{args.kd_loss}'
@@ -344,47 +431,72 @@ def main():
 
     logging.info('rewriting calibration resample flag to True')
     args.calibration_resample = True
-
     teacher = model_builder(**model_config)
+    student_model_config=model_config.copy()
     logging.info("created teacher with configuration: %s", model_config)
     logging.debug(teacher)
-    logging.info(f"loading teacher checkpoint {args.teacher}")
-    teacher_checkpoint = torch.load(args.teacher,map_location='cpu')
-    if 'state_dict' in teacher_checkpoint:
-        logging.info(f"reference top 1 score {teacher_checkpoint['best_prec1']}")
-        teacher_checkpoint = teacher_checkpoint['state_dict']
-    teacher.load_state_dict(teacher_checkpoint)
-    q_model_config=model_config.copy()
-    if not args.no_quantize:
-        q_model_config.update({'quantize': True})
+    if args.teacher is not None:
+        logging.info(f"loading teacher checkpoint {args.teacher}")
+        teacher_checkpoint = torch.load(args.teacher,map_location='cpu')
+        if 'state_dict' in teacher_checkpoint:
+            logging.info(f"reference top 1 score {teacher_checkpoint['best_prec1']}")
+            teacher_checkpoint = teacher_checkpoint['state_dict']
+        teacher.load_state_dict(teacher_checkpoint)
+    else:
+        teacher_checkpoint = teacher.state_dict()
 
-        if 'weights_numbits' not in q_model_config:
-            q_model_config.update({'weights_numbits':_DEFUALT_W_NBITS})
-        if 'activations_numbits' not in q_model_config:
-            q_model_config.update({'activations_numbits':_DEFUALT_A_NBITS})
+    if not args.no_quantize:
+        if not from_model_zoo:
+            # legacy
+            ## todo: seperate models that have builtin (hard-coded) quantization from other models
+            student_model_config.update({'quantize': True})
+            quantize_settings = student_model_config
+
+        if 'weights_numbits' not in quantize_settings:
+            quantize_settings.update({'weights_numbits': _DEFUALT_W_NBITS})
+        if 'activations_numbits' not in quantize_settings:
+            quantize_settings.update({'activations_numbits': _DEFUALT_A_NBITS})
+
         if args.absorb_bn or args.otf or args.fresh_bn:
-            assert not (args.absorb_bn and args.otf or args.absorb_bn and  args.fresh_bn or args.otf and  args.fresh_bn)
+            assert not (args.absorb_bn and args.otf or args.absorb_bn and args.fresh_bn or args.otf and args.fresh_bn)
             from utils.absorb_bn import search_absorbe_bn
             logging.info('absorbing teacher batch normalization')
-            search_absorbe_bn(teacher,verbose=True,remove_bn=not args.fresh_bn,keep_modifiers=args.fresh_bn)
+            search_absorbe_bn(teacher, verbose=True, remove_bn=not args.fresh_bn, keep_modifiers=args.fresh_bn)
             if not args.fresh_bn:
-                model_config.update({'absorb_bn': True})
-                teacher_nobn = model_builder(**model_config)
-                teacher_nobn.load_state_dict(teacher.state_dict())
-                teacher = teacher_nobn
-                teacher.eval()
-                q_model_config.update({'absorb_bn': True})
-        q_model_config.update({'OTF': args.otf})
+                if from_model_zoo:
+                    remove_bn_writer=QReWriter(remove_bn=True)
+                    remove_bn_writer.group_fns={'remove_bn':remove_bn_writer.group_fns['remove_bn']}
+                    remove_bn_writer(teacher)
+                    quantize_settings.update({'remove_bn':True})
+                else:
+                    model_config.update({'absorb_bn': True})
+                    quantize_settings.update({'absorb_bn': True})
+                    teacher_nobn = model_builder(**model_config)
+                    teacher_nobn.load_state_dict(teacher.state_dict())
+                    teacher = teacher_nobn
 
-    logging.info("creating apprentice model with configuration: %s", q_model_config)
-    model = model_builder(**q_model_config)
+            quantize_settings.update({'OTF': args.otf})
+    teacher.eval()
+    teacher.to(args.device, dtype)
+    logging.info("creating apprentice model with configuration: %s", student_model_config)
+    model = model_builder(**student_model_config)
+    # add bias terms to the student model since we partially/entirely absorbed them in the teacher
+    if args.fresh_bn or (args.absorb_bn and from_model_zoo):
+        search_absorbe_bn(model, remove_bn=not args.freeze_bn)
+    if not args.no_quantize and from_model_zoo:
+        #apply quantization on arbitrary models
+        rewriter = QReWriter(**quantize_settings)
+        rewriter(model)
     logging.debug(model)
 
-    regime = literal_eval(args.overwrite_regime) if args.overwrite_regime else getattr(model, 'regime', [{'epoch': 0,
-                                                                                                          'optimizer': 'SGD',
-                                                                                                          'lr': 0.1,
-                                                                                                          'momentum': 0.9,
-                                                                                                          'weight_decay': 1e-4}])
+    if from_model_zoo:
+        if regime_name == 'default':
+            set_default_regime(model,args.lr)
+        elif regime_name == 'linear':
+            set_default_regime(model, args.lr,warmup=(),cos_drops=[])
+
+    regime = regime or getattr(model, 'regime', [{'epoch': 0, 'optimizer': 'SGD', 'lr': 0.1,
+                                                  'momentum': 0.9,'weight_decay': 1e-4}])
     if args.absorb_bn and not args.otf:
         logging.info('freezing remaining batch normalization in student model')
         set_bn_is_train(model,False,logger=logging)
@@ -442,7 +554,7 @@ def main():
     val_data = get_dataset(val_dataset_name, 'val', transform['eval'])
     val_loader = torch.utils.data.DataLoader(
         val_data,
-        batch_size=args.batch_size*4, shuffle=False,
+        batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=not distributed,drop_last=False)
 
     repeat = 1
@@ -506,8 +618,6 @@ def main():
     # valid_criterion = getattr(model, 'criterion', nn.CrossEntropyLoss)()
     # valid_criterion.to(args.device,dtype)
     valid_criterion = criterion
-    teacher.eval()
-    teacher.to(args.device, dtype)
 
     # optionally resume from a checkpoint
     if args.evaluate:
@@ -530,8 +640,8 @@ def main():
             checkpoint = torch.load(checkpoint_file)
             args.start_epoch = checkpoint['epoch'] - 1
             best_prec1 = checkpoint['best_prec1']
-            if args.fresh_bn:
-                search_absorbe_bn(model, remove_bn=False)
+            if args.fresh_bn or from_model_zoo:
+                search_absorbe_bn(model, remove_bn=not args.fresh_bn)
             model.load_state_dict(checkpoint['state_dict'])
             logging.info("loaded checkpoint '%s' (epoch %s)",
                          checkpoint_file, checkpoint['epoch'])
@@ -542,27 +652,26 @@ def main():
     elif not args.recalibrate and not args.reset_weights and os.path.isfile(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar')):
         student_checkpoint = torch.load(os.path.join(save_calibrated_path,'calibrated_checkpoint.pth.tar'),'cpu')
         logging.info(f"loading pre-calibrated quantized model from {save_calibrated_path}, reported top 1 score {student_checkpoint['best_prec1']}")
-        if args.fresh_bn:
-            search_absorbe_bn(model,remove_bn=False)
-        model.load_state_dict(student_checkpoint['state_dict'],strict=False)
+        # if args.fresh_bn:
+        #     search_absorbe_bn(model,remove_bn=False)
+        model.load_state_dict(student_checkpoint['state_dict'],strict=True)
     else:
         # no checkpoint for model, calibrate quant measure nodes and freeze bn
-        logging.info("initializing apprentice model with teacher parameters: %s", q_model_config)
+        logging.info("initializing apprentice model with teacher parameters: %s", student_model_config)
         if not args.reset_weights:
-            if args.fresh_bn:
-                search_absorbe_bn(model,remove_bn=False)
-            model.load_state_dict(teacher.state_dict(), strict=False)
+            model.load_state_dict(teacher_checkpoint, strict=False)
+        #freeze_dropout(model)
         model.to(args.device, dtype)
         model,loss_avg,acc = calibrate(model,train_dataset_name,transform,val_loader=val_loader,logging=logging,resample=args.shuffle_calibration_steps,sample_per_class=args.calibration_set_size)
 
         student_checkpoint= teacher_checkpoint.copy()
-        student_checkpoint.update({'config': q_model_config, 'state_dict': model.state_dict(),
+        student_checkpoint.update({'config': student_model_config, 'state_dict': model.state_dict(),
                                    'epoch': 0,'regime':None, 'best_prec1': acc})
         logging.info("saving apprentice checkpoint")
         save_checkpoint(student_checkpoint, path=save_calibrated_path,filename='calibrated_checkpoint')
         if args.recalibrate:
+            print(f'reported calibration\t loss-{loss_avg:.3f} top1-{acc:.2f}', )
             if args.exp_group:
-                print(f'reported calibration\t loss-{loss_avg:.3f} top1-{acc:.2f}', )
                 logging.info(f'appending experiment result summary to {args.exp_group} experiment')
                 exp_summary = ResultsLog(exp_group_path, title='Result Summary, Experiment Group: %s' % args.exp_group,
                                          resume=1, params=None)
@@ -675,7 +784,7 @@ def main():
             save_checkpoint({
                 'epoch': epoch + 1,
                 'model': args.model,
-                'config': q_model_config,
+                'config': student_model_config,
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
                 'regime': regime
@@ -939,15 +1048,15 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
 
         if i % args.print_freq == 0:
             logging.info('{phase} - Epoch: [{0}][{1}/{2}]  \t{steps}'
-                         'Loss {loss.avg:.4e} ({loss.var:.3f}) \t'
-                         'Prec@1 {top1.avg:.3f} ({top1.var:.3f}) \t'
-                         'Prec@5 {top5.avg:.3f} ({top5.var:.3f})'.format(
+                         'Loss {loss.avg:.4e} ({loss.std:.3f}) \t'
+                         'Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
+                         'Prec@5 {top5.avg:.3f} ({top5.std:.3f})'.format(
                 epoch, i, len(data_loader),
                 phase='TRAINING' if training else 'EVALUATING',
                 steps=f'Train steps: {steps}\t' if training else '',
                 loss=losses, top1=top1, top5=top5)+
-                         f'\taux_loss {aux_loss_mtr.avg:0.4f}({aux_loss_mtr.var:0.3f})'
-                         f'\tranking loss {ranking_loss_mtr.avg:0.4f}({ranking_loss_mtr.var:0.3f})')
+                         f'\taux_loss {aux_loss_mtr.avg:0.4f}({aux_loss_mtr.std:0.3f})'
+                         f'\tranking loss {ranking_loss_mtr.avg:0.4f}({ranking_loss_mtr.std:0.3f})')
 
         if training:
             #post gradient accumulation step
@@ -961,8 +1070,8 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         end = time.time()
 
         if i % args.print_freq == 0:
-            logging.info('Time {batch_time.avg:.3f} ({batch_time.var:.3f})\t'
-                         'Data {data_time.avg:.3f} ({data_time.var:.3f})\t'.format(batch_time=batch_time,
+            logging.info('Time {batch_time.avg:.3f} ({batch_time.std:.3f})\t'
+                         'Data {data_time.avg:.3f} ({data_time.std:.3f})\t'.format(batch_time=batch_time,
                                                                                    data_time=data_time))
 
     return losses.avg, top1.avg, top5.avg
@@ -1086,7 +1195,9 @@ class SubModules(nn.Sequential):
         output = []
         for module in self._modules.values():
             input = module(input)
-            output.append(input)
+            num_parameters = sum([l.nelement() for l in module.parameters()])
+            if num_parameters> 0:
+                output.append(input)
         return output
 
 def calibrate(model,dataset,transform,calib_criterion=None,resample=200,batch_size=256,workers=4,val_loader=None,sample_per_class=-1,logging=None):

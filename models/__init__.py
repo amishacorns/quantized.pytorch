@@ -6,4 +6,5 @@ from .resnext import *
 from .inception_resnet_v2 import *
 from .inception_v2 import *
 from .mobilenet import *
+from .mobilenet_tv import *
 from .mobilenet_quantized import *
