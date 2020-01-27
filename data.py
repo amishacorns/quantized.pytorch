@@ -37,7 +37,7 @@ _DATASET_META_DATA={
 
 _IMAGINE_CONFIGS=[
     'no_dd_kl','no_dd_mse','no_dd_sym',
-    'dd-exp_kl','dd-ce_kl',
+    'dd-exp_kl','dd-ce_kl','dd-exp_mse',
     'dd-exp', 'dd-ce']
 
 def get_dataset(name, split='train', transform=None,
