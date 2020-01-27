@@ -457,7 +457,7 @@ def Gaussian_KL(mu1,sigma1,mu2,sigma2):
 
 def Gaussian_KLNorm(mu1,sigma1,epsilon=1e-8):
     #assert all(sigma1>1e-8)
-    return -1/2 - th.log(sigma1+epsilon) + (sigma1.pow(2)+(mu1).pow(2))/2
+    return -1/2 - th.log(th.max(sigma1,epsilon)) + (sigma1.pow(2)+(mu1).pow(2))/2
 
 
 def Gaussian_sym_KLNorm(mu,sigma,eps=1e-3):
