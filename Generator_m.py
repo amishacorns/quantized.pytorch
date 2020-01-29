@@ -21,12 +21,12 @@ from apex import amp
 from apex.parallel import SyncBatchNorm,convert_syncbn_model
 from data import _DATASET_META_DATA, get_dataset
 from utils.log import ResultsLog
-from utils.absorb_bn import is_bn, search_absorbe_bn
+from utils.absorb_bn import is_bn, search_absorbe_bn, get_bn_params
 from utils.misc import _META, AutoArgParser, GaussianSmoothing
 from utils.meters import AverageMeter, accuracy, ConfusionMeter
 from utils.mixup import MixUp
 from preprocess import get_transform
-_VERSION=16
+_VERSION=17
 ############## cfg
 cudnn.benchmark=True
 def settings():
@@ -43,7 +43,6 @@ def settings():
         model_config=''
         model=''
     use_amp=0
-    sync_bn=0
     result_root_dir = 'results'
     exp_tag=''
     measure='' #'imagine-cifar10-r44-dd_only_r500'
@@ -94,6 +93,7 @@ parser=AutoArgParser()
 parser.add_argument('-d',default=[0],type=int,nargs='+')
 parser.add_argument('-lr_drop_replays',default=[800, 1500, 3000],type=int,nargs='+')
 parser.add_argument('-snapshots_replay',default= [1000],type=int,nargs='+')
+parser.add_argument('-stats_targets',default='middle_bn',choices=['pre_bn','post_bn','middle_bn'])
 parser.auto_add(settings())
 
 class _MODEL_META(_META):
@@ -450,58 +450,75 @@ def freeze_params(model):
     for param in model.parameters(True):
         param.requires_grad = False
 
+# P(mu1,var1)||P(mu2,var2)
+def Gaussian_KL(mu1,var1,mu2,var2,epsilon=1e-5):
+    var1=var1.clamp(min=epsilon)
+    var2=var2.clamp(min=epsilon)
+    return 1/2*(-1 + th.log(var2/var1)+(var1+(mu1-mu2).pow(2))/var2)
 
-def Gaussian_KL(mu1,sigma1,mu2,sigma2):
-    return -1/2 + th.log(sigma2)-th.log(sigma1)+(sigma1.pow(2)+(mu1-mu2).pow(2))/(2*sigma2.pow(2))
+def Gaussian_sym_KL(mu1,sigma1,mu2,sigma2,epsilon=1e-5):
+    return 0.5*(Gaussian_KL(mu1,sigma1,mu2,sigma2,epsilon)+Gaussian_KL(mu2,sigma2,mu1,sigma1,epsilon))
 
+def reversedKLDNormal(mu1,var1,epsilon=1e-5):
+    return 0.5*(var1+mu1.pow(2) - th.log(var1.clamp(min=epsilon)) -1)
 
-def Gaussian_KLNorm(mu1,sigma1,epsilon=1e-8):
-    #assert all(sigma1>1e-8)
-    return -1/2 - th.log(sigma1.where(sigma1>epsilon,th.zeros_like(sigma1)+epsilon)) + (sigma1.pow(2)+(mu1).pow(2))/2
+def forwardKLDNormal(mu2,var2,epsilon=1e-5):
+    return 0.5*(th.log(var2.clamp(min=epsilon)) + (1 + mu2.pow(2))/var2.clamp(min=epsilon) - 1)
 
+def symKLDNormal(mu,sigma,epsilon=1e-5):
+    return 0.5*(forwardKLDNormal(mu,sigma,epsilon)+reversedKLDNormal(mu,sigma,epsilon))
 
-def Gaussian_sym_KLNorm(mu,sigma,eps=1e-3):
-    sigma_p2=sigma.pow(2)+eps
-    mu_p2=mu.pow(2)
-    inverse_sigma_p2=1/(sigma_p2)
-    return 0.5*(sigma_p2+mu_p2+inverse_sigma_p2+(1+mu_p2)*inverse_sigma_p2) - 1
-
-
-def calc_stats_loss(loss_stat,inputs,stat_dict,mode='kl',verbose=0):
+def calc_stats_loss(loss_stat,stat_dict,mode='kl',ref_stats_dict=None,inputs=None,verbose=0,epsilon=1e-8,pre_bn=True):
     def _get_stats_from_dict(stats_dict):
-        stat_list = []
+        batch_statistics = {}
         for k, v in stats_dict.items():
             mean = v[0] / v[2]
-            std = (v[1] / (v[2] - 1) - mean.pow(2)).sqrt()
-            stat_list.append((mean, std))
+            var = v[1] / v[2] - mean.pow(2)
+            ## var = E(x^2)-(EX)^2: sum_p2/n -sum/n
+            batch_statistics[k]=(mean, var)
         stats_dict.clear()
-        return stat_list
+        return batch_statistics
 
-    stat_list = _get_stats_from_dict(stat_dict)
-    in_mu, in_std = inputs.mean((0, 2, 3)), inputs.std((0,2,3))
-    stat_list.append((in_mu,in_std))
+    target_mean_key, target_var_key = None, None
+    batch_statistics = _get_stats_from_dict(stat_dict)
+    if inputs is not None:
+        in_mu, in_std = inputs.mean((0, 2, 3)), inputs.var((0,2,3))
+        batch_statistics['inputs']=(in_mu, in_std)
     if mode == 'mse':
-        for m, v in stat_list:
-            loss_stat += m.pow(2).mean()
-            loss_stat += (v - 1).pow(2).mean()
+        calc_stats = lambda m1,m2,v1,v2: m1.sub(m2).pow(2).mean() + v1.sub(v2).pow(2).mean()
     else:
-        for i,(m,v) in enumerate(stat_list):
-            if mode=='kl':
-                kl = Gaussian_KLNorm(m,v).mean()
-            elif mode== 'sym':
-                kl = Gaussian_sym_KLNorm(m,v).mean()
-            if verbose > 0:
-                with th.no_grad():
-                    zero_sigma = (v < 1e-8).sum()
-                    if zero_sigma > 0 or kl > 5*loss_stat/i:
-                        mu=m.mean()
-                        sigma=(v).mean()
-                        print(f'high divergence in layer {i}: {kl}'
-                              f'\nmu:{mu:0.4f}\tsigma:{sigma:0.4f}\tsmall sigma:{zero_sigma}/{len(v)}')
-            loss_stat=loss_stat+kl
+        if ref_stats_dict:
+            if pre_bn:
+                target_mean_key, target_var_key='running_mean', 'running_var'
+            else:
+                target_mean_key, target_var_key = 'bias', 'weight'
 
-    ret_val=loss_stat / len(stat_list)
-    stat_list.clear()
+            if mode == 'kl':
+                calc_stats = lambda m1, m2, v1, v2 : Gaussian_KL(m2,v2,m1,v1,epsilon).mean()
+            elif mode == 'sym':
+                calc_stats = lambda m1, m2, v1, v2: Gaussian_sym_KL(m1,v1,m2,v2,epsilon).mean()
+        else:
+            if mode == 'kl':
+                calc_stats = lambda m1, m2, v1, v2: reversedKLDNormal(m2,v2,epsilon).mean()
+            elif mode == 'sym':
+                calc_stats = lambda m1, m2, v1, v2: symKLDNormal(m2,v2,epsilon).mean()
+
+    for i,(k, (m, v)) in enumerate(batch_statistics.items()):
+        if ref_stats_dict and k in ref_stats_dict:
+            ref_dict = ref_stats_dict[k]
+            m_ref, v_ref = ref_dict[target_mean_key],ref_dict[target_var_key]
+        else:
+            m_ref, v_ref = th.zeros_like(m), th.ones_like(v)
+        moments_distance = calc_stats(m_ref, m, v_ref, v)
+        if verbose > 0:
+            with th.no_grad():
+                zero_sigma = (v < 1e-5).sum()
+                if zero_sigma > 0 or moments_distance > 5*loss_stat/i:
+                    print(f'high divergence in layer {k}: {moments_distance}'
+                          f'\nmu:{m.mean():0.4f}<s:r>{m_ref.mean():0.4f}\tsigma:{v.mean():0.4f}<s:r>{v_ref.mean():0.4f}\tsmall sigmas:{zero_sigma}/{len(v)}')
+        loss_stat = loss_stat + moments_distance
+
+    ret_val = loss_stat / len(batch_statistics)
     return ret_val
 
 
@@ -517,16 +534,19 @@ def plot_grid(image_tensor,samples= 16,nrow=4,denorm_meta=None):
     pass
 
 # collects stats accross devices as well
-def layer_stats_hook_dict(stat_dict,trance_name,device):
-    def stat_record(m,inputs,outputs):
-        sum = inputs[0].sum((0,2,3)).to(device)
-        sum_p2 = inputs[0].pow(2).sum((0,2,3)).to(device)
-        n=inputs[0].shape[0]*inputs[0].shape[2]*inputs[0].shape[3]
+def layer_stats_hook_dict(stat_dict,trance_name,device,pre_bn=True):
+    def stat_record(m,inputs , outputs):
+        target_activations = inputs if pre_bn else [outputs.clone()]
+        sum = target_activations[0].sum((0, 2, 3))
+        sum_p2 = target_activations[0].pow(2).sum((0, 2, 3))
+        n= target_activations[0][:, 0, :, :].numel()
+        _sum=sum.to(device)
+        _sum_p2=sum_p2.to(device)
         if trance_name not in stat_dict:
-            stat_dict[trance_name]=(sum,sum_p2,n)
+            stat_dict[trance_name]=(_sum,_sum_p2,n)
         else:
             sum_, sum_p2_, n_ = stat_dict[trance_name]
-            stat_dict[trance_name]=(sum+sum_, sum_p2+sum_p2_,n+n_)
+            stat_dict[trance_name]=(_sum+sum_, _sum_p2+sum_p2_,n+n_)
     return stat_record
 
 
@@ -853,9 +873,9 @@ def fgsm_attack(image, epsilon, data_grad):
     #perturbed_image = th.clamp(perturbed_image, 0, 1)
     return perturbed_image
 
-def forward(model, data_loader, inp_shape, args, device , batch_augment = None,normalize_inputs=None,
-            optimizer=None, smooth_loss=None, cont_loss=None,stat_list=[],adversarial=False,
-            mixer=None,FID=None,log=None,save_path='tmp',time_stamp=None,use_amp=False):
+def forward(model, data_loader, inp_shape, args, device, batch_augment = None, normalize_inputs=None,
+            optimizer=None, smooth_loss=None, cont_loss=None, recorded_stats_dict={},reference_stats_dict={},
+            adversarial=False, mixer=None, FID=None, log=None, save_path='tmp', time_stamp=None, use_amp=False):
     # for m in model.modules():
     #     assert m.training == False
     # for n,p in model.named_parameters():
@@ -963,7 +983,8 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             ## model activations statistics loss
             if args.calc_stats_loss:
                 # norm to compare to the 0,1 input statistics
-                loss_stat = calc_stats_loss(loss_stat, inputs, stat_list, args.stats_loss_mode)
+                loss_stat = calc_stats_loss(loss_stat, stat_dict=recorded_stats_dict, ref_stats_dict=reference_stats_dict,
+                                            mode=args.stats_loss_mode, inputs=inputs,pre_bn=args.stats_targets!='post_bn')
 
             if adversarial:
                 adv_loss = adversarial(out, labels)  # adv_targets)
@@ -977,8 +998,11 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                         plot_grid(inputs, denorm_meta=_DATASET_META_DATA[args.dataset])
                         plot_grid(perturbed_data, denorm_meta=_DATASET_META_DATA[args.dataset])
                     fooled_out = model(perturbed_data)
-                    fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), perturbed_data, stat_list,
-                                                        mode=args.stats_loss_mode)
+                    fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), inputs=perturbed_data,
+                                                        stat_dict=recorded_stats_dict,
+                                                        ref_stats_dict=reference_stats_dict,
+                                                        mode=args.stats_loss_mode,
+                                                        pre_bn=args.stats_targets!='post_bn')
                     t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
                     t1_, t5_ = accuracy(fooled_out.detach(), labels.detach(), (1, 5))
                     fooled_t1, fooled_t5 = accuracy(fooled_out.detach(), adv_targets.detach(), (1, 5))
@@ -1059,7 +1083,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
                     )
                     print('saving deep dreams')
                     snapshot_path = os.path.join(save_path, f'r{n_replay + 1}')
-                    save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_r{n_replay + 1}',
+                    save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_e{step}r{n_replay + 1}',
                                         (10, 5) if step < 5 else None, f'snapshot_e{step}r{n_replay + 1}')
 
                 if n_replay % args.report_freq == 0 or n_replay in args.snapshots_replay:
@@ -1075,7 +1099,7 @@ def forward(model, data_loader, inp_shape, args, device , batch_augment = None,n
             if args.target_stats > loss_stat:
                 print('reached stats target')
                 snapshot_path = os.path.join(save_path, f't_stat{args.target_stats:0.2f}')
-                save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_r{n_replay + 1}',
+                save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_e{step}r{n_replay + 1}',
                                     (10, 5) if step < 1 else None, f'snapshot_e{step}r{n_replay + 1}')
                 break
 
@@ -1197,18 +1221,25 @@ def main():
     model = factory_method(**args.model_config)
     if args.ckt_path != '':
         model.load_state_dict(th.load(args.ckt_path,map_location='cpu')['state_dict'])
-    model.to(device)
+
     num_parameters = sum([l.nelement() for l in model.parameters()])
     print(f"number of parameters: {num_parameters}")
-
+    freeze_params(model)
+    model.eval()
+    model.to(device)
     ### todo: simplify by absorbing all bn parameters and returning the list of affine transformation parameters
     ## absorb batch normalization so layers statistics are normalized. we want to track the batch statistics for
     # the loss function for each iteration, setting momentum to 1 lets us access this information
     if args.use_stats_loss:
         args.calc_stats_loss=1
     if args.calc_stats_loss:
-        print('partially absorbing batch normalization parameters')
-        search_absorbe_bn(model,remove_bn=False,keep_modifiers=True)
+        if args.stats_targets!='middle_bn':
+            print('collecting bn info')
+            reference_stats = get_bn_params(model)
+        else:
+            print('partially absorbing batch normalization parameters')
+            search_absorbe_bn(model,remove_bn=False,keep_modifiers=True)
+            reference_stats = None
 
     if args.measure == '':
         # generate samples with a smaller size then the expected input, this is an additional image scaling prior
@@ -1230,10 +1261,10 @@ def main():
         if args.use_amp and optimizer_im:
             #print(f'using amp {amp_opt}')
             model, optimizer = amp.initialize(model, optimizer_im, opt_level='O1')
-
-        if args.sync_bn:
-            print('converting batch norms',args.sync_bn)
-            model = convert_syncbn_model(model)
+        #
+        # if args.sync_bn:
+        #     print('converting batch norms',args.sync_bn)
+        #     model = convert_syncbn_model(model)
 
     if args.calc_cont_loss:
         cont_loss=ContinuityLoss()
@@ -1255,7 +1286,7 @@ def main():
     #             m.register_forward_hook(layer_stats_hook(stat_list,device))
         for n, m in model.named_modules():
             if is_bn(m):
-                m.register_forward_hook(layer_stats_hook_dict(stat_list, n, device))
+                m.register_forward_hook(layer_stats_hook_dict(stat_list, n, device,pre_bn=args.stats_targets!='post_bn'))
 
     if len(device_id)>1:
         if args.calc_smooth_loss:
@@ -1271,9 +1302,6 @@ def main():
         mixer.to(device)
     else:
         mixer = None
-
-    freeze_params(model)
-    model.eval()
 
     if args.measure_fid != '':
         fid_ref_dataset = get_dataset(args.measure_fid, args.split_fid,
@@ -1324,10 +1352,11 @@ def main():
             adversarial_l=nn.CrossEntropyLoss()
             adversarial_l.to(device)
             forward(model, train_loader, inp_shape, args, device, None, None, None, smooth_loss, cont_loss,
-                    stat_list,adversarial=adversarial_l,mixer=mixer,FID=FID)
+                    recorded_stats_dict=stat_list,reference_stats_dict=reference_stats,adversarial=adversarial_l,mixer=mixer,FID=FID)
         else:
             with th.no_grad():
-                forward(model,train_loader,inp_shape,args,device,None,None,None,smooth_loss,cont_loss,stat_list,mixer=mixer,FID=FID)
+                forward(model,train_loader,inp_shape,args,device,None,None,None,smooth_loss,cont_loss,
+                        recorded_stats_dict=stat_list,reference_stats_dict=reference_stats,mixer=mixer,FID=FID)
         exit(0)
 
     #### gen
@@ -1340,6 +1369,8 @@ def main():
     exp_tag += f'_lr{args.lr}_ba{args.batch_dup_factor}'
     if args.use_stats_loss:
         exp_tag += f'_stats-{args.stats_loss_mode}'
+        if args.stats_targets!='middle_bn':
+            exp_tag+=f'_{args.stats_targets}'
     if args.use_dd_loss:
         exp_tag += '_dd-{}_scale-{}'.format(args.dd_loss_mode, args.cls_scale)
     if args.use_prior_loss:
@@ -1366,7 +1397,7 @@ def main():
                              else 'running',
                              limit=int((args.n_samples_to_generate * args.nclasses) / args.batch_size)+0.5)
 
-    forward(model, train_loader, inp_shape, args, device, b_aug, input_stats, optimizer_im, smooth_loss, cont_loss, stat_list,
+    forward(model, train_loader, inp_shape, args, device, b_aug, input_stats, optimizer_im, smooth_loss, cont_loss, stat_list,reference_stats_dict=reference_stats,
             mixer=mixer, FID=FID,save_path=save_path,time_stamp=exp_start_time_stamp,log=log,use_amp=args.use_amp)
 
 def save_batched_images(input_batch,label,root_path,prefix='',plot_sample_shape=None,plot_sample_name='sample'):
