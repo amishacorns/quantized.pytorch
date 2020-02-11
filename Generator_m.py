@@ -77,7 +77,7 @@ def settings():
     cls_scale = 0.0004
     smooth_scale = 1. #20
     smooth_scale_decay={} #{100:0.2,5000:0.5,1000:0.5,1500:0.5}
-    batch_size = 128
+    batch_size = 256
     betas = (0.9, 0.999)
     lr = 0.1
     replay_latent = 2000
@@ -93,7 +93,7 @@ parser=AutoArgParser()
 parser.add_argument('-d',default=[0],type=int,nargs='+')
 parser.add_argument('-lr_drop_replays',default=[800, 1500, 3000],type=int,nargs='+')
 parser.add_argument('-snapshots_replay',default= [1000],type=int,nargs='+')
-parser.add_argument('-stats_targets',default='middle_bn',choices=['pre_bn','post_bn','middle_bn'])
+parser.add_argument('-stats_targets',default='pre_bn',choices=['pre_bn','post_bn','middle_bn'])
 parser.auto_add(settings())
 
 class _MODEL_META(_META):
@@ -970,7 +970,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
 
             if mixer:
                 inputs = mixer(inputs, [0.5, inputs.size(0), True])
-
+            generator_time.update(time.time()-end)
             out = model(inputs)
 
             if args.measure:
