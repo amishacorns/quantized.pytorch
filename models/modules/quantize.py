@@ -9,7 +9,7 @@ from utils.misc import get_lambda_module_class
 from utils.partial_class import partial_class
 from inspect import signature
 from copy import deepcopy
-from utils.module_rewriter import ReWriter
+from utils.module_rewriter import ReWriter,BaseMatcher,FirstNMatcher,ExactAttrMatcher,BasicTypeMatcher,BaseConfigurationGroup
 from collections import OrderedDict
 import pdb
 ## DEBUG FLAGS
@@ -302,12 +302,13 @@ class QConv2d(nn.Conv2d,QuantNode):
         sd = self.state_dict()
         if logging:
             logging.debug(f'quantizing parameters for {super(QConv2d,self).__str__()}')
-        sd.update({'weight':quantize(self.weight, num_bits=self.num_bits_weight,
+        with torch.no_grad():
+            sd.update({'weight':quantize(self.weight, num_bits=self.num_bits_weight,
                  min_value=self.weight_min,
                  max_value=self.weight_max)})
-        if self.bias_quant:
-            sd.update({'bias': quantize(self.bias, min_value=self.bias_min, max_value=self.bias_max,
-                             num_bits=self.num_bits_weight)})
+            if self.bias_quant:
+                sd.update({'bias': quantize(self.bias, min_value=self.bias_min, max_value=self.bias_max,
+                                 num_bits=self.num_bits_weight)})
         self.load_state_dict(sd)
 
     def forward(self, input):
@@ -519,7 +520,7 @@ def recursive_apply(model,func,*args):
         recursive_apply(m,func,*args)
 
 
-def set_bn_is_train(model,train,logger=None,reload_running_estimators=False,reset_running_estimators=False):
+def set_bn_is_train(model,train,logger=None,reload_running_estimators=False,reset_running_estimators=False,freeze_affine=False):
     def func(m,*args):
         if is_bn(m):
             if logger:
@@ -535,6 +536,9 @@ def set_bn_is_train(model,train,logger=None,reload_running_estimators=False,rese
                         logger.debug('{} set to {}'.format(m,'loading running estimators from clones'))
                     m.running_mean.data=m.locked_running_mean.clone()
                     m.running_var.data=m.locked_running_var.clone()
+            if freeze_affine:
+                for p in m.parameters():
+                    p.requires_grad=False
             m.train(train)
 
     recursive_apply(model,func)
@@ -666,6 +670,15 @@ def get_bn_folding_module(base_module,bn_module,
 
     return QFold
 
+#todo move QWriterConfig groups to use a configuration template instead of dictionaries
+class QRewriterConfigurationGroup(BaseConfigurationGroup):
+    def __init__(self,name,matcher,activations_numbits,weights_numbits,bias_quant,grad_numbits,
+                 builder_fn=None):
+        super().__init__(name,matcher,builder_fn)
+        self.activations_numbits=activations_numbits
+        self.weights_numbits=weights_numbits
+        self.bias_quant=bias_quant
+        self.grad_numbits=grad_numbits
 
 class QReWriter(ReWriter):
     _SUPPORTED_MODULES = [torch.nn.modules.conv.Conv2d,
@@ -676,14 +689,25 @@ class QReWriter(ReWriter):
     _DEFUALT_WEIGHT_NBITS=8
     _DEFUALT_GRAD_NBITS=None
     _DEFAULT_BIAS_QUANT=False
-    _BASIC_MATCHER_FN=lambda C: lambda m,n: isinstance(m, C)
+    #todo these factory methods should be return cfg class instance
+    _PRESET_CFG_GROUPS={
+        'ignore': lambda matcher_fn: {'builder_fn': lambda ref: ref, 'matcher_fn': matcher_fn},
+        'first_convs': lambda limit,nbits: {'replace_op': QConv2d,
+                                            'activations_numbits': nbits,
+                                            'weights_numbits': nbits,
+                                            'matcher_fn':FirstNMatcher(limit,BasicTypeMatcher(
+                                               torch.nn.modules.conv.Conv2d))},
+        'conv1x1': lambda nbits: {'replace_op': QConv2d, 'activations_numbits': nbits, 'weights_numbits': nbits,
+                                  'matcher_fn': ExactAttrMatcher(torch.nn.modules.conv.Conv2d,{'kernel_size': (1, 1)})
+                                  }
+    }
 
-    def __init__(self,**config):
-        super().__init__()
+    def __init__(self,verbose=0,**config):
+        super().__init__(verbose=verbose)
         def _create_quantized_partial_class_from_cfg(cfg):
-            return partial_class(cfg['replace_op'], num_bits=cfg.get('activation_numbit',self.activation_numbit),
+            return partial_class(cfg['replace_op'], num_bits=cfg.get('activations_numbits',self.activation_numbit),
                                  num_bits_weight=cfg.get('weights_numbits', self.weights_numbits),
-                                 num_bits_grad=cfg.get('gradient_numbits', self.gradient_numbits),
+                                 num_bits_grad=cfg.get('grad_numbits', self.gradient_numbits),
                                  bias_quant=cfg.get('bias_quant', self.bias_quant))
 
         self.activation_numbit = config.get('activations_numbits', type(self)._DEFUALT_ACT_NBITS)
@@ -691,34 +715,38 @@ class QReWriter(ReWriter):
         self.gradient_numbits = config.get('grad_numbits', type(self)._DEFUALT_GRAD_NBITS)
         self.bias_quant = config.get('bias_quant', type(self)._DEFAULT_BIAS_QUANT)
         self.remove_bn = config.get('remove_bn', False)
-
         #self._fallback_matchers = [type(self)._BASIC_MATCHER_FN(C) for C in type(self)._SUPPORTED_MODULES]
         self._default_cfgs.update({
-            'default_conv2d': {'replace_op': QConv2d, 'replace': torch.nn.modules.conv.Conv2d,
-                               'matcher_fn': self._fallback_matchers[0], 'quantized':True},
-            'default_linear': {'replace_op': QLinear, 'replace': torch.nn.modules.linear.Linear,
-                               'matcher_fn': self._fallback_matchers[1], 'quantized':True}
+            'default_conv2d': {'replace_op': QConv2d, 'matcher_fn': BasicTypeMatcher(torch.nn.modules.conv.Conv2d)},
+            'default_linear': {'replace_op': QLinear, 'matcher_fn': BasicTypeMatcher(torch.nn.modules.linear.Linear)}
         })
         if self.remove_bn:
             #todo consider merging bn absorbtion logic
             pass_through_module = get_lambda_module_class(lambda x:x)
-            self._default_cfgs['remove_bn']={'replace': torch.nn.modules.BatchNorm2d,
-                                              'replace_op': pass_through_module,
-                                              'matcher_fn': self._fallback_matchers[2],
-                                              'quantized':False, 'builder_fn': lambda ref_module : pass_through_module()
-                                              }
+            self._default_cfgs['remove_bn']={'matcher_fn': BasicTypeMatcher(torch.nn.modules.batchnorm.BatchNorm2d),
+                                             'builder_fn': lambda ref_module : pass_through_module()}
+        # config['cfg_groups'] = {
+        #     'conv1x1_8-bit': {'replace_op': QConv2d, 'replace': torch.nn.modules.conv.Conv2d, 'quantized': True,
+        #                       'matcher_fn': lambda m,name: isinstance(m,torch.nn.modules.conv.Conv2d)
+        #                                                  and m.kernel_size == (1, 1),
+        #                       'activations_numbits': 8, 'weights_numbits': 8}}
+        # config['cfg_groups'] = {'preset-conv1x1':8}
         cfg_groups=config.get('cfg_groups',OrderedDict())
+        for name,cfg in cfg_groups.items():
+            if name.startswith('preset-'):
+                cfg = type(self)._PRESET_CFG_GROUPS[name[7:]](cfg)
+            cfg_groups[name]=cfg
+        if not isinstance(cfg_groups,OrderedDict):
+            print('Rewriter-Warning: cfg groups are not ordered')
+            cfg_groups=OrderedDict(cfg_groups)
+
         cfg_groups.update(self._default_cfgs)
 
-        ## eg. first and last fc layers quant configs, matcher gets the modules' long name and the module itself
-        # and returns True if belongs to the group :
         for group_name,group_cfgs in cfg_groups.items():
-            if group_cfgs['replace'] and group_cfgs['quantized']:
-                #if quantization is used we can auto generate quantized builders via partial class
-                self.group_fns[group_name] = group_cfgs['matcher_fn'], \
-                                             group_cfgs.get('builder_fn',
-                                             self.gen_builder_fn(_create_quantized_partial_class_from_cfg(group_cfgs)))
-            else:
-                #expect user to provide the builder method that builds a replacement module i.e.
-                # new_module=builder_fn(ref_module)
-                self.group_fns[group_name] = group_cfgs['matcher_fn'], group_cfgs['builder_fn']
+            # expect user to provide the builder method that builds a replacement module i.e.
+            # new_module=builder_fn(ref_module)
+            if not group_cfgs.get('builder_fn') and is_quant(group_cfgs['replace_op']):
+                #for quantization layers we can auto generate builders via partial class
+                group_cfgs['builder_fn'] = self.gen_builder_fn(_create_quantized_partial_class_from_cfg(group_cfgs))
+
+            self.group_fns[group_name] = group_cfgs['matcher_fn'], group_cfgs['builder_fn']
