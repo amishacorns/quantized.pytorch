@@ -13,7 +13,7 @@ import torch.optim
 import torch.utils.data
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
-
+from utils.absorb_bn import search_absorbe_bn
 from utils.mixup import MixUp
 import models
 from data import get_dataset
@@ -185,8 +185,9 @@ parser.add_argument('--dist-init', default='env://', type=str,
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 
-def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(10,1e-8),cos_drops=[(15,1),(40,1e-2)]):
-    from utils.regime import cosine_anneal_lr
+def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(5,1e-8,'cos'),drops=[(40,1,'linear'),(15,1e-1,'cos'),(10,1e-1,'cos')],
+                       steps_per_epoch=400,epochs=80,weight_decay=None):
+    from utils.regime import cosine_anneal_lr,linear_lr,exp_decay_lr
     def _pop_if_list(l):
         if type(l)==list:
             v=l.pop(0)
@@ -194,19 +195,26 @@ def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(10,1e-8),
             v=l
         return v
 
-    def _build_phase(lr_start,epoch_start,lr_end,epoch_end,regime_steps_per_epoch,**kwargs):
-        regime_phase={'step': epoch_start * regime_steps_per_epoch}
+    def _build_phase(lr_start,epoch_start,lr_end,epoch_end,steps_per_epoch,mode='linear',ndrops=None,**kwargs):
+        step_start=epoch_start * steps_per_epoch
+        regime_phase={'step': step_start}
         regime_phase.update(kwargs)
         if lr_start-lr_end==0:
             regime_phase.update({'lr':lr_start})
         else:
-            epochs=epoch_end-epoch_start
-            regime_phase.update({'step_lambda': cosine_anneal_lr(lr_start, lr_end, epoch_start * model.regime_steps_per_epoch,
-                                         epoch_end * model.regime_steps_per_epoch, epochs - 1)})
+            step_end = epoch_end * steps_per_epoch
+            if mode=='cos':
+                regime_phase.update(
+                    {'step_lambda': cosine_anneal_lr(lr_start, lr_end, step_start, step_end, ndrops)})
+            elif mode=='linear':
+                regime_phase.update(
+                    {'step_lambda': linear_lr(lr_start, lr_end, step_start,step_end)})
+            else:
+                assert 0,"mode not supported choose from [\'linear\',\'cos\']"
         return regime_phase
 
-    model.regime_epochs = 80
-    model.regime_steps_per_epoch = 400
+    model.regime_epochs = epochs
+    model.regime_steps_per_epoch = steps_per_epoch
     #start epoch,epochs,lr modifier
     #cos_drops=[(15,1),(40,1e-2)]
     ## reference settings to fix training regime length in update steps
@@ -217,21 +225,23 @@ def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(10,1e-8),
     epoch_start=0
     # todo regime construction can be reduced to a single loop over num_epochs,lr_scales tuples
     if warmup:
-        ramp_up_epochs,warmup_scale=warmup
+        ramp_up_epochs, warmup_scale,mode = warmup
         model.regime += [_build_phase(lr_start*warmup_scale,epoch_start,
-                                      lr_start             ,ramp_up_epochs*model.regime_steps_per_epoch,
+                                      lr_start,ramp_up_epochs,
                                       model.regime_steps_per_epoch,
+                                      mode=mode,
                                       optimizer='SGD',
                                       momentum=_pop_if_list(momentum),
                                       dampning=_pop_if_list(dampning))]
         epoch_start+=ramp_up_epochs
     #set drops
-    for epochs,lr_md in cos_drops:
+    for epochs,lr_md,mode in drops:
         lr_end=lr_start*lr_md
         epoch_end=epoch_start+epochs
         model.regime +=[_build_phase(lr_start,epoch_start,
                                      lr_end,epoch_end,
                                      model.regime_steps_per_epoch,
+                                     mode=mode,
                                      optimizer='SGD',
                                      momentum=_pop_if_list(momentum),
                                      dampning=_pop_if_list(dampning))]
@@ -244,7 +254,8 @@ def set_default_regime(model,lr=1e-3,momentum=0.9,dampning=0.1,warmup=(10,1e-8),
                                 optimizer='SGD',
                                 momentum=_pop_if_list(momentum),
                                 dampning=_pop_if_list(dampning))]
-
+    if weight_decay is not None:
+        model.regime[0]['weight_decay']=weight_decay
 
 
 def freeze_dropout(model):
@@ -333,7 +344,11 @@ def main():
         if model_config.get('fc'):
             fc = '_fc_{}'.format(model_config['fc'].__str__().strip('\{\}').replace('\'','').replace(': ','').replace(', ',''))
         fl_layers = conv1 + fc
-
+        qcfg_g=quantize_settings.get('cfg_groups', {})
+        for qcfg_n,cfg in qcfg_g.items():
+            if qcfg_n.startswith('preset-'):
+                qcfg_n=qcfg_n[7:]+f'_{cfg}'
+            fl_layers+='_'+qcfg_n
         if args.freeze_bn_running_estimators:
             bn_mod_tag = '_freeze_bn_estimators'
         elif args.freeze_bn:
@@ -459,7 +474,6 @@ def main():
 
         if args.absorb_bn or args.otf or args.fresh_bn:
             assert not (args.absorb_bn and args.otf or args.absorb_bn and args.fresh_bn or args.otf and args.fresh_bn)
-            from utils.absorb_bn import search_absorbe_bn
             logging.info('absorbing teacher batch normalization')
             search_absorbe_bn(teacher, verbose=True, remove_bn=not args.fresh_bn, keep_modifiers=args.fresh_bn)
             if not args.fresh_bn:
@@ -485,7 +499,7 @@ def main():
         search_absorbe_bn(model, remove_bn=not args.freeze_bn)
     if not args.no_quantize and from_model_zoo:
         #apply quantization on arbitrary models
-        rewriter = QReWriter(**quantize_settings)
+        rewriter = QReWriter(verbose=1,**quantize_settings)
         rewriter(model)
     logging.debug(model)
 
@@ -493,7 +507,9 @@ def main():
         if regime_name == 'default':
             set_default_regime(model,args.lr)
         elif regime_name == 'linear':
-            set_default_regime(model, args.lr,warmup=(),cos_drops=[])
+            set_default_regime(model, args.lr,warmup=(5,1e-3),cos_drops=[])
+        elif regime_name == 'short':
+            set_default_regime(model, args.lr, warmup=(1,1e-5), cos_drops=[(40,1),(1,1e-1)])
 
     regime = regime or getattr(model, 'regime', [{'epoch': 0, 'optimizer': 'SGD', 'lr': 0.1,
                                                   'momentum': 0.9,'weight_decay': 1e-4}])
@@ -640,7 +656,7 @@ def main():
             checkpoint = torch.load(checkpoint_file)
             args.start_epoch = checkpoint['epoch'] - 1
             best_prec1 = checkpoint['best_prec1']
-            if args.fresh_bn or from_model_zoo:
+            if args.fresh_bn or (args.absorb_bn and from_model_zoo):
                 search_absorbe_bn(model, remove_bn=not args.fresh_bn)
             model.load_state_dict(checkpoint['state_dict'])
             logging.info("loaded checkpoint '%s' (epoch %s)",
@@ -764,7 +780,8 @@ def main():
                     val_loader, model, CE, epoch)
             else:
                 val_loss, val_prec1, val_prec5 = validate(
-                val_loader, model, valid_criterion, epoch,teacher=teacher)
+                val_loader, model, valid_criterion, epoch,teacher=teacher,
+                    loss_scale=loss_scale,distributed=distributed)
             if distributed:
                 logging.debug('local rank {} is now saving'.format(args.local_rank))
             timer_save=time.time()
@@ -1000,7 +1017,7 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
             loss = aux_loss*aux_loss_scale + criterion(output, target) * loss_scale
 
             if ce:
-                loss = loss + ce(output,labels)*1e-5
+                loss = loss + ce(output,labels)
 
             if args.ranking_loss and training:
                 topk=5
@@ -1115,15 +1132,15 @@ def train(data_loader, model, criterion, epoch, optimizer,teacher=None,aux=None,
                    aux_depth_scale=aux_depth_scale)
 
 
-def validate(data_loader, model, criterion, epoch,teacher=None):
+def validate(data_loader, model, criterion, epoch,teacher=None,loss_scale=1.0,distributed=False):
     # switch to evaluate mode
     if args.freeze_bn_running_estimators:
         logging.info('restoring all batch normalization parameters')
         set_bn_is_train(model,False,logger=logging,reload_running_estimators=True)
     model.eval()
     with torch.no_grad():
-        return forward(data_loader, model, criterion, epoch,
-                       training=False, optimizer=None,teacher=teacher)
+        return forward(data_loader, model, criterion, epoch, training=False, optimizer=None,
+                       teacher=teacher,loss_scale=loss_scale,distributed=distributed)
 
 
 def compare_activations(src,tgt,inputs):
