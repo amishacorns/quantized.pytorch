@@ -8,3 +8,4 @@ from .inception_v2 import *
 from .mobilenet import *
 from .mobilenet_tv import *
 from .mobilenet_quantized import *
+from .densenet_tv import *
