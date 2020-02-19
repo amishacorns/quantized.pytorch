@@ -745,8 +745,11 @@ class QReWriter(ReWriter):
         for group_name,group_cfgs in cfg_groups.items():
             # expect user to provide the builder method that builds a replacement module i.e.
             # new_module=builder_fn(ref_module)
-            if not group_cfgs.get('builder_fn') and is_quant(group_cfgs['replace_op']):
+            if group_cfgs.get('builder_fn') is None:
+                if issubclass(group_cfgs['replace_op'],QuantNode):
                 #for quantization layers we can auto generate builders via partial class
-                group_cfgs['builder_fn'] = self.gen_builder_fn(_create_quantized_partial_class_from_cfg(group_cfgs))
+                    group_cfgs['builder_fn'] = self.gen_builder_fn(_create_quantized_partial_class_from_cfg(group_cfgs))
+                else:
+                    assert 0, 'bad cfg, must specify builder_fn for non-quant ops'
 
             self.group_fns[group_name] = group_cfgs['matcher_fn'], group_cfgs['builder_fn']
