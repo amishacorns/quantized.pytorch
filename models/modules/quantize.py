@@ -697,6 +697,17 @@ class QReWriter(ReWriter):
                                             'weights_numbits': nbits,
                                             'matcher_fn':FirstNMatcher(limit,BasicTypeMatcher(
                                                torch.nn.modules.conv.Conv2d))},
+        'convs_w_a': lambda w_bits, act_bits: {'replace_op': QConv2d,
+                                             'activations_numbits': act_bits,
+                                             'weights_numbits': w_bits,
+                                             'matcher_fn': BasicTypeMatcher(
+                                                 torch.nn.modules.conv.Conv2d)},
+        'linear_w_a': lambda w_bits, act_bits: {'replace_op': QLinear,
+                                               'activations_numbits': act_bits,
+                                               'weights_numbits': w_bits,
+                                               'matcher_fn': BasicTypeMatcher(
+                                                   torch.nn.modules.linear.Linear)},
+
         'conv1x1': lambda nbits: {'replace_op': QConv2d, 'activations_numbits': nbits, 'weights_numbits': nbits,
                                   'matcher_fn': ExactAttrMatcher(torch.nn.modules.conv.Conv2d,{'kernel_size': (1, 1)})
                                   }
@@ -734,7 +745,7 @@ class QReWriter(ReWriter):
         cfg_groups=config.get('cfg_groups',OrderedDict())
         for name,cfg in cfg_groups.items():
             if name.startswith('preset-'):
-                cfg = type(self)._PRESET_CFG_GROUPS[name[7:]](cfg)
+                cfg = type(self)._PRESET_CFG_GROUPS[name[7:]](*cfg)
             cfg_groups[name]=cfg
         if not isinstance(cfg_groups,OrderedDict):
             print('Rewriter-Warning: cfg groups are not ordered')
