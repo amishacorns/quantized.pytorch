@@ -900,7 +900,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
     end = time.time()
     if args.record > 0:
         from utils.misc import Recorder
-        r = Recorder(model, recording_mode=['outputs'])
+        r = Recorder(model, recording_mode=['outputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.Conv2d))
     for step, (inputs_, labels_) in enumerate(data_loader):
         labels_ = labels_.to(device)
         inputs_ = inputs_.to(device)
@@ -975,7 +975,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
             if mixer:
                 inputs = mixer(inputs, [0.5, inputs.size(0), True])
             generator_time.update(time.time()-end)
-            if args.record < step:
+            if args.record > step:
                 r.insert('inputs',inputs)
             else:
                 r.master_record_enable = False
@@ -1005,7 +1005,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
 
                     perturbed_data = fgsm_attack(inp_ptr, args.epsilon,
                                                  th.cat([data_grad] * (len(inputs) // len(inp_ptr))))
-                    if args.record < step:
+                    if args.record > step:
                         r.insert('FGSM_grad', data_grad)
                         r.insert('FGSM_grad_sign', data_grad.sign())
                         r.insert('input_pertrubed_eps_0', perturbed_data)
@@ -1015,9 +1015,9 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
                         plot_grid(inputs, denorm_meta=_DATASET_META_DATA[args.dataset])
                         plot_grid(perturbed_data, denorm_meta=_DATASET_META_DATA[args.dataset])
                     fooled_out = model(perturbed_data)
-                    if args.record < step:
+                    if args.record > step:
                         r.tag = old_tag
-                    if args.record == step-1:
+                    if args.record - 1 == step:
                         r.dump_record()
                         r.record.clear()
                     fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), inputs=perturbed_data,
