@@ -900,7 +900,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
     end = time.time()
     if args.record > 0:
         from utils.misc import Recorder
-        r = Recorder(model, recording_mode=['outputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.Conv2d))
+        r = Recorder(model, recording_mode=['outputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.Conv2d) or isinstance(m,th.nn.Linear))
     for step, (inputs_, labels_) in enumerate(data_loader):
         labels_ = labels_.to(device)
         inputs_ = inputs_.to(device)
@@ -977,6 +977,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
             generator_time.update(time.time()-end)
             if args.record > step:
                 r.insert('inputs',inputs)
+                r.insert('labels', labels)
             else:
                 r.master_record_enable = False
             out = model(inputs)
@@ -996,30 +997,37 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
 
             if adversarial:
                 #compute the gradient with respect to the actual labels
+                ## todo add targeted attacks
                 adv_loss = adversarial(out, labels)  # adv_targets)
                 adv_loss.backward()
                 data_grad = inp_ptr.grad.data
 
                 # Call FGSM Attack
                 with th.no_grad():
-
                     perturbed_data = fgsm_attack(inp_ptr, args.epsilon,
                                                  th.cat([data_grad] * (len(inputs) // len(inp_ptr))))
                     if args.record > step:
+                        r.insert('predictions', out)
                         r.insert('FGSM_grad', data_grad)
                         r.insert('FGSM_grad_sign', data_grad.sign())
-                        r.insert('input_pertrubed_eps_0', perturbed_data)
                         old_tag = r.tag
-                        r.tag = 'FGSM_0.1'
+                        r.tag = f'FGSM_{args.epsilon}'
+                        r.insert('input_pertrubed', perturbed_data)
+
                     if args.DEBUG_SHOW:
                         plot_grid(inputs, denorm_meta=_DATASET_META_DATA[args.dataset])
                         plot_grid(perturbed_data, denorm_meta=_DATASET_META_DATA[args.dataset])
+
                     fooled_out = model(perturbed_data)
                     if args.record > step:
+                        r.insert('predictions', fooled_out)
                         r.tag = old_tag
-                    if args.record - 1 == step:
-                        r.dump_record()
-                        r.record.clear()
+                        if args.record - 1 == step:
+                            r.dump_record()
+                            r.record.clear()
+                            print('Done recording')
+                            exit(0)
+
                     fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), inputs=perturbed_data,
                                                         stat_dict=recorded_stats_dict,
                                                         ref_stats_dict=reference_stats_dict,
