@@ -88,6 +88,7 @@ def settings():
     masking = False
     SGD=0
     target_stats=0
+    nclasses=-1
     return locals()
 
 parser=AutoArgParser()
@@ -469,19 +470,23 @@ def forwardKLDNormal(mu2,var2,epsilon=1e-5):
 def symKLDNormal(mu,sigma,epsilon=1e-5):
     return 0.5*(forwardKLDNormal(mu,sigma,epsilon)+reversedKLDNormal(mu,sigma,epsilon))
 
-def calc_stats_loss(loss_stat,stat_dict,mode='kl',ref_stats_dict=None,inputs=None,verbose=0,epsilon=1e-8,pre_bn=True):
-    def _get_stats_from_dict(stats_dict):
+def calc_stats_loss(loss_stat,stat_dict=None,running_dict=None,mode='kl',ref_stats_dict=None,inputs=None,verbose=0,epsilon=1e-8,pre_bn=True,record=None):
+    # used to aggregate running stats from multiple devices
+    def _get_stats_from_running_dict(stats_dict):
         batch_statistics = {}
         for k, v in stats_dict.items():
             mean = v[0] / v[2]
             var = v[1] / v[2] - mean.pow(2)
             ## var = E(x^2)-(EX)^2: sum_p2/n -sum/n
             batch_statistics[k]=(mean, var)
+            if record is not None:
+                record.insert(k+'_batch_mean',mean)
+                record.insert(k+'_batch_var',var)
         stats_dict.clear()
         return batch_statistics
 
     target_mean_key, target_var_key = None, None
-    batch_statistics = _get_stats_from_dict(stat_dict)
+    batch_statistics = stat_dict or _get_stats_from_running_dict(running_dict)
     if inputs is not None:
         in_mu, in_std = inputs.mean((0, 2, 3)), inputs.var((0,2,3))
         batch_statistics['inputs']=(in_mu, in_std)
@@ -900,7 +905,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
     end = time.time()
     if args.record > 0:
         from utils.misc import Recorder
-        r = Recorder(model, recording_mode=['outputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.Conv2d) or isinstance(m,th.nn.Linear))
+        r = Recorder(model, recording_mode=['inputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.BatchNorm2d))
     for step, (inputs_, labels_) in enumerate(data_loader):
         labels_ = labels_.to(device)
         inputs_ = inputs_.to(device)
@@ -913,10 +918,13 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
         #        #aggregate target dataset activations
         #        FID(inputs,report=False)
         #        print('FID:',FId.item())
+        ## for reporting topk results
+        topk = min(5, args.nclasses)
+
         if adversarial:
-            ## choose arbitrary adv_targets
-            ##todo optional: choose adv_targets closest to predicted class instead of arbitrary assignment
-            adv_targets = (labels_ + th.randint_like(labels_, 1, args.nclasses - 2)) % args.nclasses
+            ##todo optional: choose arbitrary adv_targets (targeted attack)
+            #adv_targets = (labels_ + th.randint_like(labels_, 1, args.nclasses - 2)) % args.nclasses
+            adv_targets = None
             inputs_.requires_grad = True
             inputs_.retain_grad()
             inp_ptr = inputs_
@@ -975,12 +983,15 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
             if mixer:
                 inputs = mixer(inputs, [0.5, inputs.size(0), True])
             generator_time.update(time.time()-end)
+            if args.record <= step:
+                r.master_record_enable = False
+
+            out = model(inputs)
+
             if args.record > step:
                 r.insert('inputs',inputs)
                 r.insert('labels', labels)
-            else:
-                r.master_record_enable = False
-            out = model(inputs)
+                r.insert('outputs', out)
 
             if args.measure:
                 soft_out = F.softmax(out.detach() / args.output_temp).cpu().numpy()
@@ -992,8 +1003,9 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
             ## model activations statistics loss
             if args.calc_stats_loss:
                 # norm to compare to the 0,1 input statistics
-                loss_stat = calc_stats_loss(loss_stat, stat_dict=recorded_stats_dict, ref_stats_dict=reference_stats_dict,
-                                            mode=args.stats_loss_mode, inputs=inputs,pre_bn=args.stats_targets!='post_bn')
+                loss_stat = calc_stats_loss(loss_stat, running_dict=recorded_stats_dict, ref_stats_dict=reference_stats_dict,
+                                            mode=args.stats_loss_mode, inputs=inputs,pre_bn=args.stats_targets!='post_bn')#,record=r)
+
 
             if adversarial:
                 #compute the gradient with respect to the actual labels
@@ -1007,9 +1019,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
                     perturbed_data = fgsm_attack(inp_ptr, args.epsilon,
                                                  th.cat([data_grad] * (len(inputs) // len(inp_ptr))))
                     if args.record > step:
-                        r.insert('predictions', out)
                         r.insert('FGSM_grad', data_grad)
-                        r.insert('FGSM_grad_sign', data_grad.sign())
                         old_tag = r.tag
                         r.tag = f'FGSM_{args.epsilon}'
                         r.insert('input_pertrubed', perturbed_data)
@@ -1020,24 +1030,24 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
 
                     fooled_out = model(perturbed_data)
                     if args.record > step:
-                        r.insert('predictions', fooled_out)
+                        r.insert('outputs', fooled_out)
                         r.tag = old_tag
-                        if args.record - 1 == step:
-                            r.dump_record()
-                            r.record.clear()
-                            print('Done recording')
-                            exit(0)
 
                     fooled_stats_loss = calc_stats_loss(th.zeros(1, device=device), inputs=perturbed_data,
-                                                        stat_dict=recorded_stats_dict,
+                                                        running_dict=recorded_stats_dict,
                                                         ref_stats_dict=reference_stats_dict,
                                                         mode=args.stats_loss_mode,
-                                                        pre_bn=args.stats_targets!='post_bn')
-                    t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
-                    t1_, t5_ = accuracy(fooled_out.detach(), labels.detach(), (1, 5))
-                    fooled_t1, fooled_t5 = accuracy(fooled_out.detach(), adv_targets.detach(), (1, 5))
-                    print('top1 before {}\ttop1 after {}\ttop1 fooled {}\t||\tstats pre {}\tstats post {}'.format(
-                        t1.item(), t1_.item(), fooled_t5.item(), loss_stat.item(), fooled_stats_loss.item()))
+                                                        pre_bn=args.stats_targets!='post_bn')#,record=r)
+
+                    t1, t5 = accuracy(out.detach(), labels.detach(), (1, topk))
+                    t1_, t5_ = accuracy(fooled_out.detach(), labels.detach(), (1, topk))
+                    if adv_targets:
+                        fooled_t1, fooled_t5 = accuracy(fooled_out.detach(), adv_targets.detach(), (1, topk))
+
+                    print('top1 before {}\ttop1 after {}\t||\tstats pre {}\tstats post {}'.format(
+                        t1.item(), t1_.item(), loss_stat.item(), fooled_stats_loss.item()))
+                    if adv_targets:
+                        print('top1 fooled {}\t top5 fooled {}'.format(fooled_t1.item(),fooled_t5.item()))
                     model.zero_grad()
                     # keep adversarials measures to report mean adversarial stats loss value and confusion
                     loss_stat = fooled_stats_loss
@@ -1074,7 +1084,7 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
             end = time.time()
             loss_avg.update(loss.item(), args.batch_size)
             loss_stat_avg.update(loss_stat.item())
-            t1, t5 = accuracy(out.detach(), labels.detach(), (1, 5))
+            t1, t5 = accuracy(out.detach(), labels.detach(), (1, topk))
             confusion.update(out.detach(), labels.detach())
             top1.update(t1.item() / 100)
             top5.update(t5.item() / 100)
@@ -1125,17 +1135,22 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
                         f'{generator_time.avg:.2f} global loss {loss_avg.avg:.4f}, statistics loss '
                         f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
                         f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
-
-            if args.target_stats > loss_stat:
-                print('reached stats target')
-                snapshot_path = os.path.join(save_path, f't_stat{args.target_stats:0.2f}')
-                save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_e{step}r{n_replay + 1}',
-                                    (10, 5) if step < 1 else None, f'snapshot_e{step}r{n_replay + 1}')
-                break
+                if args.target_stats > loss_stat:
+                    print('reached stats target')
+                    snapshot_path = os.path.join(save_path, f't_stat{args.target_stats:0.2f}')
+                    save_batched_images(inputs_, labels_, snapshot_path, f'{time_stamp}_e{step}r{n_replay + 1}',
+                                        (10, 5) if step < 1 else None, f'snapshot_e{step}r{n_replay + 1}')
+                    break
 
         print(f'global loss {loss_avg.avg:.4f}, statistics loss '
             f'{loss_stat_avg.avg:.4f}, smoothness {loss_smoothness.avg:.4f}, '
             f'top1 {top1.avg:.2f} top5 {top5.avg:.2f}')
+
+        if args.record > step and args.record - 1 == step:
+            print('Done recording, saving')
+            r.dump_record(name=f'record-{args.measure}.pth')
+            print('Done!')
+            exit(0)
 
         # reset stats
         if step == 0 and log:
@@ -1239,7 +1254,7 @@ def main():
     #last_layer_fetcher = last_layer_fetcher or lambda m: list(m._modules.values())[-1]
     exp_start_time_stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    args.nclasses = meta.nclasses
+    args.nclasses = args.nclasses if args.nclasses>-1 else meta.nclasses
     inp_shape = meta.shape
     mean = th.tensor(meta.mean, requires_grad=False).reshape((1, 3, 1, 1)).to(device)
     std = th.tensor(meta.std, requires_grad=False).reshape((1, 3, 1, 1)).to(device)
@@ -1364,8 +1379,10 @@ def main():
 
         #data loader MUST SHUFFLE the data for bnstat-measurement!
         th.random.manual_seed(args.measure_seed)
+        transform = get_transform(args.measure, augment=False,input_size=inp_shape[1:]) or \
+                    get_transform(args.dataset, augment=False,input_size=inp_shape[1:])
         ds=get_dataset(args.measure, args.split,
-                       get_transform(args.measure, augment=False,input_size=inp_shape[1:]),
+                       transform,
                        limit=args.measure_ds_limit)
 
         print('MEASURE ds:',ds)
