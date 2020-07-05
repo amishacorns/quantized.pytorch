@@ -42,7 +42,7 @@ _IMAGINE_CONFIGS=[
 
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
-                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None,class_ids=None):
+                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None,class_ids=None,per_class_limit=True):
     train = (split == 'train')
     if '+' in name:
         ds=None
@@ -59,6 +59,18 @@ def get_dataset(name, split='train', transform=None,
             ds_dir_name = name[:-4]
         else:
             raise NotImplementedError
+    if name.endswith('-dogs') or name.endswith('-cats'):
+        if name.startswith('imagenet-'):
+            if name.endswith('dogs'):
+                _ids = _imagenet_dogs.keys()
+            else:
+                _ids = _imagenet_cats.keys()
+        else:
+            _ids = [1] if name.endswith('dogs') else [0]
+
+        return get_dataset(name[:-5], split, transform, target_transform, download, limit=limit,
+                       shuffle_before_limit=True, datasets_path=__DATASETS_DEFAULT_PATH,
+                       class_ids=_ids,per_class_limit=False,limit_shuffle_seed=0)
     elif name.startswith('imagine-'):
         if train:
             ds_dir_name=None
@@ -117,7 +129,7 @@ def get_dataset(name, split='train', transform=None,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
-    elif name in ['imagenet'] or any(i in name for i in ['imagine-', '-raw']):
+    elif name in ['imagenet', 'cats_vs_dogs'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
             root = os.path.join(root, 'train')
         else:
@@ -125,11 +137,11 @@ def get_dataset(name, split='train', transform=None,
         ds= datasets.ImageFolder(root=root,
                                     transform=transform,
                                     target_transform=target_transform)
-        if limit:
+        if limit or class_ids:
             if 'no_dd' in name:
                 ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
             else:
-                ds=balance_image_folder_ds(ds, limit,True,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
+                ds=balance_image_folder_ds(ds, limit,per_class=per_class_limit,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
         return ds
     elif name.startswith('random-'):
         ds_name = name[7:]
@@ -147,14 +159,16 @@ def get_dataset(name, split='train', transform=None,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
 
 
-def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed=None,class_ids=None):
+def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False,seed=None,class_ids=None):
     assert isinstance(dataset,datasets.DatasetFolder)
 
     if shuffle:
         import random
         random.seed(seed)
-        print(f'shufflling with seed{seed}')
+        print(f'shufflling with seed {seed}')
     samps = []
+
+    n_samples = n_samples or len(dataset)
     if per_class or class_ids is not None:
         samp_reg_per_class={}
         for s in dataset.samples:
@@ -167,10 +181,13 @@ def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed
                 samp_reg_per_class[s[1]]=[s]
 
         for k in samp_reg_per_class.keys():
-            if shuffle:
+            if shuffle and per_class:
                 samps += random.sample(samp_reg_per_class[k],n_samples)
             else:
                 samps += samp_reg_per_class[k]
+
+        if not per_class and shuffle and len(samps)>n_samples:
+            samps = random.sample(samps, n_samples)
     else:
         if shuffle:
             samps = random.sample(dataset.samples,n_samples)
@@ -181,3 +198,130 @@ def balance_image_folder_ds(dataset, n_samples,per_class=True,shuffle=False,seed
         dataset.imgs = samps
     dataset.samples = samps
     return dataset
+
+_imagenet_dogs = {
+ 151: 'Chihuahua',
+ 152: 'Japanese spaniel',
+ 153: 'Maltese dog, Maltese terrier, Maltese',
+ 154: 'Pekinese, Pekingese, Peke',
+ 155: 'Shih-Tzu',
+ 156: 'Blenheim spaniel',
+ 157: 'papillon',
+ 158: 'toy terrier',
+ 159: 'Rhodesian ridgeback',
+ 160: 'Afghan hound, Afghan',
+ 161: 'basset, basset hound',
+ 162: 'beagle',
+ 163: 'bloodhound, sleuthhound',
+ 164: 'bluetick',
+ 165: 'black-and-tan coonhound',
+ 166: 'Walker hound, Walker foxhound',
+ 167: 'English foxhound',
+ 168: 'redbone',
+ 169: 'borzoi, Russian wolfhound',
+ 170: 'Irish wolfhound',
+ 171: 'Italian greyhound',
+ 172: 'whippet',
+ 173: 'Ibizan hound, Ibizan Podenco',
+ 174: 'Norwegian elkhound, elkhound',
+ 175: 'otterhound, otter hound',
+ 176: 'Saluki, gazelle hound',
+ 177: 'Scottish deerhound, deerhound',
+ 178: 'Weimaraner',
+ 179: 'Staffordshire bullterrier, Staffordshire bull terrier',
+ 180: 'American Staffordshire terrier, Staffordshire terrier, American pit bull terrier, pit bull terrier',
+ 181: 'Bedlington terrier',
+ 182: 'Border terrier',
+ 183: 'Kerry blue terrier',
+ 184: 'Irish terrier',
+ 185: 'Norfolk terrier',
+ 186: 'Norwich terrier',
+ 187: 'Yorkshire terrier',
+ 188: 'wire-haired fox terrier',
+ 189: 'Lakeland terrier',
+ 190: 'Sealyham terrier, Sealyham',
+ 191: 'Airedale, Airedale terrier',
+ 192: 'cairn, cairn terrier',
+ 193: 'Australian terrier',
+ 194: 'Dandie Dinmont, Dandie Dinmont terrier',
+ 195: 'Boston bull, Boston terrier',
+ 196: 'miniature schnauzer',
+ 197: 'giant schnauzer',
+ 198: 'standard schnauzer',
+ 199: 'Scotch terrier, Scottish terrier, Scottie',
+ 200: 'Tibetan terrier, chrysanthemum dog',
+ 201: 'silky terrier, Sydney silky',
+ 202: 'soft-coated wheaten terrier',
+ 203: 'West Highland white terrier',
+ 204: 'Lhasa, Lhasa apso',
+ 205: 'flat-coated retriever',
+ 206: 'curly-coated retriever',
+ 207: 'golden retriever',
+ 208: 'Labrador retriever',
+ 209: 'Chesapeake Bay retriever',
+ 210: 'German short-haired pointer',
+ 211: 'vizsla, Hungarian pointer',
+ 212: 'English setter',
+ 213: 'Irish setter, red setter',
+ 214: 'Gordon setter',
+ 215: 'Brittany spaniel',
+ 216: 'clumber, clumber spaniel',
+ 217: 'English springer, English springer spaniel',
+ 218: 'Welsh springer spaniel',
+ 219: 'cocker spaniel, English cocker spaniel, cocker',
+ 220: 'Sussex spaniel',
+ 221: 'Irish water spaniel',
+ 222: 'kuvasz',
+ 223: 'schipperke',
+ 224: 'groenendael',
+ 225: 'malinois',
+ 226: 'briard',
+ 227: 'kelpie',
+ 228: 'komondor',
+ 229: 'Old English sheepdog, bobtail',
+ 230: 'Shetland sheepdog, Shetland sheep dog, Shetland',
+ 231: 'collie',
+ 232: 'Border collie',
+ 233: 'Bouvier des Flandres, Bouviers des Flandres',
+ 234: 'Rottweiler',
+ 235: 'German shepherd, German shepherd dog, German police dog, alsatian',
+ 236: 'Doberman, Doberman pinscher',
+ 237: 'miniature pinscher',
+ 238: 'Greater Swiss Mountain dog',
+ 239: 'Bernese mountain dog',
+ 240: 'Appenzeller',
+ 241: 'EntleBucher',
+ 242: 'boxer',
+ 243: 'bull mastiff',
+ 244: 'Tibetan mastiff',
+ 245: 'French bulldog',
+ 246: 'Great Dane',
+ 247: 'Saint Bernard, St Bernard',
+ 248: 'Eskimo dog, husky',
+ 249: 'malamute, malemute, Alaskan malamute',
+ 250: 'Siberian husky',
+ 251: 'dalmatian, coach dog, carriage dog',
+ 252: 'affenpinscher, monkey pinscher, monkey dog',
+ 253: 'basenji',
+ 254: 'pug, pug-dog',
+ 255: 'Leonberg',
+ 256: 'Newfoundland, Newfoundland dog',
+ 257: 'Great Pyrenees',
+ 258: 'Samoyed, Samoyede',
+ 259: 'Pomeranian',
+ 260: 'chow, chow chow',
+ 261: 'keeshond',
+ 262: 'Brabancon griffon',
+ 263: 'Pembroke, Pembroke Welsh corgi',
+ 264: 'Cardigan, Cardigan Welsh corgi',
+ 265: 'toy poodle',
+ 266: 'miniature poodle',
+ 267: 'standard poodle',
+ 268: 'Mexican hairless'}
+
+_imagenet_cats = {
+ 281: 'tabby, tabby cat',
+ 282: 'tiger cat',
+ 283: 'Persian cat',
+ 284: 'Siamese cat, Siamese',
+ 285: 'Egyptian cat'}
