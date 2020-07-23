@@ -905,7 +905,8 @@ def forward(model, data_loader, inp_shape, args, device, batch_augment = None, n
     end = time.time()
     if args.record > 0:
         from utils.misc import Recorder
-        r = Recorder(model, recording_mode=['inputs'],recursive=True,include_matcher_fn=lambda n,m: isinstance(m,th.nn.BatchNorm2d))
+        r = Recorder(model, recording_mode=['inputs'],recursive=True,
+                     include_matcher_fn=lambda n,m: isinstance(m,th.nn.BatchNorm2d) or isinstance(m,th.nn.Linear))
     for step, (inputs_, labels_) in enumerate(data_loader):
         labels_ = labels_.to(device)
         inputs_ = inputs_.to(device)
