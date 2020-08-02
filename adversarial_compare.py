@@ -6,11 +6,13 @@ from data import get_dataset
 from preprocess import get_transform
 import os
 import tqdm
+import logging
+from utils.log import setup_logging
 from utils.absorb_bn import get_bn_params
 from dataclasses import dataclass
 import inspect
-
-
+from utils.misc import Recorder
+from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 @dataclass
 class Settings:
     def __repr__(self):
@@ -18,14 +20,14 @@ class Settings:
                                                    if type(attr) == str and not attr.startswith('__')})
 
     def __init__(self,
-                 layer_names: list,
+                 plot_layer_names: list,
                  model_cfg: dict,
                  measure_stats: bool = True,
                  recompute: bool = True,
-                 augment: bool = False,
+                 augment: bool = True,
                  device: str = 'cuda',
                  dataset: str = f'cats_vs_dogs',
-                 super_category: str = '', # 'cats'  # dogs
+                 super_category: str = 'dogs', # 'cats'  # dogs
                  ckt_path: str = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
                  collector_device : str = 'cpu'):
 
@@ -37,11 +39,11 @@ class Settings:
 
 args = Settings(
     recompute=False,
-    augment=False,
-    device='cuda:2',
-    collector_device='cuda:3',
-    super_category='dogs',
-    layer_names=['layer1.0.bn1', 'layer2.0.downsample.1', 'layer2.1.bn2',
+    augment=True,
+    device='cuda:3',
+    collector_device='cpu',
+    super_category='',
+    plot_layer_names=['layer1.0.bn1', 'layer2.0.downsample.1', 'layer2.1.bn2',
                              'layer4.0.downsample.1','layer4.1.bn2'],
     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2})
 
@@ -160,7 +162,7 @@ def calc_stats_loss(ref_stat_dict=None, stat_dict=None, running_dict=None, raw_a
 
     return loss_stat
 
-
+# todo broken for now
 def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ratio=True, mode='sym',
          rank_by_stats_loss=False):
     if rank_by_stats_loss:
@@ -196,73 +198,192 @@ def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ra
     # fig.waitforbuttonpress()
     pass
 
+def gen_simes_reducer_fn(ref_stats_dict):
+    def _batch_calc_simes(trace_name, m, inputs):
+        class_specific_stats = []
+        for class_stat_dict in ref_stats_dict:
+            reduction_specific_record = []
+            for reduction_name, reduction_stat in class_stat_dict[trace_name].items():
+                pval_per_input = {}
+                for e, per_input_stat in enumerate(reduction_stat):
+                    reduced = per_input_stat.reduction_fn(inputs[e])
+                    pval = per_input_stat.pval_matcher(reduced)
+                    ## for now just reduce channles using simes
+                    pval_per_input.append(calc_simes(pval))
+                reduction_specific_record[reduction_name] = pval_per_input
+            class_specific_stats.append(reduction_specific_record)
+        return class_specific_stats
+    return _batch_calc_simes
 
-def measure_data_statistics(loader, model, epochs=10, model_device='cuda:2', collector_device='cuda:3', stats_dict={},
-                            collect_pecentiles=th.tensor([0, 0.005,0.001, 0.025, 0.05, 0.5, 0.995, 0.975, 0.999, 0.995, 1]), num_edge_samples=5):
-    from utils.misc import Recorder
-    from utils.meters import MeterDict,OnlineMeter
-    ## this tracks simplified statistics
-    tracker = MeterDict(meter_factory=lambda k,v: OnlineMeter(batched=True))
+class OODDetector():
+    def __init__(self, model, num_classes,reducer_fn):
+        self.num_classes = num_classes
+        self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
+                                       include_matcher_fn=lambda n, m: isinstance(m,th.nn.BatchNorm2d) or
+                                                                       isinstance(m, th.nn.Linear),
+                                       input_fn=reducer_fn,
+                                       recursive=True, device_modifier='same')
 
-    @dataclass()
-    class measure_cfg():
-        compute_cov_on_partial_stats :bool = False
-        update_tracker :bool = True
+    # helper function to convert per class per reduction to per reduction per class dictionary
+    def _gen_output_dict(self,per_class_per_reduction_record):
+        # prepare a dict with pvalues per reduction per sample per class i.e. {reduction_name : (BxC)}
+        reduction_stats_collection = {}
+        for class_stats in per_class_per_reduction_record:
+            for reduction_name, pval in class_stats.items():
+                if reduction_name in reduction_stats_collection:
+                    reduction_stats_collection[reduction_name] = th.cat([reduction_stats_collection[reduction_name],
+                                                                         pval])
+                else:
+                    reduction_stats_collection[reduction_name] = pval
 
-    measure_settings = measure_cfg()
+        self.reductions = list(reduction_stats_collection.keys())
+        return reduction_stats_collection
+
+    # this function should return pvalues in the format of (Batch x num_classes)
+    def get_fisher(self):
+        per_class_record = []
+        # reduce all layers (e.g. fisher)
+        for class_id in range(self.num_classes):
+            sum_pval_per_reduction = {}
+            for layer_pvalues_per_class in self.stats_recorder.values():
+                for reduction_dict in layer_pvalues_per_class[class_id]:
+                    for reduction_name,pval_per_input in reduction_dict.items():
+                        if reduction_name in sum_pval_per_reduction:
+                            sum_pval_per_reduction[reduction_name] += pval_per_input
+                        else:
+                            sum_pval_per_reduction[reduction_name] = pval_per_input
+
+            # update fisher pvalue per reduction
+            fisher_pvals_per_reduction = {}
+            for reduction_name, sum_pval in sum_pval_per_reduction.items():
+                fisher_pvals_per_reduction[reduction_name] = 2*th.log(sum_pval)
+
+            per_class_record.append(fisher_pvals_per_reduction)
+
+        self.stats_recorder.clear()
+        return self._gen_output_dict(per_class_record)
+
+class PvalueMatcher():
+    def __init__(self,percentiles,quantiles):
+        self.percentiles = percentiles
+        self.quantiles = quantiles
+
+    ## todo document!
+    def __call__(self, x):
+        len_q = self.quantiles.shape[0]
+        stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], len_q)
+        quant_layer = self.quantiles.t().unsqueeze(0).expand(stat_layer.shape[0], stat_layer.shape[1], len_q)
+
+        ### find p-values based on quantiles
+        temp_location = th.sum(stat_layer < quant_layer, 2)
+        upper_quant_ind = temp_location >= (len_q / 2) + 1
+        temp_location[upper_quant_ind] += -1
+        pval = self.percentiles[temp_location]
+        pval[upper_quant_ind] = 1 - pval[upper_quant_ind]
+        return pval
+
+# clac Simes per batch element (samples x variables)
+def calc_simes(pval):
+    pval, _ = th.sort(pval, 1)
+    rank = th.arange(1, pval.shape[1] + 1).repeat(pval.shape[0], 1)
+    simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
+    return simes_pval
+
+def spatial_mean(x):
+    return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
+
+def spatial_max(x):
+    return x.view(x.shape[0], x.shape[1], -1).max(-1)[0] if x.dim() > 2 else x
+
+def spatial_min(x):
+    return x.view(x.shape[0], x.shape[1], -1).min(-1)[0] if x.dim() > 2 else x
+
+## auxilary data containers
+@dataclass()
+class BatchStatsCollectorRet():
+    def __init__(self, reduction_name: str,
+                 reduction_fn = lambda x: x,
+                 cov: th.Tensor = None,
+                 num_observations: int = 0,
+                 simes_pval: th.Tensor = None,
+                 meter :AverageMeter = None,
+                 pval_matcher : PvalueMatcher = None):
+        self.reduction_name = reduction_name
+        self.cov = cov
+        self.num_observations = num_observations
+        self.simes_pval = simes_pval
+        self.meter = meter
+        self.reduction_fn = reduction_fn
+        self.pval_matcher = pval_matcher
+
+@dataclass()
+class BatchStatsCollectorCfg():
+    track_cov: bool = False
+    update_tracker: bool = True
+    find_simes: bool = False
     reduction_dictionary = {
-        'spatial-mean': lambda x: x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x,
-        'spatial-max': lambda x: x.view(x.shape[0],x.shape[1],-1).max(-1)[0] if x.dim() > 2 else x,
-        'spatial-min': lambda x: x.view(x.shape[0],x.shape[1],-1).min(-1)[0] if x.dim() > 2 else x,
+        'spatial-mean': spatial_mean,
+        'spatial-max': spatial_max,
+        'spatial-min': spatial_min,
     }
+    target_percentiles = [0.001, 0.005, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.5,
+               0.75, 0.8, 0.85, 0.9, 0.95, 0.975, 0.995, 0.999]
+    num_edge_samples: int = 70
+
+    def __init__(self,batch_size):
+        # adjust percentiles to the specified batch size
+        if self.target_percentiles:
+            self.target_percentiles = th.tensor(self.target_percentiles).clamp_(1/batch_size,1-1/batch_size).unique()
+
+def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', collector_device='cpu',
+                            compute_cov_on_partial_stats=False, batch_size=1000,
+                            measure_settings : BatchStatsCollectorCfg = None):
+
+    measure_settings = measure_settings or BatchStatsCollectorCfg(batch_size)
+
+    ## bypass the simple recorder dictionary with a meter dictionary to track statistics
+    tracker = MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True, track_percentiles=True,
+                                                               target_percentiles=measure_settings.target_percentiles,
+                                                               per_channel=True,number_edge_samples=measure_settings.num_edge_samples,
+                                                               track_cov=not compute_cov_on_partial_stats))
 
     # function collects statistics of a batched tensors, return the collected statistics per input tensor
     def _batch_stats_collector(trace_name, m, inputs):
         stats_per_input = []
         for e, i in enumerate(inputs):
-            reduction_specific_record=[]
-            for reduction_name, reduction_fn in reduction_dictionary.items():
-                tracker_name_pattern = f'{trace_name}_{reduction_name}_@@:{e}'
-                tracker_mean_name = tracker_name_pattern.replace("@@","mean")
-                tracker_cent_name = tracker_name_pattern.replace("@@","cent")
+            reduction_specific_record = []
+            for reduction_name, reduction_fn in measure_settings.reduction_dictionary.items():
+                tracker_name = f'{trace_name}_{reduction_name}:{e}'
                 ## make sure input is a 2d tensor [batch, nchannels]
                 i_ = reduction_fn(i)
                 if collector_device != model_device:
                     i_ = i_.to(collector_device)
-                ## find tensor percentile per channel
+
                 num_observations, channels = i_.shape
+                reduction_ret_obj = BatchStatsCollectorRet(reduction_name,reduction_fn,num_observations=num_observations)
 
-                # sort tensor and slice percentiles from the sorted tensor per channel
-                sorted = i_.sort(0)[0]
+                # we dont always want to update the tracker, particularly when we call the method again to collect
+                # statistics that depends on previous values that are computed on the entire measure dataset
                 if measure_settings.update_tracker:
-                    # compute ids for each percentile
-                    percentile_ids = th.repeat_interleave(
-                        th.round(collect_pecentiles * (num_observations - 1)).long()[:, None], channels, 1)
-                    percentile_values = sorted.gather(0, percentile_ids.to(i_.device))
-                    tracker.update({tracker_cent_name: percentile_values.unsqueeze(0), tracker_mean_name: i_})
+                    # tracker keeps track statistics such as number of samples seen, mean, var, percentiles and potentially
+                    # running mean covariance
+                    tracker.update({tracker_name: i_})
+                # save a reference to the meter for convenience
+                reduction_ret_obj.meter = tracker[tracker_name]
+                reduction_ret_obj.pval_matcher = PvalueMatcher(*reduction_ret_obj.meter.get_distribution_histogram())
 
-                if not (measure_settings.compute_cov_on_partial_stats or tracker_mean_name in stats_dict):
-                    continue
+                if measure_settings.find_simes:
+                    pval = reduction_ret_obj.pval_matcher(i_)
+                    reduction_ret_obj.simes_pval = calc_simes(pval)
 
-                # calculate covariance
-                if tracker_mean_name in stats_dict:
-                    # provided reference dictionary we can use a more accurate measure for the per-channel mean
-                    # (typically we will first calculate the global mean then use it to get a better covariance estimator)
-                    _i_mean = stats_dict[tracker_mean_name]
-                else:
-                    # use tracked mean from previous steps
-                    _i_mean = tracker[tracker_mean_name]
+                # calculate covariance, can be used to compute covariance with global mean instead of running mean
+                if measure_settings.track_cov:
+                    _i_mean = reduction_ret_obj.meter.mean
+                    _i_centered = i_ - _i_mean
+                    reduction_ret_obj.cov = _i_centered.transpose(1, 0).matmul(_i_centered) / (num_observations)
 
-                if isinstance(_i_mean, OnlineMeter):
-                    _i_mean = _i_mean.mean
+                reduction_specific_record.append(reduction_ret_obj)
 
-                _i_centered = i_ - _i_mean
-                cov_n = _i_centered.transpose(1, 0).matmul(_i_centered)/(num_observations)
-
-                min_obs = sorted[:num_edge_samples]
-                max_obs = sorted[-num_edge_samples:]
-
-                reduction_specific_record.append([reduction_name,cov_n, num_observations, min_obs, max_obs])
             stats_per_input.append(reduction_specific_record)
 
         return stats_per_input
@@ -271,113 +392,164 @@ def measure_data_statistics(loader, model, epochs=10, model_device='cuda:2', col
     def _batch_stats_reducer(old_record, new_entry):
         stats_per_input = []
         for input_id, reduction_stats_record_n in enumerate(new_entry):
-            reductions_per_input=[]
-            for reduction_id,(reduction_name_n,cov_n, obs_n,min_obs_n, max_obs_n) in enumerate(reduction_stats_record_n):
-                reduction_name,cov, obs,min_obs, max_obs = old_record[input_id][reduction_id]
-                assert reduction_name==reduction_name_n
-                # update worst case observations
-                max_obs = th.cat([max_obs,max_obs_n]).sort(0)[0][-len(max_obs):]
-                min_obs = th.cat([min_obs,min_obs_n]).sort(0)[0][:len(min_obs)]
-                #compute new covariance
-                tot_obs = obs + obs_n
-                scale = obs_n / tot_obs
-                #delta
-                delta = cov_n.sub(cov)
-                #update mean covariance
-                cov.add_(delta.mul_(scale))
-                reductions_per_input.append([reduction_name, cov, tot_obs, min_obs, max_obs])
+            reductions_per_input = []
+            for reduction_id, new_reduction_ret_obj in enumerate(reduction_stats_record_n):
+                reduction_ret_obj = old_record[input_id][reduction_id]
+                assert reduction_ret_obj.reduction_name == new_reduction_ret_obj.reduction_name
+                # compute global mean covariance update
+                if new_reduction_ret_obj.cov is not None:
+                    if reduction_ret_obj.cov is None:
+                        reduction_ret_obj.cov = new_reduction_ret_obj.cov
+                        reduction_ret_obj.num_observations = new_reduction_ret_obj.num_observations
+                    else:
+                        reduction_ret_obj.num_observations += new_reduction_ret_obj.num_observations
+                        scale = new_reduction_ret_obj.num_observations / reduction_ret_obj.num_observations
+                        # delta
+                        delta = new_reduction_ret_obj.cov.sub(reduction_ret_obj.cov)
+                        # update mean covariance
+                        reduction_ret_obj.cov.add_(delta.mul_(scale))
+
+                # Simes aggregated (for now we collect all of the observed values and process them later for simplicity)
+                if new_reduction_ret_obj.simes_pval is not None:
+                    if reduction_ret_obj.simes_pval is None:
+                        reduction_ret_obj.simes_pval=new_reduction_ret_obj.simes_pval
+                    else:
+                        reduction_ret_obj.simes_pval = th.cat([reduction_ret_obj.simes_pval, new_reduction_ret_obj.simes_pval])
+
+                reductions_per_input.append(reduction_ret_obj)
             stats_per_input.append(reductions_per_input)
         return stats_per_input
 
+    #simple loop over measure data to collect statistics
     def _loop_over_data():
         model.eval()
         with th.no_grad():
             for e in range(epochs):
                 print(f'measure statistics - epoch {e}')
-                for d, l in tqdm.tqdm(loader,total=len(loader)):
+                for d, l in tqdm.tqdm(loader, total=len(loader)):
                     _ = model(d.to(model_device))
 
     model.to(model_device)
     r = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
-                 include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m,th.nn.Linear), input_fn=_batch_stats_collector,
-                 activation_reducer_fn=_batch_stats_reducer,recursive=True,device_modifier='same')
+                 include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear),
+                 input_fn=_batch_stats_collector,
+                 activation_reducer_fn=_batch_stats_reducer, recursive=True, device_modifier='same')
+    if compute_cov_on_partial_stats:
+        measure_settings.track_cov = True
 
     _loop_over_data()
-    if not stats_dict:
-        print('calculating covariance using measured mean')
-        r.record.clear()
-        stats_dict.update(tracker)
-        measure_settings.update_tracker=False
-        _loop_over_data()
+    print('calculating covariance and Simes pvalues using measured mean and quantiles')
+    measure_settings.update_tracker = False
+    measure_settings.find_simes = True
+    measure_settings.track_cov = not measure_settings.track_cov
+    _loop_over_data()
+
     ## build reference dictionary
     ret_stat_dict = {}
     for k in r.tracked_modules.keys():
         ret_stat_dict[k] = {}
         for kk, stats_per_input in r.record.items():
             if kk.startswith(k):
-                for inp_id,reduction_records in enumerate(stats_per_input):
+                for inp_id, reduction_records in enumerate(stats_per_input):
                     for reduction_record in reduction_records:
-                        reduction_name = reduction_record[0]
-                        ret_stat_dict[k][reduction_name]={
-                            f'cov:{inp_id}'     : reduction_record[1],
-                            f'count:{inp_id}'   : reduction_record[2],
-                            f'min_obs:{inp_id}' : reduction_record[3],
-                            f'max_obs:{inp_id}' : reduction_record[4]
-                        }
-
-        for kk, v in tracker.items():
-            if kk.startswith(k):
-                reduction_name,stat_name=kk.split('_')[-2:]
-                ret_stat_dict[k][reduction_name][stat_name]= v.mean
-        # ret_stat_dict.update({k[:-len('input_fn')]+f'min_obs:0':v[0][2] for kk,v in r.record.items()})
-        # ret_stat_dict.update({k[:-len('input_fn')]+f'max_obs:0':v[0][3] for k,v in r.record.items()})
-        # ret_stat_dict.update({k:v.mean for k,v in tracker.items()})
+                        assert isinstance(reduction_record,BatchStatsCollectorRet)
+                        if reduction_record.reduction_name in ret_stat_dict[k]:
+                            ret_stat_dict[k][reduction_record.reduction_name] += [reduction_record]
+                        else:
+                            ret_stat_dict[k][reduction_record.reduction_name] = [reduction_record]
+    r.record.clear()
+    r.remove_model_hooks()
     return ret_stat_dict
 
+
+def evaluate_data(loader,model, ref_stat_dict,model_device, alpha = 0.05):
+    model.eval()
+    model.to(model_device)
+    detector = OODDetector(model,train_loader.dataset.classes,gen_simes_reducer_fn(ref_stat_dict))
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    rejected = {'spatial-mean':AverageMeter(),
+                'spatial-max':AverageMeter(),
+                'spatial-min':AverageMeter()}
+    with th.no_grad():
+        for d, l in tqdm.tqdm(loader, total=len(loader)):
+            out = model(d.to(model_device))
+            prec1, prec5 = accuracy(out, l, topk=(1, 5))
+            top1.update(prec1.item(), d.size(0))
+            top5.update(prec5.item(), d.size(0))
+            pvalues_dict = detector.get_fisher()
+            for reduction_name,pvalues in pvalues_dict.items():
+                #aggragate pvalues or return per reduction score
+                # todo:
+                #  1. split rejection statistics between correct and incorrect model predictions
+                #  2. check rejection rate according to all class statistics (i.e. reject only if pval is unlikely
+                #  under all class reference)
+                #  3. compute accuracy according to maximum likelihood class from 2.
+
+                predicted_class_pval = pvalues[th.where(out.max(1,keepdims=True)[1])]
+                rejected[reduction_name].update((predicted_class_pval < alpha).mean(),out.shape[0])
+        for reduction_name, rejected_p in rejected.items():
+            logging.info(f'{reduction_name} rejected: {rejected_p}')
+        logging.info(f'Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
+                     f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
+    return
+setup_logging()
 model = models.resnet(**(args.model_cfg))
-model.load_state_dict(th.load(args.ckt_path)['state_dict'])
+model.load_state_dict(th.load(args.ckt_path, map_location='cpu')['state_dict'])
 
 if args.augment:
     epochs = 5
 else:
     epochs = 1
 
-if args.measure_stats:
-    calibrated_path = f'record-measured_stats-{args.super_category}.pth'
-    if not args.recompute and os.path.exists(calibrated_path):
-        ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
-    else:
-        ds = get_dataset(args.dataset, 'train',
-                           get_transform('imagenet', augment=args.augment),limit=None)
-        sampler = None #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+calibrated_path = f'measured_stats_per_class-{args.dataset}.pth'
+if not args.recompute and os.path.exists(calibrated_path):
+    all_class_ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
+else:
+    ds = get_dataset(args.dataset, 'train',
+                       get_transform('imagenet', augment=args.augment),limit=None)
+    all_class_ref_stats=[]
+    targets = th.tensor(ds.targets)
+    for class_id,class_name in enumerate(ds.classes):
+        print(f'collecting stats for class {class_name}')
+        sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
         train_loader = th.utils.data.DataLoader(
                 ds, sampler=sampler,
-                batch_size=1000, shuffle=True, #(sampler is None),
+                batch_size=1000, shuffle=True if sampler is None else False,
                 num_workers=8, pin_memory=False, drop_last=True)
-        # calibrate_bn to get single class statistics per layer
-        ref_stats = measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
-                                            collector_device=args.collector_device)
-        print('saving reference stats dict')
-        th.save(ref_stats, calibrated_path)
-else:
-    ref_stats = get_bn_params(model)
-record = th.load(f'record-{args.dataset}.pth')
-# ref_stats.keys()
-adv_tag = 'FGSM_0.1'
 
+        all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
+                                            collector_device=args.collector_device, batch_size=1000))
+    print('saving reference stats dict')
+    th.save(all_class_ref_stats, calibrated_path)
+
+val_ds = get_dataset(args.dataset, 'val',get_transform('imagenet', augment=args.augment),limit=None)
+targets = th.tensor(val_ds.targets)
+# todo replace all targets to in or out of distribution?
+# todo add adversarial samples test
+# for in-dist data evaluate per class to simplify post analysis
+for class_id,class_name in enumerate(ds.classes):
+    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+    val_loader = th.utils.data.DataLoader(
+            ds, sampler=sampler,
+            batch_size=1000, shuffle=True if sampler is None else False,
+            num_workers=8, pin_memory=False, drop_last=True)
+
+    evaluate_data(val_loader, model, all_class_ref_stats,args.device)
+pass
+
+# record = th.load(f'record-{args.dataset}.pth')
+# adv_tag = 'FGSM_0.1'
 # layer_inputs = recorded[layer_name]
 # layer_inputs_fgsm = recorded[f'{layer_name}-@{adv_tag}']
-
-def _maybe_slice(tensor, nsamples=-1):
-    if nsamples > 0:
-        return tensor[0:nsamples]
-    return tensor
-
-
-for layer_name in args.layer_names:
-    clean_act = _maybe_slice(record[layer_name + '_forward_input:0'])
-    fgsm_act = _maybe_slice(record[layer_name + f'_forward_input:0-@{adv_tag}'])
-
-    plot(clean_act, fgsm_act, layer_name, reference_stats=ref_stats, rank_by_stats_loss=True, max_ratio=False)
-
-plt.waitforbuttonpress()
+# def _maybe_slice(tensor, nsamples=-1):
+#     if nsamples > 0:
+#         return tensor[0:nsamples]
+#     return tensor
+#
+# for layer_name in args.plot_layer_names:
+#     clean_act = _maybe_slice(record[layer_name + '_forward_input:0'])
+#     fgsm_act = _maybe_slice(record[layer_name + f'_forward_input:0-@{adv_tag}'])
+#
+#     plot(clean_act, fgsm_act, layer_name, reference_stats=ref_stats, rank_by_stats_loss=True, max_ratio=False)
+# plt.waitforbuttonpress()
