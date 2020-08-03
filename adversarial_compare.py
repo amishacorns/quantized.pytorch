@@ -202,9 +202,9 @@ def gen_simes_reducer_fn(ref_stats_dict):
     def _batch_calc_simes(trace_name, m, inputs):
         class_specific_stats = []
         for class_stat_dict in ref_stats_dict:
-            reduction_specific_record = []
-            for reduction_name, reduction_stat in class_stat_dict[trace_name].items():
-                pval_per_input = {}
+            reduction_specific_record = {}
+            for reduction_name, reduction_stat in class_stat_dict[trace_name[:-8]].items():
+                pval_per_input = []
                 for e, per_input_stat in enumerate(reduction_stat):
                     reduced = per_input_stat.reduction_fn(inputs[e])
                     pval = per_input_stat.pval_matcher(reduced)
@@ -215,53 +215,6 @@ def gen_simes_reducer_fn(ref_stats_dict):
         return class_specific_stats
     return _batch_calc_simes
 
-class OODDetector():
-    def __init__(self, model, num_classes,reducer_fn):
-        self.num_classes = num_classes
-        self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
-                                       include_matcher_fn=lambda n, m: isinstance(m,th.nn.BatchNorm2d) or
-                                                                       isinstance(m, th.nn.Linear),
-                                       input_fn=reducer_fn,
-                                       recursive=True, device_modifier='same')
-
-    # helper function to convert per class per reduction to per reduction per class dictionary
-    def _gen_output_dict(self,per_class_per_reduction_record):
-        # prepare a dict with pvalues per reduction per sample per class i.e. {reduction_name : (BxC)}
-        reduction_stats_collection = {}
-        for class_stats in per_class_per_reduction_record:
-            for reduction_name, pval in class_stats.items():
-                if reduction_name in reduction_stats_collection:
-                    reduction_stats_collection[reduction_name] = th.cat([reduction_stats_collection[reduction_name],
-                                                                         pval])
-                else:
-                    reduction_stats_collection[reduction_name] = pval
-
-        self.reductions = list(reduction_stats_collection.keys())
-        return reduction_stats_collection
-
-    # this function should return pvalues in the format of (Batch x num_classes)
-    def get_fisher(self):
-        per_class_record = []
-        # reduce all layers (e.g. fisher)
-        for class_id in range(self.num_classes):
-            sum_pval_per_reduction = {}
-            for layer_pvalues_per_class in self.stats_recorder.values():
-                for reduction_dict in layer_pvalues_per_class[class_id]:
-                    for reduction_name,pval_per_input in reduction_dict.items():
-                        if reduction_name in sum_pval_per_reduction:
-                            sum_pval_per_reduction[reduction_name] += pval_per_input
-                        else:
-                            sum_pval_per_reduction[reduction_name] = pval_per_input
-
-            # update fisher pvalue per reduction
-            fisher_pvals_per_reduction = {}
-            for reduction_name, sum_pval in sum_pval_per_reduction.items():
-                fisher_pvals_per_reduction[reduction_name] = 2*th.log(sum_pval)
-
-            per_class_record.append(fisher_pvals_per_reduction)
-
-        self.stats_recorder.clear()
-        return self._gen_output_dict(per_class_record)
 
 class PvalueMatcher():
     def __init__(self,percentiles,quantiles):
@@ -272,7 +225,7 @@ class PvalueMatcher():
     def __call__(self, x):
         len_q = self.quantiles.shape[0]
         stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], len_q)
-        quant_layer = self.quantiles.t().unsqueeze(0).expand(stat_layer.shape[0], stat_layer.shape[1], len_q)
+        quant_layer = self.quantiles.t().unsqueeze(0).expand(stat_layer.shape[0], stat_layer.shape[1], len_q).to(x.device)
 
         ### find p-values based on quantiles
         temp_location = th.sum(stat_layer < quant_layer, 2)
@@ -282,12 +235,61 @@ class PvalueMatcher():
         pval[upper_quant_ind] = 1 - pval[upper_quant_ind]
         return pval
 
+class OODDetector():
+    def __init__(self, model, num_classes,channle_reducer_fn, output_pval_matcher):
+        self.output_pval_matcher = output_pval_matcher
+        self.num_classes = num_classes
+        self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
+                                       include_matcher_fn=lambda n, m: isinstance(m,th.nn.BatchNorm2d) or
+                                                                       isinstance(m, th.nn.Linear),
+                                       input_fn=channle_reducer_fn,
+                                       recursive=True, device_modifier='same')
+
+    # helper function to convert per class per reduction to per reduction per class dictionary
+    def _gen_output_dict(self,per_class_per_reduction_record):
+        # prepare a dict with pvalues per reduction per sample per class i.e. {reduction_name : (BxC)}
+        reduction_stats_collection = {}
+        for class_stats in per_class_per_reduction_record:
+            for reduction_name, pval in class_stats.items():
+                if reduction_name in reduction_stats_collection:
+                    reduction_stats_collection[reduction_name] = th.cat([reduction_stats_collection[reduction_name],
+                                                                         pval.unsqueeze(1)],1)
+                else:
+                    reduction_stats_collection[reduction_name] = pval.unsqueeze(1)
+
+        return reduction_stats_collection
+
+    # this function should return pvalues in the format of (Batch x num_classes)
+    def get_fisher(self):
+        per_class_record = []
+        # reduce all layers (e.g. fisher)
+        for class_id in range(self.num_classes):
+            sum_pval_per_reduction = {}
+            # iterate over recorder to aggragate per layer statistics for the new batch
+            for layer_pvalues_per_class in self.stats_recorder.record.values():
+                for reduction_name,pval_per_input in layer_pvalues_per_class[class_id].items():
+                    for pval in pval_per_input:
+                        if reduction_name in sum_pval_per_reduction:
+                            sum_pval_per_reduction[reduction_name] += pval
+                        else:
+                            sum_pval_per_reduction[reduction_name] = pval
+
+            # update fisher pvalue per reduction
+            fisher_pvals_per_reduction = {}
+            for reduction_name, sum_pval in sum_pval_per_reduction.items():
+                fisher_pvals_per_reduction[reduction_name] = self.output_pval_matcher[class_id][reduction_name](2*th.log(sum_pval))
+
+            per_class_record.append(fisher_pvals_per_reduction)
+
+        self.stats_recorder.record.clear()
+        return self._gen_output_dict(per_class_record)
+
 # clac Simes per batch element (samples x variables)
 def calc_simes(pval):
     pval, _ = th.sort(pval, 1)
     rank = th.arange(1, pval.shape[1] + 1).repeat(pval.shape[0], 1)
     simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
-    return simes_pval
+    return simes_pval.unsqueeze(1)
 
 def spatial_mean(x):
     return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
@@ -462,10 +464,10 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', coll
     return ret_stat_dict
 
 
-def evaluate_data(loader,model, ref_stat_dict,model_device, alpha = 0.05):
+def evaluate_data(loader,model, ref_stat_dict,model_device, output_pval_matcher,alpha = 0.001):
     model.eval()
     model.to(model_device)
-    detector = OODDetector(model,train_loader.dataset.classes,gen_simes_reducer_fn(ref_stat_dict))
+    detector = OODDetector(model,len(loader.dataset.classes),gen_simes_reducer_fn(ref_stat_dict),output_pval_matcher)
     top1 = AverageMeter()
     top5 = AverageMeter()
     rejected = {'spatial-mean':AverageMeter(),
@@ -474,9 +476,9 @@ def evaluate_data(loader,model, ref_stat_dict,model_device, alpha = 0.05):
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
             out = model(d.to(model_device))
-            prec1, prec5 = accuracy(out, l, topk=(1, 5))
-            top1.update(prec1.item(), d.size(0))
-            top5.update(prec5.item(), d.size(0))
+            #prec1, prec5 = accuracy(out, l, topk=(1, 5))
+            #top1.update(prec1.item(), d.size(0))
+            #top5.update(prec5.item(), d.size(0))
             pvalues_dict = detector.get_fisher()
             for reduction_name,pvalues in pvalues_dict.items():
                 #aggragate pvalues or return per reduction score
@@ -486,10 +488,10 @@ def evaluate_data(loader,model, ref_stat_dict,model_device, alpha = 0.05):
                 #  under all class reference)
                 #  3. compute accuracy according to maximum likelihood class from 2.
 
-                predicted_class_pval = pvalues[th.where(out.max(1,keepdims=True)[1])]
-                rejected[reduction_name].update((predicted_class_pval < alpha).mean(),out.shape[0])
+                predicted_class_pval = pvalues[th.where(out.max(1,keepdims=True)[0] == out)]
+                rejected[reduction_name].update((predicted_class_pval < alpha).float().mean(),out.shape[0])
         for reduction_name, rejected_p in rejected.items():
-            logging.info(f'{reduction_name} rejected: {rejected_p}')
+            logging.info(f'{reduction_name} rejected: {rejected_p.avg}')
         logging.info(f'Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
                      f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
     return
@@ -523,19 +525,57 @@ else:
     print('saving reference stats dict')
     th.save(all_class_ref_stats, calibrated_path)
 
+def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.001, 0.005, 0.025, 0.05, 0.1, 0.15,
+                                                                                  0.2, 0.25, 0.5, 0.75, 0.8, 0.85, 0.9,
+                                                                                  0.95, 0.975, 0.995, 0.999])):
+    # this function should return pvalues in the format of (Batch x num_classes)
+    per_class_record = []
+    # reduce all layers (e.g. fisher)
+    for class_stats_per_layer_dict in all_class_ref_stats:
+        sum_pval_per_reduction = {}
+        for layer_stats_per_input_dict in class_stats_per_layer_dict.values():
+            for reduction_name, record_per_input in layer_stats_per_input_dict.items():
+                for record in record_per_input:
+                    if reduction_name in sum_pval_per_reduction:
+                        sum_pval_per_reduction[reduction_name] += record.simes_pval
+                    else:
+                        sum_pval_per_reduction[reduction_name] = record.simes_pval
+
+        # update fisher pvalue per reduction
+        fisher_pvals_per_reduction = {}
+        for reduction_name, sum_pval in sum_pval_per_reduction.items():
+            meter = OnlineMeter(batched=True, track_percentiles=True,
+                                target_percentiles= target_percentiles.clamp_(
+                                1/sum_pval.shape[0],1-1/sum_pval.shape[0]).unique(),
+                                                                per_channel=False, number_edge_samples=70,
+                                                                track_cov=False)
+            meter.update(2*th.log(sum_pval))
+            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram())
+
+        per_class_record.append(fisher_pvals_per_reduction)
+
+    return per_class_record
+
+# get the pvalue estimators per class per reduction for the channel and final output functions
+# here we can implement subsample channles and other layer reductions exept Fisher
+# todo add Specs to fuse the pvalue matcher and OODDetector as they are tightly coupled.
+output_pval_matcher = extract_output_distribution(all_class_ref_stats)
+
 val_ds = get_dataset(args.dataset, 'val',get_transform('imagenet', augment=args.augment),limit=None)
 targets = th.tensor(val_ds.targets)
 # todo replace all targets to in or out of distribution?
 # todo add adversarial samples test
 # for in-dist data evaluate per class to simplify post analysis
-for class_id,class_name in enumerate(ds.classes):
+logging.info(f'evaluating inliers')
+for class_id,class_name in enumerate(val_ds.classes):
     sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     val_loader = th.utils.data.DataLoader(
-            ds, sampler=sampler,
+            val_ds, sampler=sampler,
             batch_size=1000, shuffle=True if sampler is None else False,
             num_workers=8, pin_memory=False, drop_last=True)
+    logging.info(f'evaluating class {class_name}')
+    evaluate_data(val_loader, model, all_class_ref_stats,args.device,output_pval_matcher,0.05)
 
-    evaluate_data(val_loader, model, all_class_ref_stats,args.device)
 pass
 
 # record = th.load(f'record-{args.dataset}.pth')
