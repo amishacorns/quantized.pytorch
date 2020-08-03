@@ -55,11 +55,11 @@ def get_dataset(name, split='train', transform=None,
                 ds += ds_
         return ds
     if name.endswith('-raw'):
-        if name[:-4] in ['cifar10','cifar100']:
-            ds_dir_name = name[:-4]
-        else:
-            raise NotImplementedError
-    if name.endswith('-dogs') or name.endswith('-cats'):
+        assert name[:-4] in ['cifar10','cifar100']
+        ds_dir_name = name[:-4]
+    elif name.startswith('folder-'):
+        ds_dir_name = name[7:]
+    elif name.endswith('-dogs') or name.endswith('-cats'):
         if name.startswith('imagenet-'):
             if name.endswith('dogs'):
                 _ids = _imagenet_dogs.keys()
@@ -85,9 +85,9 @@ def get_dataset(name, split='train', transform=None,
             return get_dataset(name.split('-')[1], split, transform, target_transform,download, limit=limit,
                                shuffle_before_limit=shuffle_before_limit,
                                datasets_path=__DATASETS_DEFAULT_PATH)
-
     else:
         ds_dir_name = name
+
     root = os.path.join(datasets_path, ds_dir_name)
     if name == 'cifar10':
         return datasets.CIFAR10(root=root,
@@ -109,7 +109,7 @@ def get_dataset(name, split='train', transform=None,
                               download=download)
     elif name == 'SVHN':
         return datasets.SVHN(root=root,
-                              split=split,
+                              split= 'test' if not train else split,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
@@ -129,6 +129,13 @@ def get_dataset(name, split='train', transform=None,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
+    elif name.startswith('folder'):
+        ds = datasets.ImageFolder(root=root,
+                                  transform=transform,
+                                  target_transform=target_transform)
+        ds = balance_image_folder_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
+                                     seed=limit_shuffle_seed, class_ids=class_ids)
+        return ds
     elif name in ['imagenet', 'cats_vs_dogs'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
             root = os.path.join(root, 'train')
@@ -157,6 +164,17 @@ def get_dataset(name, split='train', transform=None,
         else:
             return get_dataset(name[7:],split, transform, target_transform,download, limit=limit,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
+    elif name == 'LSUN':
+        return datasets.LSUN(root=root,
+                                classes=split,
+                                transform=transform,
+                                target_transform=target_transform)
+    elif hasattr(datasets,name):
+        return getattr(datasets,name)(root=root,
+                                split=train,
+                                transform=transform,
+                                target_transform=target_transform,
+                                download=download)
 
 
 def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False,seed=None,class_ids=None):

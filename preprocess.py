@@ -77,7 +77,7 @@ def inception_color_preproccess(input_size, normalize=__imagenet_stats):
 from data import _DATASET_META_DATA
 def get_transform(name='imagenet', input_size=None,
                   scale_size=None, normalize=None, augment=True):
-    if 'imagenet' in name or name in ['imaginet','randomnet']:
+    if 'imagenet' in name or name in ['imaginet','randomnet','cats_vs_dogs']:
         normalize = normalize or __imagenet_stats
         scale_size = scale_size or 256
         input_size = input_size or 224

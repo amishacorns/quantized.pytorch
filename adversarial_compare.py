@@ -20,33 +20,20 @@ class Settings:
                                                    if type(attr) == str and not attr.startswith('__')})
 
     def __init__(self,
-                 plot_layer_names: list,
+                 model:str,
                  model_cfg: dict,
-                 measure_stats: bool = True,
-                 recompute: bool = True,
+                 recompute: bool = False,
                  augment: bool = True,
+                 augment_test :bool = False,
                  device: str = 'cuda',
                  dataset: str = f'cats_vs_dogs',
-                 super_category: str = 'dogs', # 'cats'  # dogs
                  ckt_path: str = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
-                 collector_device : str = 'cpu'):
+                 collector_device : str = 'cpu',
+                 ):
 
         arg_names, _,_, local_vars= inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
             setattr(self,name,local_vars[name])
-        if self.super_category:
-            self.dataset += '-' + self.super_category
-
-args = Settings(
-    recompute=False,
-    augment=True,
-    device='cuda:3',
-    collector_device='cpu',
-    super_category='',
-    plot_layer_names=['layer1.0.bn1', 'layer2.0.downsample.1', 'layer2.1.bn2',
-                             'layer4.0.downsample.1','layer4.1.bn2'],
-    model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2})
-
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
     var1 = var1.clamp(min=epsilon)
@@ -234,6 +221,37 @@ class PvalueMatcher():
         pval = self.percentiles[temp_location]
         pval[upper_quant_ind] = 1 - pval[upper_quant_ind]
         return pval
+
+def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.001, 0.005, 0.025, 0.05, 0.1, 0.15,
+                                                                                  0.2, 0.25, 0.5, 0.75, 0.8, 0.85, 0.9,
+                                                                                  0.95, 0.975, 0.995, 0.999])):
+    # this function should return pvalues in the format of (Batch x num_classes)
+    per_class_record = []
+    # reduce all layers (e.g. fisher)
+    for class_stats_per_layer_dict in all_class_ref_stats:
+        sum_pval_per_reduction = {}
+        for layer_stats_per_input_dict in class_stats_per_layer_dict.values():
+            for reduction_name, record_per_input in layer_stats_per_input_dict.items():
+                for record in record_per_input:
+                    if reduction_name in sum_pval_per_reduction:
+                        sum_pval_per_reduction[reduction_name] += record.simes_pval
+                    else:
+                        sum_pval_per_reduction[reduction_name] = record.simes_pval
+
+        # update fisher pvalue per reduction
+        fisher_pvals_per_reduction = {}
+        for reduction_name, sum_pval in sum_pval_per_reduction.items():
+            meter = OnlineMeter(batched=True, track_percentiles=True,
+                                target_percentiles= target_percentiles.clamp_(
+                                1/sum_pval.shape[0],1-1/sum_pval.shape[0]).unique(),
+                                                                per_channel=False, number_edge_samples=70,
+                                                                track_cov=False)
+            meter.update(2*th.log(sum_pval))
+            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram())
+
+        per_class_record.append(fisher_pvals_per_reduction)
+
+    return per_class_record
 
 class OODDetector():
     def __init__(self, model, num_classes,channle_reducer_fn, output_pval_matcher):
@@ -464,10 +482,9 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', coll
     return ret_stat_dict
 
 
-def evaluate_data(loader,model, ref_stat_dict,model_device, output_pval_matcher,alpha = 0.001):
+def evaluate_data(loader,model, detector,model_device,alpha = 0.001):
     model.eval()
     model.to(model_device)
-    detector = OODDetector(model,len(loader.dataset.classes),gen_simes_reducer_fn(ref_stat_dict),output_pval_matcher)
     top1 = AverageMeter()
     top5 = AverageMeter()
     rejected = {'spatial-mean':AverageMeter(),
@@ -489,92 +506,106 @@ def evaluate_data(loader,model, ref_stat_dict,model_device, output_pval_matcher,
                 #  3. compute accuracy according to maximum likelihood class from 2.
 
                 predicted_class_pval = pvalues[th.where(out.max(1,keepdims=True)[0] == out)]
+                # we typically evaluate only in/out dist data at a time so we only care about rejection rate
+                # (instead of accuracy)
                 rejected[reduction_name].update((predicted_class_pval < alpha).float().mean(),out.shape[0])
+
         for reduction_name, rejected_p in rejected.items():
             logging.info(f'{reduction_name} rejected: {rejected_p.avg}')
         logging.info(f'Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
                      f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
-    return
-setup_logging()
-model = models.resnet(**(args.model_cfg))
-model.load_state_dict(th.load(args.ckt_path, map_location='cpu')['state_dict'])
+    # Important! recorder hooks should be removed when done
 
-if args.augment:
-    epochs = 5
-else:
-    epochs = 1
+if __name__ == '__main__':
+    # args = Settings(
+    #     model = 'resnet',
+    #     dataset = 'cats_vs_dogs',
+    #     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
+    #     ckt_path = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar'
+    # )
 
-calibrated_path = f'measured_stats_per_class-{args.dataset}.pth'
-if not args.recompute and os.path.exists(calibrated_path):
-    all_class_ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
-else:
-    ds = get_dataset(args.dataset, 'train',
-                       get_transform('imagenet', augment=args.augment),limit=None)
-    all_class_ref_stats=[]
-    targets = th.tensor(ds.targets)
-    for class_id,class_name in enumerate(ds.classes):
-        print(f'collecting stats for class {class_name}')
-        sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
-        train_loader = th.utils.data.DataLoader(
-                ds, sampler=sampler,
-                batch_size=1000, shuffle=True if sampler is None else False,
-                num_workers=8, pin_memory=False, drop_last=True)
+    # args = Settings(
+    #     model='ResNet34',
+    #     dataset='cifar10',
+    #     model_cfg={'num_c': 10},
+    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth'
+    # )
 
-        all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
-                                            collector_device=args.collector_device, batch_size=1000))
-    print('saving reference stats dict')
-    th.save(all_class_ref_stats, calibrated_path)
+    args = Settings(
+        model='ResNet34',
+        dataset='cifar100',
+        model_cfg={'num_c': 100},
+        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth'
+    )
 
-def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.001, 0.005, 0.025, 0.05, 0.1, 0.15,
-                                                                                  0.2, 0.25, 0.5, 0.75, 0.8, 0.85, 0.9,
-                                                                                  0.95, 0.975, 0.995, 0.999])):
-    # this function should return pvalues in the format of (Batch x num_classes)
-    per_class_record = []
-    # reduce all layers (e.g. fisher)
-    for class_stats_per_layer_dict in all_class_ref_stats:
-        sum_pval_per_reduction = {}
-        for layer_stats_per_input_dict in class_stats_per_layer_dict.values():
-            for reduction_name, record_per_input in layer_stats_per_input_dict.items():
-                for record in record_per_input:
-                    if reduction_name in sum_pval_per_reduction:
-                        sum_pval_per_reduction[reduction_name] += record.simes_pval
-                    else:
-                        sum_pval_per_reduction[reduction_name] = record.simes_pval
+    setup_logging()
+    model = getattr(models,args.model)(**(args.model_cfg))
+    checkpoint = th.load(args.ckt_path, map_location='cpu')
+    if 'state_dict' in checkpoint:
+        checkpoint=checkpoint['state_dict']
 
-        # update fisher pvalue per reduction
-        fisher_pvals_per_reduction = {}
-        for reduction_name, sum_pval in sum_pval_per_reduction.items():
-            meter = OnlineMeter(batched=True, track_percentiles=True,
-                                target_percentiles= target_percentiles.clamp_(
-                                1/sum_pval.shape[0],1-1/sum_pval.shape[0]).unique(),
-                                                                per_channel=False, number_edge_samples=70,
-                                                                track_cov=False)
-            meter.update(2*th.log(sum_pval))
-            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram())
+    model.load_state_dict(checkpoint)
 
-        per_class_record.append(fisher_pvals_per_reduction)
+    if args.augment:
+        epochs = 5
+    else:
+        epochs = 1
 
-    return per_class_record
+    expected_transform_measure = get_transform(args.dataset, augment=args.augment)
+    expected_transform_test = get_transform(args.dataset, augment=args.augment_test)
+    calibrated_path = f'measured_stats_per_class-{args.dataset}.pth'
+    if not args.recompute and os.path.exists(calibrated_path):
+        all_class_ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
+    else:
+        ds = get_dataset(args.dataset, 'train',
+                           expected_transform_measure,limit=None)
+        all_class_ref_stats=[]
+        targets = th.tensor(ds.targets)
+        for class_id,class_name in enumerate(ds.classes):
+            print(f'collecting stats for class {class_name}')
+            sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+            train_loader = th.utils.data.DataLoader(
+                    ds, sampler=sampler,
+                    batch_size=1000, shuffle=False,
+                    num_workers=8, pin_memory=False, drop_last=True)
 
-# get the pvalue estimators per class per reduction for the channel and final output functions
-# here we can implement subsample channles and other layer reductions exept Fisher
-# todo add Specs to fuse the pvalue matcher and OODDetector as they are tightly coupled.
-output_pval_matcher = extract_output_distribution(all_class_ref_stats)
+            all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
+                                                collector_device=args.collector_device, batch_size=1000))
+        print('saving reference stats dict')
+        th.save(all_class_ref_stats, calibrated_path)
 
-val_ds = get_dataset(args.dataset, 'val',get_transform('imagenet', augment=args.augment),limit=None)
-targets = th.tensor(val_ds.targets)
-# todo replace all targets to in or out of distribution?
-# todo add adversarial samples test
-# for in-dist data evaluate per class to simplify post analysis
-logging.info(f'evaluating inliers')
-for class_id,class_name in enumerate(val_ds.classes):
-    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+    val_ds = get_dataset(args.dataset, 'val',expected_transform_test,limit=None)
+    targets = th.tensor(val_ds.targets)
+
+    # get the pvalue estimators per class per reduction for the channel and final output functions
+    # here we can implement subsample channles and other layer reductions exept Fisher
+    # todo add Specs to fuse the pvalue matcher and OODDetector as they are tightly coupled.
+    output_pval_matcher = extract_output_distribution(all_class_ref_stats)
+    detector = OODDetector(model,len(val_ds.classes),gen_simes_reducer_fn(all_class_ref_stats),output_pval_matcher)
+
+    # todo replace all targets to in or out of distribution?
+    # todo add adversarial samples test
+    # run in-dist data evaluate per class to simplify analysis
+    logging.info(f'evaluating inliers')
+    #for class_id,class_name in enumerate(val_ds.classes):
+    sampler = None #th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     val_loader = th.utils.data.DataLoader(
             val_ds, sampler=sampler,
-            batch_size=1000, shuffle=True if sampler is None else False,
+            batch_size=1000, shuffle=False,
             num_workers=8, pin_memory=False, drop_last=True)
-    logging.info(f'evaluating class {class_name}')
-    evaluate_data(val_loader, model, all_class_ref_stats,args.device,output_pval_matcher,0.05)
+    #logging.info(f'evaluating class {class_name}')
+    evaluate_data(val_loader, model, detector,args.device,0.05)
+
+    logging.info(f'evaluating outliers')
+    ood_datasets = ['folder-LSUN_resize','folder-Imagenet_resize','SVHN']
+    for ood_dataset in ood_datasets:
+        val_ds = get_dataset(ood_dataset, 'val',expected_transform_test)
+        val_loader = th.utils.data.DataLoader(
+            val_ds, sampler=None,
+            batch_size=1000, shuffle=False,
+            num_workers=8, pin_memory=False, drop_last=True)
+        logging.info(f'evaluating {ood_dataset}')
+        evaluate_data(val_loader, model, detector, args.device, 0.05)
 
 pass
 
