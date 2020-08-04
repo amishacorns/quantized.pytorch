@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import inspect
 from utils.misc import Recorder
 from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
+from functools import partial
 @dataclass
 class Settings:
     def __repr__(self):
@@ -22,6 +23,7 @@ class Settings:
     def __init__(self,
                  model:str,
                  model_cfg: dict,
+                 batch_size: int = 1000,
                  recompute: bool = False,
                  augment: bool = True,
                  augment_test :bool = False,
@@ -204,23 +206,34 @@ def gen_simes_reducer_fn(ref_stats_dict):
 
 
 class PvalueMatcher():
-    def __init__(self,percentiles,quantiles):
+    def __init__(self,percentiles,quantiles, two_side=True, right_side=False):
         self.percentiles = percentiles
-        self.quantiles = quantiles
+        self.quantiles = quantiles.t().unsqueeze(0)
+        self.num_percentiles = percentiles.shape[0]
+        self.two_side = two_side
+        self.right_side = right_side
+        assert not (self.two_side and self.right_side)
 
     ## todo document!
     def __call__(self, x):
-        len_q = self.quantiles.shape[0]
-        stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], len_q)
-        quant_layer = self.quantiles.t().unsqueeze(0).expand(stat_layer.shape[0], stat_layer.shape[1], len_q).to(x.device)
+        stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], self.num_percentiles)
+        if x.device != self.percentiles.device:
+            self.percentiles=self.percentiles.to(x.device)
+            self.quantiles = self.quantiles.to(x.device)
+
+        quant_layer = self.quantiles.expand(stat_layer.shape[0], stat_layer.shape[1], self.num_percentiles)
 
         ### find p-values based on quantiles
         temp_location = th.sum(stat_layer < quant_layer, 2)
-        upper_quant_ind = temp_location >= (len_q / 2) + 1
+        upper_quant_ind = temp_location >= (self.num_percentiles / 2) + 1
         temp_location[upper_quant_ind] += -1
-        pval = self.percentiles[temp_location]
-        pval[upper_quant_ind] = 1 - pval[upper_quant_ind]
-        return pval
+        matching_percentiles = self.percentiles[temp_location]
+        if self.two_side:
+            matching_percentiles[upper_quant_ind] = 1 - matching_percentiles[upper_quant_ind]
+            return matching_percentiles * 2
+        if self.right_side:
+            return 1-matching_percentiles
+        return matching_percentiles
 
 def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.001, 0.005, 0.025, 0.05, 0.1, 0.15,
                                                                                   0.2, 0.25, 0.5, 0.75, 0.8, 0.85, 0.9,
@@ -234,9 +247,9 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
             for reduction_name, record_per_input in layer_stats_per_input_dict.items():
                 for record in record_per_input:
                     if reduction_name in sum_pval_per_reduction:
-                        sum_pval_per_reduction[reduction_name] += record.simes_pval
+                        sum_pval_per_reduction[reduction_name] -= 2*th.log(record.simes_pval)
                     else:
-                        sum_pval_per_reduction[reduction_name] = record.simes_pval
+                        sum_pval_per_reduction[reduction_name] = -2*th.log(record.simes_pval)
 
         # update fisher pvalue per reduction
         fisher_pvals_per_reduction = {}
@@ -246,8 +259,10 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
                                 1/sum_pval.shape[0],1-1/sum_pval.shape[0]).unique(),
                                                                 per_channel=False, number_edge_samples=70,
                                                                 track_cov=False)
-            meter.update(2*th.log(sum_pval))
-            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram())
+            meter.update(sum_pval)
+            # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
+            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram(),
+                                                                       two_side=False,right_side=True)
 
         per_class_record.append(fisher_pvals_per_reduction)
 
@@ -288,14 +303,14 @@ class OODDetector():
                 for reduction_name,pval_per_input in layer_pvalues_per_class[class_id].items():
                     for pval in pval_per_input:
                         if reduction_name in sum_pval_per_reduction:
-                            sum_pval_per_reduction[reduction_name] += pval
+                            sum_pval_per_reduction[reduction_name] -= 2*th.log(pval)
                         else:
-                            sum_pval_per_reduction[reduction_name] = pval
+                            sum_pval_per_reduction[reduction_name] = -2*th.log(pval)
 
             # update fisher pvalue per reduction
             fisher_pvals_per_reduction = {}
             for reduction_name, sum_pval in sum_pval_per_reduction.items():
-                fisher_pvals_per_reduction[reduction_name] = self.output_pval_matcher[class_id][reduction_name](2*th.log(sum_pval))
+                fisher_pvals_per_reduction[reduction_name] = self.output_pval_matcher[class_id][reduction_name](sum_pval)
 
             per_class_record.append(fisher_pvals_per_reduction)
 
@@ -312,11 +327,32 @@ def calc_simes(pval):
 def spatial_mean(x):
     return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
 
-def spatial_max(x):
-    return x.view(x.shape[0], x.shape[1], -1).max(-1)[0] if x.dim() > 2 else x
+# k will ignore k-1 most extreme values, todo choose value to match percentile ()
+def spatial_edges(x,k=1,is_max=True,):
+    x_ = x
+    if x.dim() < 3:
+        return x
 
-def spatial_min(x):
-    return x.view(x.shape[0], x.shape[1], -1).min(-1)[0] if x.dim() > 2 else x
+    if x.dim()>3:
+        x_ = x.view(x.shape[0], x.shape[1], -1)
+
+    ret = x_.topk(k, -1, is_max)[0]
+    if is_max:
+        return ret[:,0]
+
+    return ret[:,k-1]
+
+def spatial_min(x,k=1):
+    return spatial_edges(x,k,False)
+
+def spatial_max(x,k=1):
+    return spatial_edges(x,k,True)
+
+def spatial_margin(x,k=1):
+    return spatial_max(x,k)-spatial_min(x,k)
+
+
+
 
 ## auxilary data containers
 @dataclass()
@@ -345,6 +381,7 @@ class BatchStatsCollectorCfg():
         'spatial-mean': spatial_mean,
         'spatial-max': spatial_max,
         'spatial-min': spatial_min,
+        'spatial-margin': partial(spatial_margin,k=1)
     }
     target_percentiles = [0.001, 0.005, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.5,
                0.75, 0.8, 0.85, 0.9, 0.95, 0.975, 0.995, 0.999]
@@ -444,9 +481,8 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', coll
     def _loop_over_data():
         model.eval()
         with th.no_grad():
-            for e in range(epochs):
-                print(f'measure statistics - epoch {e}')
-                for d, l in tqdm.tqdm(loader, total=len(loader)):
+            for _ in tqdm.trange(epochs):
+                for d, l in loader:
                     _ = model(d.to(model_device))
 
     model.to(model_device)
@@ -457,8 +493,9 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', coll
     if compute_cov_on_partial_stats:
         measure_settings.track_cov = True
 
+    logging.info('measuring mean and percentiles')
     _loop_over_data()
-    print('calculating covariance and Simes pvalues using measured mean and quantiles')
+    logging.info('calculating covariance and Simes pvalues using measured mean and quantiles')
     measure_settings.update_tracker = False
     measure_settings.find_simes = True
     measure_settings.track_cov = not measure_settings.track_cov
@@ -489,7 +526,8 @@ def evaluate_data(loader,model, detector,model_device,alpha = 0.001):
     top5 = AverageMeter()
     rejected = {'spatial-mean':AverageMeter(),
                 'spatial-max':AverageMeter(),
-                'spatial-min':AverageMeter()}
+                'spatial-min':AverageMeter(),
+                'spatial-margin_k2:':AverageMeter()}
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
             out = model(d.to(model_device))
@@ -524,19 +562,20 @@ if __name__ == '__main__':
     #     ckt_path = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar'
     # )
 
-    # args = Settings(
-    #     model='ResNet34',
-    #     dataset='cifar10',
-    #     model_cfg={'num_c': 10},
-    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth'
-    # )
-
     args = Settings(
         model='ResNet34',
-        dataset='cifar100',
-        model_cfg={'num_c': 100},
-        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth'
+        dataset='cifar10',
+        model_cfg={'num_c': 10},
+        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth'
     )
+
+    # args = Settings(
+    #     model='ResNet34',
+    #     dataset='cifar100',
+    #     model_cfg={'num_c': 100},
+    #     batch_size = 500,
+    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth'
+    # )
 
     setup_logging()
     model = getattr(models,args.model)(**(args.model_cfg))
@@ -563,14 +602,14 @@ if __name__ == '__main__':
         targets = th.tensor(ds.targets)
         for class_id,class_name in enumerate(ds.classes):
             print(f'collecting stats for class {class_name}')
-            sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+            sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0])
             train_loader = th.utils.data.DataLoader(
                     ds, sampler=sampler,
-                    batch_size=1000, shuffle=False,
+                    batch_size=500, shuffle=False,
                     num_workers=8, pin_memory=False, drop_last=True)
 
             all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
-                                                collector_device=args.collector_device, batch_size=1000))
+                                                collector_device=args.collector_device, batch_size=args.batch_size))
         print('saving reference stats dict')
         th.save(all_class_ref_stats, calibrated_path)
 
@@ -591,7 +630,7 @@ if __name__ == '__main__':
     sampler = None #th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     val_loader = th.utils.data.DataLoader(
             val_ds, sampler=sampler,
-            batch_size=1000, shuffle=False,
+            batch_size=args.batch_size, shuffle=False,
             num_workers=8, pin_memory=False, drop_last=True)
     #logging.info(f'evaluating class {class_name}')
     evaluate_data(val_loader, model, detector,args.device,0.05)
@@ -602,7 +641,7 @@ if __name__ == '__main__':
         val_ds = get_dataset(ood_dataset, 'val',expected_transform_test)
         val_loader = th.utils.data.DataLoader(
             val_ds, sampler=None,
-            batch_size=1000, shuffle=False,
+            batch_size=args.batch_size, shuffle=False,
             num_workers=8, pin_memory=False, drop_last=True)
         logging.info(f'evaluating {ood_dataset}')
         evaluate_data(val_loader, model, detector, args.device, 0.05)
