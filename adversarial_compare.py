@@ -406,7 +406,7 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
 
     measure_settings = measure_settings or BatchStatsCollectorCfg(batch_size)
     compute_cov_on_partial_stats = measure_settings.partial_stats and not measure_settings.cov_off
-    ## bypass the simple recorder dictionary with a meter dictionary to track statistics
+    ## bypass the simple recorder 7dictionary with a meter dictionary to track statistics
     tracker = MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True, track_percentiles=True,
                                                                target_percentiles=measure_settings.target_percentiles,
                                                                per_channel=True,number_edge_samples=measure_settings.num_edge_samples,
@@ -421,7 +421,7 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                 tracker_name = f'{trace_name}_{reduction_name}:{e}'
                 ## make sure input is a 2d tensor [batch, nchannels]
                 i_ = reduction_fn(i)
-                if collector_device != 'same' and collector_device '!= model_device:
+                if collector_device != 'same' and collector_device != model_device:
                     i_ = i_.to(collector_device)
 
                 num_observations, channels = i_.shape
@@ -591,9 +591,7 @@ if __name__ == '__main__':
     #     dataset='cifar100',
     #     num_classes=100,
     #     model_cfg={'num_c': 100},
-    #     limit_test=None,
     #     batch_size = 500,
-    #     augment_measure=False,
     #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
     #     device='cuda:1'
     # )
