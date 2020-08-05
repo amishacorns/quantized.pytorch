@@ -217,6 +217,37 @@ def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False
     dataset.samples = samps
     return dataset
 
+def limit_ds(dataset, n_samples,per_class=True,shuffle=True,seed=0,allowed_classes=None):
+    if per_class:
+        id_reg_per_class = {}
+        # map id to class label
+        for e, t in enumerate(dataset.targets):
+            if t in id_reg_per_class:
+                id_reg_per_class[t] += [e]
+            else:
+                id_reg_per_class[t] = [e]
+
+        ids = []
+        # shuffle and clip each class
+        for t in id_reg_per_class.keys():
+            if allowed_classes and t not in allowed_classes:
+                continue
+
+            class_ids = torch.tensor(id_reg_per_class[t])
+            if shuffle:
+                class_ids = class_ids[torch.randperm(len(class_ids), generator=torch.Generator().manual_seed(seed))]
+
+            ids.append(torch.tensor(class_ids[:n_samples]))
+        ids = torch.cat(ids)
+    else:
+        if shuffle:
+            ids = torch.randperm(len(dataset.targets), generator=torch.Generator().manual_seed(seed))[:n_samples]
+        else:
+            ids = torch.arange(0,n_samples)
+    ds = torch.utils.data.Subset(dataset,ids)
+    ds.targets = torch.tensor(dataset.targets)[ids]
+    return ds
+
 _imagenet_dogs = {
  151: 'Chihuahua',
  152: 'Japanese spaniel',
