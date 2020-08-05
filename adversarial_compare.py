@@ -35,8 +35,7 @@ class Settings:
                  limit_measure : int = None,
                  test_split : str = 'val',
                  num_classes=2,
-                 ## for now setting default to a two sided test
-                 right_sided_fisher_pvalue = False
+                 right_sided_fisher_pvalue = True
                  ):
 
         arg_names, _,_, local_vars= inspect.getargvalues(inspect.currentframe())
@@ -229,7 +228,7 @@ class PvalueMatcher():
         quant_layer = self.quantiles.expand(stat_layer.shape[0], stat_layer.shape[1], self.num_percentiles)
 
         ### find p-values based on quantiles
-        temp_location = th.sum(stat_layer < quant_layer, 2)
+        temp_location = self.num_percentiles - th.sum(stat_layer < quant_layer, -1)
         upper_quant_ind = temp_location > (self.num_percentiles // 2)
         temp_location[upper_quant_ind] += -1
         matching_percentiles = self.percentiles[temp_location]
@@ -580,11 +579,11 @@ if __name__ == '__main__':
         num_classes = 10,
         model_cfg={'num_c': 10},
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth',
-        device='cuda:2',
-        limit_measure=None,
-        limit_test=1000,
-        test_split='val',
-        augment_measure=False
+        # device='cuda:2',
+        # limit_measure=None,
+        # limit_test=1000,
+        # test_split='val',
+        # augment_measure=False
     )
 
     # args = Settings(
