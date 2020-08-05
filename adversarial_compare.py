@@ -30,7 +30,7 @@ class Settings:
                  device: str = 'cuda',
                  dataset: str = f'cats_vs_dogs',
                  ckt_path: str = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
-                 collector_device : str = 'cpu',
+                 collector_device : str = 'same', #use cpu or cuda:# if gpu runs OOM
                  limit_test : int = None,
                  limit_measure : int = None,
                  test_split : str = 'val',
@@ -401,7 +401,7 @@ class BatchStatsCollectorCfg():
         if self.target_percentiles:
             self.target_percentiles = th.tensor(self.target_percentiles).clamp_(1/batch_size,1-1/batch_size).unique()
 
-def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', collector_device='cpu', batch_size=1000,
+def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collector_device='same', batch_size=1000,
                             measure_settings : BatchStatsCollectorCfg = None):
 
     measure_settings = measure_settings or BatchStatsCollectorCfg(batch_size)
@@ -421,7 +421,7 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda:0', coll
                 tracker_name = f'{trace_name}_{reduction_name}:{e}'
                 ## make sure input is a 2d tensor [batch, nchannels]
                 i_ = reduction_fn(i)
-                if collector_device != model_device:
+                if collector_device != 'same' and collector_device '!= model_device:
                     i_ = i_.to(collector_device)
 
                 num_observations, channels = i_.shape
