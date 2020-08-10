@@ -18,9 +18,11 @@ from functools import partial
 
 @dataclass
 class Settings:
+    def get_args_dict(self):
+        return {k:getattr(self,k) for k in list(inspect.signature(Settings.__init__).parameters.keys())[1:]}
+
     def __repr__(self):
-        return str(self.__class__.__name__) + str({attr: getattr(self, attr) for attr in self.__dir__()
-                                                   if type(attr) == str and not attr.startswith('__')})
+        return str(self.__class__.__name__) + str(self.get_args_dict())
 
     def __init__(self,
                  model: str,
@@ -40,10 +42,11 @@ class Settings:
                  right_sided_fisher_pvalue: bool = True,
                  transform_dataset: str = None,
                  ):
+        self._dict = {}
         arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
             setattr(self, name, local_vars[name])
-
+            self._dict[name] = getattr(self,name)
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
     var1 = var1.clamp(min=epsilon)
@@ -532,6 +535,8 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
     r.remove_model_hooks()
     return ret_stat_dict
 
+def batched_meter_factory(k, v):
+    return OnlineMeter(batched=True)
 
 def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=False):
     alpha_list = alpha_list or [i / 100 for i in range(1, 100)]
@@ -543,10 +548,11 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
     #             'spatial-max':AverageMeter(),
     #             'spatial-min':AverageMeter(),
     #             'spatial-margin':AverageMeter()}
-    rejected = {'spatial-mean':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
-                'spatial-max':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
-                'spatial-min':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
-                'spatial-margin':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True))}
+
+    rejected = {'spatial-mean':MeterDict(meter_factory=batched_meter_factory),
+                'spatial-max':MeterDict(meter_factory=batched_meter_factory),
+                'spatial-min':MeterDict(meter_factory=batched_meter_factory),
+                'spatial-margin':MeterDict(meter_factory=batched_meter_factory)}
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
             out = model(d.to(model_device)).cpu()
@@ -622,9 +628,16 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
         if in_dist:
             logging.info(f'\nModel prediction :Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
                          f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
+        ret_dict = {}
         for reduction_name, rejected_p in rejected.items():
             logging.info(f'{reduction_name} rejected: {rejected_p["max_pval"].mean.numpy()}')
-    return rejected
+            ## strip meter dict functionality for simpler post-processing
+            reduction_dict = {}
+            for k,v in rejected_p.items():
+                # keeping meter object - potentially remove it here
+                reduction_dict[k] = v
+            ret_dict[reduction_name] = reduction_dict
+    return ret_dict
 
     # Important! recorder hooks should be removed when done
 
@@ -705,12 +718,11 @@ def measure_and_eval(args : Settings):
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device)
 
-    th.save({'results':rejection_results,'settings':args},f'experiment_results-{args.model}-{args.dataset}.pth')
+    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}.pth')
 
 
 if __name__ == '__main__':
-    device_id = 0
-    resnet_set = True
+    device_id = 1
     # helper class used to overwrite default settings for a group of experiments
     class ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
@@ -773,7 +785,7 @@ if __name__ == '__main__':
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_svhn_ported.pth',
     )
-    if resnet_set:
+    if device_id%2==0:
         experiments = [resnet34_cifar10,resnet34_cifar100,resnet34_svhn]
     else:
         experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
