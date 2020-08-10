@@ -14,34 +14,36 @@ import inspect
 from utils.misc import Recorder
 from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 from functools import partial
+
+
 @dataclass
 class Settings:
     def __repr__(self):
-        return str(self.__class__.__name__) + str({attr:getattr(self,attr) for attr in self.__dir__()
+        return str(self.__class__.__name__) + str({attr: getattr(self, attr) for attr in self.__dir__()
                                                    if type(attr) == str and not attr.startswith('__')})
 
     def __init__(self,
-                 model:str,
+                 model: str,
                  model_cfg: dict,
                  batch_size: int = 1000,
                  recompute: bool = False,
-                 augment_measure: bool = True,
-                 augment_test :bool = False,
+                 augment_measure: bool = False,
+                 augment_test: bool = False,
                  device: str = 'cuda',
                  dataset: str = f'cats_vs_dogs',
                  ckt_path: str = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
-                 collector_device : str = 'same', #use cpu or cuda:# if gpu runs OOM
-                 limit_test : int = None,
-                 limit_measure : int = None,
-                 test_split : str = 'val',
-                 num_classes=2,
-                 right_sided_fisher_pvalue = True,
-                 transform_dataset = None
+                 collector_device: str = 'same',  # use cpu or cuda:# if gpu runs OOM
+                 limit_test: int = None,
+                 limit_measure: int = None,
+                 test_split: str = 'val',
+                 num_classes: int = 2,
+                 right_sided_fisher_pvalue: bool = True,
+                 transform_dataset: str = None,
                  ):
-
-        arg_names, _,_, local_vars= inspect.getargvalues(inspect.currentframe())
+        arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
-            setattr(self,name,local_vars[name])
+            setattr(self, name, local_vars[name])
+
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
     var1 = var1.clamp(min=epsilon)
@@ -531,19 +533,25 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
     return ret_stat_dict
 
 
-def evaluate_data(loader,model, detector,model_device,alpha = 0.001,class_conditional=True,report_accuracy=False):
+def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=False):
+    alpha_list = alpha_list or [i / 100 for i in range(1, 100)]
     model.eval()
     model.to(model_device)
     top1 = AverageMeter()
     top5 = AverageMeter()
-    rejected = {'spatial-mean':AverageMeter(),
-                'spatial-max':AverageMeter(),
-                'spatial-min':AverageMeter(),
-                'spatial-margin':AverageMeter()}
+    # rejected = {'spatial-mean':AverageMeter(),
+    #             'spatial-max':AverageMeter(),
+    #             'spatial-min':AverageMeter(),
+    #             'spatial-margin':AverageMeter()}
+    rejected = {'spatial-mean':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
+                'spatial-max':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
+                'spatial-min':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True)),
+                'spatial-margin':MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True))}
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
-            out = model(d.to(model_device))
-            if report_accuracy:
+            out = model(d.to(model_device)).cpu()
+            correct_predictions = l == out.argmax(1)
+            if in_dist:
                 t1, t5 = accuracy(out, l, (1, 5))
                 top1.update(t1, out.shape[0])
                 top5.update(t5, out.shape[0])
@@ -551,125 +559,77 @@ def evaluate_data(loader,model, detector,model_device,alpha = 0.001,class_condit
                              f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
             pvalues_dict = detector.get_fisher()
             for reduction_name,pvalues in pvalues_dict.items():
+                pvalues=pvalues.squeeze().cpu()
                 #aggragate pvalues or return per reduction score
                 # todo:
                 #  1. split rejection statistics between correct and incorrect model predictions
                 #  2. check rejection rate according to all class statistics (i.e. reject only if pval is unlikely
                 #  under all class reference)
                 #  3. compute accuracy according to maximum likelihood class from 2.
-                best_class_pval, best_class_pval_id = pvalues.squeeze().max(1)
-                if class_conditional:
-                    predicted_class_pval = pvalues[th.where(out.max(1,keepdims=True)[0] == out)]
-                else:
-                    predicted_class_pval = best_class_pval
+                best_class_pval, best_class_pval_id = pvalues.max(1)
+                class_conditional_pval = pvalues[th.arange(l.shape[0]), out.argmax(1)]
+                correct_pred_conditional_pval = class_conditional_pval[correct_predictions]
+                true_class_pval = pvalues[th.arange(l.shape[0]), l]
+                # if class_conditional:
+                #     if in_dist and not use_labels:
+                #         # for a fair comparison measure rejection rate only on samples that are correctly classified
+                #         pvalues_for_val = correct_pred_conditional_pval
+                #         #rejected[reduction_name].update((correct_pred_conditional_pval < alpha).float().mean(), correct_predictions.sum())
+                #     elif in_dist and use_labels:
+                #         # use labels to evaluate rejection rate instead of predicted class as an alternative to the first
+                #         #rejected[reduction_name].update((true_class_pval < alpha).float().mean(), out.shape[0])
+                #         pvalues_for_val = true_class_pval
+                #     else:
+                #         # class conditional when not in distribution - this is the normal operation mode
+                #         #rejected[reduction_name].update((class_conditional_pval < alpha).float().mean(), out.shape[0])
+                #         pvalues_for_val = class_conditional_pval
+                # else:
+                #     #rejected[reduction_name].update((best_class_pval < alpha).float().mean(), out.shape[0])
+                #     pvalues_for_val = best_class_pval
+
+                def _gen_curve(pvalues_for_val,):
+                    rejected_ = []
+                    for alpha_ in alpha_list:
+                        rejected_.append((pvalues_for_val < alpha_).float().unsqueeze(1))
+                    return th.cat(rejected_,1)
+                # measure rejection rates for a range of pvalues under each measure and each reduction
+                rejected[reduction_name].update({
+                    'class_conditional_pval': _gen_curve(class_conditional_pval),
+                    'max_pval': _gen_curve(best_class_pval),
+                })
+                if in_dist:
+                    rejected[reduction_name].update({
+                        'true_class_pval' : _gen_curve(true_class_pval),
+                        'class_conditional_correct_only_pval' : _gen_curve(correct_pred_conditional_pval)
+                    })
+
                 # we typically evaluate only in/out dist data at a time so we only care about rejection rate
                 # (instead of accuracy)
-                rejected[reduction_name].update((predicted_class_pval < alpha).float().mean(),out.shape[0])
-                if report_accuracy:
+                if in_dist:
                     predicted = out.max(1)[1].cpu()
                     t1_likely,t5_likely = accuracy(pvalues.squeeze(),l,(1,5))
                     agreement = (best_class_pval_id.cpu() == predicted)
                     agreement_true = (agreement == (predicted == l))
                     agreement_false =  pvalues[predicted != l]
-                    logging.info(f'{reduction_name}: rejected: {rejected[reduction_name].avg:0.3f}\t'
-                                 f'Prec@1 {t1_likely:0.3f}, Prec@5 {t5_likely:0.3f}\n'
-                                 f'\tagreement: {agreement.float().mean():0.3f},\t'
-                                 f'agreement on true: {agreement_true.float().mean():0.3f},\t'
-                                 f'agreement on false {agreement_false.float().mean():0.3f}')
+                    logging.info(f'{reduction_name}: rejected: {rejected[reduction_name]["max_pval"].mean.numpy()}\t'
+                                 f'Prec@1 {t1_likely:0.3f}, Prec@5 {t5_likely:.3f}\n'
+                                 f'\tagreement: {agreement.float().mean():.3f},\t'
+                                 f'agreement on true: {agreement_true.float().mean():.3f},\t'
+                                 f'agreement on false {agreement_false.float().mean():.3f}')
                 # we typically evaluate only in/out dist data at a time so we only care about rejection rate
                 # (instead of accuracy)
 
+        if in_dist:
+            logging.info(f'\nModel prediction :Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
+                         f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
         for reduction_name, rejected_p in rejected.items():
-            logging.info(f'{reduction_name} rejected: {rejected_p.avg:0.3f}')
+            logging.info(f'{reduction_name} rejected: {rejected_p["max_pval"].mean.numpy()}')
+    return rejected
 
     # Important! recorder hooks should be removed when done
 
-if __name__ == '__main__':
-    # args = Settings(
-    #     model = 'resnet',
-    #     dataset = 'cats_vs_dogs',
-    #     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
-    #     ckt_path = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar'
-    # )
-    #
-    args = Settings(
-        model='ResNet34',
-        dataset='SVHN', #'cifar10',
-        transform_dataset = 'cifar10',
-        num_classes = 10,
-        model_cfg={'num_c': 10},
-        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth',
-        limit_measure=None,
-        limit_test=None,
-        test_split='val',
-        augment_measure=False,
-        right_sided_fisher_pvalue=True
-    )
-    # args = Settings(
-    #     model='ResNet34',
-    #     dataset='cifar100',
-    #     num_classes=100,
-    #     model_cfg={'num_c': 100},
-    #     batch_size = 1000,
-    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
-    #     device='cuda:1',
-    #     augment_measure=False,
-    #     limit_test =None,
-    #     test_split='val'
-    # )
-    # args = Settings(
-    #     model='ResNet34',
-    #     dataset='svhn',
-    #     num_classes=10,
-    #     model_cfg={'num_c': 10},
-    #     batch_size = 1000,
-    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_svhn.pth',
-    #     device='cuda:1',
-    #     augment_measure=False,
-    #     limit_test =1000,
-    #     test_split='val',
-    # )
-    # args = Settings(
-    #     model='DenseNet3',
-    #     dataset='cifar10',
-    #     num_classes = 10,
-    #     model_cfg={'num_classes': 10,'depth':100},
-    #     ckt_path='densenet_cifar10_ported.pth',
-    #     # device='cuda:2',
-    #     # limit_measure=None,
-    #     # limit_test=1000,
-    #     # test_split='val',
-    #     augment_measure=False
-    # )
-    # args = Settings(
-    #     model='DenseNet3',
-    #     dataset='svhn',
-    #     num_classes = 10,
-    #     model_cfg={'num_classes': 10,'depth':100},
-    #     ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/densenet_svhn.pth',
-    #     # device='cuda:2',
-    #     # limit_measure=None,
-    #     # limit_test=1000,
-    #     # test_split='val',
-    #     augment_measure=False
-    # )
-    # args = Settings(
-    #     model='DenseNet3',
-    #     dataset='cifar100',
-    #     num_classes = 100,
-    #     model_cfg={'num_classes': 100,'depth':100},
-    #     ckt_path='densenet_cifar100_ported.pth',
-    #     device='cuda:1',
-    #     batch_size=500,
-    #     collector_device='cpu',
-    #     # limit_measure=None,
-    #     # limit_test=1000,
-    #     # test_split='val',
-    #     augment_measure=False
-    #     )
-
-    setup_logging()
-    logging.info(args)
+def measure_and_eval(args : Settings):
+    rejection_results = {} # dataset , out
     model = getattr(models,args.model)(**(args.model_cfg))
     checkpoint = th.load(args.ckt_path, map_location='cpu')
     if 'state_dict' in checkpoint:
@@ -726,10 +686,14 @@ if __name__ == '__main__':
             val_ds, sampler=sampler,
             batch_size=args.batch_size, shuffle=False,
             num_workers=8, pin_memory=True, drop_last=True)
-    evaluate_data(val_loader, model, detector,args.device,0.05,report_accuracy=True)
-
+    rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,in_dist=True)
     logging.info(f'evaluating outliers')
-    ood_datasets = ['folder-LSUN_resize','folder-Imagenet_resize','SVHN']
+    ood_datasets = ['folder-LSUN_resize', 'folder-Imagenet_resize']
+    if args.dataset == 'SVHN':
+        ood_datasets += ['cifar10']
+    else:
+        ood_datasets += ['SVHN']
+
     for ood_dataset in ood_datasets:
         ood_ds = get_dataset(ood_dataset, 'val',expected_transform_test)
         if args.limit_test:
@@ -739,8 +703,85 @@ if __name__ == '__main__':
             batch_size=args.batch_size, shuffle=False,
             num_workers=8, pin_memory=False, drop_last=True)
         logging.info(f'evaluating {ood_dataset}')
-        evaluate_data(ood_loader, model, detector, args.device, 0.05)
+        rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,
+                                                       class_conditional=args.class_conditional_rejection)
 
+    th.save({'results':rejection_results,'settings':args},f'experiment_results-{args.model}-{args.dataset}.pth')
+
+
+if __name__ == '__main__':
+    device_id = 0
+    resnet_set = True
+    # helper class used to overwrite default settings for a group of experiments
+    class ExpGroupSettings(Settings):
+        def __init__(self,**kwargs):
+            super().__init__(device=f'cuda:{device_id}',**kwargs)
+
+    resnet18_cats_dogs = ExpGroupSettings(
+        model='resnet',
+        dataset='cats_vs_dogs',
+        model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
+        ckt_path='/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar'
+    )
+
+    resnet34_cifar10 = ExpGroupSettings(
+        model='ResNet34',
+        dataset='cifar10',
+        num_classes=10,
+        model_cfg={'num_c': 10},
+        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth',
+    )
+
+    resnet34_cifar100 = ExpGroupSettings(
+        model='ResNet34',
+        dataset='cifar100',
+        num_classes=100,
+        model_cfg={'num_c': 100},
+        batch_size=500,
+        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
+    )
+
+    resnet34_svhn = ExpGroupSettings(
+        model='ResNet34',
+        dataset='svhn',
+        num_classes=10,
+        model_cfg={'num_c': 10},
+        batch_size=1000,
+        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_svhn.pth',
+    )
+
+    densenet_cifar10 = ExpGroupSettings(
+        model='DenseNet3',
+        dataset='cifar10',
+        num_classes=10,
+        model_cfg={'num_classes': 10,'depth':100},
+        ckt_path='densenet_cifar10_ported.pth',
+    )
+
+    densenet_cifar100 = ExpGroupSettings(
+        model='DenseNet3',
+        dataset='cifar100',
+        num_classes=100,
+        model_cfg={'num_classes': 100,'depth':100},
+        ckt_path='densenet_cifar100_ported.pth',
+        batch_size=500,
+        )
+
+    densenet_svhn = ExpGroupSettings(
+        model='DenseNet3',
+        dataset='svhn',
+        num_classes = 10,
+        model_cfg={'num_classes': 10,'depth':100},
+        ckt_path='densenet_svhn_ported.pth',
+    )
+    if resnet_set:
+        experiments = [resnet34_cifar10,resnet34_cifar100,resnet34_svhn]
+    else:
+        experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
+    setup_logging()
+    for args in experiments:
+        logging.info(args)
+        measure_and_eval(args)
 pass
 
 # record = th.load(f'record-{args.dataset}.pth')
