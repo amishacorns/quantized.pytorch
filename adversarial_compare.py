@@ -703,8 +703,7 @@ def measure_and_eval(args : Settings):
             batch_size=args.batch_size, shuffle=False,
             num_workers=8, pin_memory=False, drop_last=True)
         logging.info(f'evaluating {ood_dataset}')
-        rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,
-                                                       class_conditional=args.class_conditional_rejection)
+        rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device)
 
     th.save({'results':rejection_results,'settings':args},f'experiment_results-{args.model}-{args.dataset}.pth')
 
