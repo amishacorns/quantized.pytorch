@@ -641,6 +641,30 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
 
     # Important! recorder hooks should be removed when done
 
+def result_summary(res_dict,args_dict):
+    in_dist=args_dict['dataset']
+    logging.info(f'Report for {args_dict["model"]} - {in_dist}')
+    for red, vd in res_dict[in_dist].items():
+        ids = []
+        res = []
+        logging.info(red)
+        for n, p in vd.items():
+            rejected = {}
+            pvalues_under_alpha = [i for i in p.mean.tolist() if i < 0.051]
+            pvalues_id = len(pvalues_under_alpha)
+            for k, ood_v in res_dict.items():
+                if k != in_dist and n in ood_v[red]:
+                    rejected[k] = (ood_v[red][n].mean[pvalues_id].numpy())
+            ids.append(pvalues_id)
+            res.append(pvalues_under_alpha[pvalues_id - 1])
+            logging.info(f'\t {n}: {res[-1]:.3f} ({pvalues_id / 100})')
+            for kk, vv in rejected.items():
+                logging.info(f'\t\t{kk}: {vv:0.3f}')
+
+def report_from_file(path):
+    res = th.load(path,map_location='cpu')
+    result_summary(res['results'], res['settings'])
+
 def measure_and_eval(args : Settings):
     rejection_results = {} # dataset , out
     model = getattr(models,args.model)(**(args.model_cfg))
@@ -719,10 +743,10 @@ def measure_and_eval(args : Settings):
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device)
 
     th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}.pth')
-
+    result_summary(rejection_results,args.get_args_dict())
 
 if __name__ == '__main__':
-    device_id = 1
+    device_id = 0
     # helper class used to overwrite default settings for a group of experiments
     class ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
@@ -754,7 +778,7 @@ if __name__ == '__main__':
 
     resnet34_svhn = ExpGroupSettings(
         model='ResNet34',
-        dataset='svhn',
+        dataset='SVHN',
         num_classes=10,
         model_cfg={'num_c': 10},
         batch_size=1000,
@@ -780,13 +804,13 @@ if __name__ == '__main__':
 
     densenet_svhn = ExpGroupSettings(
         model='DenseNet3',
-        dataset='svhn',
+        dataset='SVHN',
         num_classes = 10,
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_svhn_ported.pth',
     )
     if device_id%2==0:
-        experiments = [resnet34_cifar10,resnet34_cifar100,resnet34_svhn]
+        experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
     else:
         experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
     setup_logging()
