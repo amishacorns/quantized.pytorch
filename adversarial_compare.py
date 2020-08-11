@@ -642,6 +642,9 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
     # Important! recorder hooks should be removed when done
 
 def result_summary(res_dict,args_dict):
+    ## if not configured setup logging for external caller
+    if not logging.getLogger('').handlers:
+        setup_logging()
     in_dist=args_dict['dataset']
     logging.info(f'Report for {args_dict["model"]} - {in_dist}')
     for red, vd in res_dict[in_dist].items():
