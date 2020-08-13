@@ -14,7 +14,7 @@ import inspect
 from utils.misc import Recorder
 from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 from functools import partial
-
+from typing import Callable,List,Dict
 
 @dataclass
 class Settings:
@@ -24,8 +24,11 @@ class Settings:
     def __repr__(self):
         return str(self.__class__.__name__) + str(self.get_args_dict())
 
-    def __init__(self,
-                 model: str,
+    @staticmethod
+    def _default_matcher_fn(n,m):
+        return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)
+
+    def __init__(self, model: str,
                  model_cfg: dict,
                  batch_size: int = 1000,
                  recompute: bool = False,
@@ -34,19 +37,31 @@ class Settings:
                  device: str = 'cuda',
                  dataset: str = f'cats_vs_dogs',
                  ckt_path: str = '/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
-                 collector_device: str = 'same',  # use cpu or cuda:# if gpu runs OOM
+                 collector_device: str = 'same',  # use cpu or cuda:<#> if gpu runs OOM
                  limit_test: int = None,
                  limit_measure: int = None,
                  test_split: str = 'val',
                  num_classes: int = 2,
                  right_sided_fisher_pvalue: bool = True,
                  transform_dataset: str = None,
-                 ):
+                 spatial_reductions : Dict[str,Callable[[th.Tensor],th.Tensor]] = None,
+                 measure_joint_distribution : bool = False,
+                 ood_datasets : List[str] = None,
+                 include_matcher_fn : Callable[[str,th.nn.Module],bool]= None):
+
         self._dict = {}
         arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
             setattr(self, name, local_vars[name])
             self._dict[name] = getattr(self,name)
+        self.include_matcher_fn = include_matcher_fn or Settings._default_matcher_fn
+
+        if ood_datasets is None:
+            if self.dataset == 'SVHN':
+                self.ood_datasets = ['cifar10']
+            else:
+                self.ood_datasets = ['SVHN']
+            self.ood_datasets += ['folder-Imagenet_resize', 'folder-LSUN_resize']
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
     var1 = var1.clamp(min=epsilon)
@@ -245,15 +260,18 @@ class PvalueMatcher():
             return 1-matching_percentiles
         return matching_percentiles
 
-def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.001, 0.005, 0.025, 0.05, 0.1, 0.15,
-                                                                                  0.2, 0.25, 0.5, 0.75, 0.8, 0.85, 0.9,
-                                                                                  0.95, 0.975, 0.995, 0.999]), right_sided_fisher_pvalue = False):
+def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.0005,0.001, 0.0025, 0.005, 0.025, 0.05, 0.1, 0.15,
+                                                                                  0.2, 0.25, 0.35, 0.5, 0.65, 0.75, 0.8, 0.85, 0.9,
+                                                                                  0.95, 0.975, 0.995, 0.9975,0.999,0.9995]),
+                                right_sided_fisher_pvalue = False,filter_layer=None):
     # this function should return pvalues in the format of (Batch x num_classes)
     per_class_record = []
     # reduce all layers (e.g. fisher)
     for class_stats_per_layer_dict in all_class_ref_stats:
         sum_pval_per_reduction = {}
-        for layer_stats_per_input_dict in class_stats_per_layer_dict.values():
+        for layer_name,layer_stats_per_input_dict in class_stats_per_layer_dict.items():
+            if filter_layer and filter_layer(layer_name):
+                continue
             for reduction_name, record_per_input in layer_stats_per_input_dict.items():
                 for record in record_per_input:
                     if reduction_name in sum_pval_per_reduction:
@@ -282,14 +300,19 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
     return per_class_record
 
 class OODDetector():
-    def __init__(self, model, num_classes,channle_reducer_fn, output_pval_matcher):
-        self.output_pval_matcher = output_pval_matcher
-        self.num_classes = num_classes
+    def __init__(self, model, all_class_ref_stats, right_sided_fisher_pvalue,
+                 include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)):
+
         self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
-                                       include_matcher_fn=lambda n, m: isinstance(m,th.nn.BatchNorm2d) or
-                                                                       isinstance(m, th.nn.Linear),
-                                       input_fn=channle_reducer_fn,
+                                       include_matcher_fn=include_matcher_fn,
+                                       input_fn=gen_simes_reducer_fn(all_class_ref_stats),
                                        recursive=True, device_modifier='same')
+
+        self.output_pval_matcher = extract_output_distribution(all_class_ref_stats,
+                                                               right_sided_fisher_pvalue=right_sided_fisher_pvalue,
+                                                               filter_layer=lambda n: n not in self.stats_recorder.tracked_modules)
+        self.num_classes = len(all_class_ref_stats)
+
 
     # helper function to convert per class per reduction to per reduction per class dictionary
     def _gen_output_dict(self,per_class_per_reduction_record):
@@ -306,12 +329,14 @@ class OODDetector():
         return reduction_stats_collection
 
     # this function should return pvalues in the format of (Batch x num_classes)
+    # todo merge this with extract_output_distribution fisher compute (iterate over tracked modules
+    #  instead of record entries)
     def get_fisher(self):
         per_class_record = []
         # reduce all layers (e.g. fisher)
         for class_id in range(self.num_classes):
             sum_pval_per_reduction = {}
-            # iterate over recorder to aggragate per layer statistics for the new batch
+            # iterate over recorder to aggregate per layer statistics for the new batch
             for layer_pvalues_per_class in self.stats_recorder.record.values():
                 for reduction_name,pval_per_input in layer_pvalues_per_class[class_id].items():
                     for pval in pval_per_input:
@@ -340,14 +365,17 @@ def calc_simes(pval):
 def spatial_mean(x):
     return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
 
-# k will ignore k-1 most extreme values, todo choose value to match percentile ()
-def spatial_edges(x,k=1,is_max=True,):
-    x_ = x
-    if x.dim() < 3:
+def dim_reducer(x):
+    if x.dim() <= 3:
         return x
 
-    if x.dim()>3:
-        x_ = x.view(x.shape[0], x.shape[1], -1)
+    return x.view(x.shape[0], x.shape[1], -1)
+
+# k will ignore k-1 most extreme values, todo choose value to match percentile ()
+def spatial_edges(x,k=1,is_max=True,):
+    if x.dim() < 3:
+        return x
+    x_ = dim_reducer(x)
 
     ret = x_.topk(k, -1, is_max)[0]
     if is_max:
@@ -364,7 +392,14 @@ def spatial_max(x,k=1):
 def spatial_margin(x,k=1):
     return spatial_max(x,k)-spatial_min(x,k)
 
+def spatial_fuse(x,k=1):
+    return 0.5*(spatial_mean(x)+spatial_margin(x,k))
 
+def spatial_l2(x):
+    if x.dim() < 3:
+        return x
+
+    return th.norm(dim_reducer(x), dim=-1)
 
 
 ## auxilary data containers
@@ -392,17 +427,21 @@ class BatchStatsCollectorCfg():
     partial_stats: bool = False
     update_tracker: bool = True
     find_simes: bool = False
-    reduction_dictionary = {
-        'spatial-mean': spatial_mean,
-        'spatial-max': spatial_max,
-        'spatial-min': spatial_min,
-        'spatial-margin': partial(spatial_margin,k=1)
-    }
     target_percentiles = [0.001, 0.005, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.5,
                0.75, 0.8, 0.85, 0.9, 0.95, 0.975, 0.995, 0.999]
     num_edge_samples: int = 70
 
-    def __init__(self,batch_size):
+    def __init__(self,batch_size,reduction_dictionary = None,include_matcher_fn = None):
+        # which reductions to use ?
+        self.reduction_dictionary = reduction_dictionary or {
+            'spatial-mean': spatial_mean,
+            'spatial-max': spatial_max,
+            'spatial-min': spatial_min,
+            'spatial-margin': partial(spatial_margin, k=1),
+            # 'spatial-l2':spatial_l2
+        }
+        # which layers to collect?
+        self.include_matcher_fn = include_matcher_fn or (lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear))
         # adjust percentiles to the specified batch size
         if self.target_percentiles:
             self.target_percentiles = th.tensor(self.target_percentiles).clamp_(1/batch_size,1-1/batch_size).unique()
@@ -502,7 +541,7 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
 
     model.to(model_device)
     r = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
-                 include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear),
+                 include_matcher_fn=measure_settings.include_matcher_fn,
                  input_fn=_batch_stats_collector,
                  activation_reducer_fn=_batch_stats_reducer, recursive=True, device_modifier='same')
 
@@ -544,93 +583,113 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
     model.to(model_device)
     top1 = AverageMeter()
     top5 = AverageMeter()
-    # rejected = {'spatial-mean':AverageMeter(),
-    #             'spatial-max':AverageMeter(),
-    #             'spatial-min':AverageMeter(),
-    #             'spatial-margin':AverageMeter()}
 
-    rejected = {'spatial-mean':MeterDict(meter_factory=batched_meter_factory),
-                'spatial-max':MeterDict(meter_factory=batched_meter_factory),
-                'spatial-min':MeterDict(meter_factory=batched_meter_factory),
-                'spatial-margin':MeterDict(meter_factory=batched_meter_factory)}
+    rejected = {}
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
             out = model(d.to(model_device)).cpu()
-            correct_predictions = l == out.argmax(1)
+            predicted = out.argmax(1)
+            correct_predictions = l == predicted
             if in_dist:
                 t1, t5 = accuracy(out, l, (1, 5))
                 top1.update(t1, out.shape[0])
                 top5.update(t5, out.shape[0])
-                logging.info(f'\nPrec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
+                logging.info(f'\nModel Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
                              f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
             pvalues_dict = detector.get_fisher()
+            last_reduction_pvalues = {}
             for reduction_name,pvalues in pvalues_dict.items():
                 pvalues=pvalues.squeeze().cpu()
-                #aggragate pvalues or return per reduction score
-                # todo:
-                #  1. split rejection statistics between correct and incorrect model predictions
-                #  2. check rejection rate according to all class statistics (i.e. reject only if pval is unlikely
-                #  under all class reference)
-                #  3. compute accuracy according to maximum likelihood class from 2.
+                # aggragate pvalues or return per reduction score
                 best_class_pval, best_class_pval_id = pvalues.max(1)
                 class_conditional_pval = pvalues[th.arange(l.shape[0]), out.argmax(1)]
                 correct_pred_conditional_pval = class_conditional_pval[correct_predictions]
                 true_class_pval = pvalues[th.arange(l.shape[0]), l]
-                # if class_conditional:
-                #     if in_dist and not use_labels:
-                #         # for a fair comparison measure rejection rate only on samples that are correctly classified
-                #         pvalues_for_val = correct_pred_conditional_pval
-                #         #rejected[reduction_name].update((correct_pred_conditional_pval < alpha).float().mean(), correct_predictions.sum())
-                #     elif in_dist and use_labels:
-                #         # use labels to evaluate rejection rate instead of predicted class as an alternative to the first
-                #         #rejected[reduction_name].update((true_class_pval < alpha).float().mean(), out.shape[0])
-                #         pvalues_for_val = true_class_pval
-                #     else:
-                #         # class conditional when not in distribution - this is the normal operation mode
-                #         #rejected[reduction_name].update((class_conditional_pval < alpha).float().mean(), out.shape[0])
-                #         pvalues_for_val = class_conditional_pval
-                # else:
-                #     #rejected[reduction_name].update((best_class_pval < alpha).float().mean(), out.shape[0])
-                #     pvalues_for_val = best_class_pval
-
-                def _gen_curve(pvalues_for_val,):
+                def _gen_curve(pvalues_for_val):
                     rejected_ = []
                     for alpha_ in alpha_list:
                         rejected_.append((pvalues_for_val < alpha_).float().unsqueeze(1))
                     return th.cat(rejected_,1)
+
                 # measure rejection rates for a range of pvalues under each measure and each reduction
+                if reduction_name not in rejected:
+                    rejected[reduction_name] = MeterDict(meter_factory=batched_meter_factory)
+                # keep track of pvalue predictions
+                last_reduction_pvalues[reduction_name]={
+                    'class_conditional_pval': class_conditional_pval,
+                    'max_pval': best_class_pval
+                }
+
                 rejected[reduction_name].update({
                     'class_conditional_pval': _gen_curve(class_conditional_pval),
                     'max_pval': _gen_curve(best_class_pval),
                 })
                 if in_dist:
+                    last_reduction_pvalues[reduction_name].update({
+                        'true_class_pval' : true_class_pval,
+                        'class_conditional_correct_only_pval' : correct_pred_conditional_pval
+                    })
+
                     rejected[reduction_name].update({
                         'true_class_pval' : _gen_curve(true_class_pval),
                         'class_conditional_correct_only_pval' : _gen_curve(correct_pred_conditional_pval)
                     })
 
-                # we typically evaluate only in/out dist data at a time so we only care about rejection rate
-                # (instead of accuracy)
-                if in_dist:
-                    predicted = out.max(1)[1].cpu()
-                    t1_likely,t5_likely = accuracy(pvalues.squeeze(),l,(1,5))
-                    agreement = (best_class_pval_id.cpu() == predicted)
-                    agreement_true = (agreement == (predicted == l))
-                    agreement_false =  pvalues[predicted != l]
-                    logging.info(f'{reduction_name}: rejected: {rejected[reduction_name]["max_pval"].mean.numpy()}\t'
-                                 f'Prec@1 {t1_likely:0.3f}, Prec@5 {t5_likely:.3f}\n'
-                                 f'\tagreement: {agreement.float().mean():.3f},\t'
-                                 f'agreement on true: {agreement_true.float().mean():.3f},\t'
-                                 f'agreement on false {agreement_false.float().mean():.3f}')
-                # we typically evaluate only in/out dist data at a time so we only care about rejection rate
-                # (instead of accuracy)
+            ## in this section we can fuse different reductions to produce a potentially stronger rejection method
+            if 'fused_pval_mean_margin' not in rejected:
+                # prime fusion meters
+                for fusion in ['fused_pval_mean_margin','fused_pval_min_max','fused_pval_min_max_mean', 'fused_pval_all']:
+                    rejected[fusion]=MeterDict(meter_factory=batched_meter_factory)
 
+            # for now we only do this for max-pval rejection method
+            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
+                                 last_reduction_pvalues['spatial-margin']['max_pval']], 1)).squeeze()
+            rejected['fused_pval_mean_margin'].update({'max_pval': _gen_curve(fused_pval)})
+
+            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-min']['max_pval'],
+                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            rejected['fused_pval_min_max'].update({'max_pval': _gen_curve(fused_pval)})
+
+            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
+                                              last_reduction_pvalues['spatial-min']['max_pval'],
+                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            rejected['fused_pval_min_max_mean'].update({'max_pval': _gen_curve(fused_pval)})
+
+            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-margin']['max_pval'],
+                                              last_reduction_pvalues['spatial-mean']['max_pval'],
+                                              last_reduction_pvalues['spatial-min']['max_pval'],
+                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            rejected['fused_pval_all'].update({'max_pval': _gen_curve(fused_pval)})
+
+            ## end batch report
+            # report accuracy and pvalue stats for in-dist dataset
+            if in_dist:
+                t1_likely, t5_likely = accuracy(pvalues.squeeze(), l, (1, 5))
+                false_pred_pvalus = pvalues[th.logical_not(correct_predictions)]
+                logging.info(f'Prec@1 {t1_likely:0.3f}, Prec@5 {t5_likely:.3f}'
+                             f'\tFalse pred avg pvalue {false_pred_pvalus.float().mean():.3f}')
+            # per reduction summary
+            for reduction_name in rejected.keys():
+                logging.info(f'{reduction_name}:')
+                if in_dist and reduction_name in last_reduction_pvalues:
+                    # additional in-dist results per reduction
+                    best_class_pval_id = last_reduction_pvalues[reduction_name]['true_class_pval']
+                    # model prediction agrees with selected pvalue
+                    agreement = (best_class_pval_id == predicted)
+                    # agreement only on predictions that are correct
+                    agreement_true = (agreement == correct_predictions)
+                    logging.info(f'\tagreement: {agreement.float().mean():.3f},'
+                                 f'\tagreement on true: {agreement_true.float().mean():.3f}')
+                # reduction rejected report
+                logging.info(f'\tRejected: {rejected[reduction_name]["max_pval"].mean.numpy()[:10]}')
+
+        ## end of eval report
         if in_dist:
             logging.info(f'\nModel prediction :Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
                          f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
         ret_dict = {}
         for reduction_name, rejected_p in rejected.items():
-            logging.info(f'{reduction_name} rejected: {rejected_p["max_pval"].mean.numpy()}')
+            logging.info(f'{reduction_name} rejected: {rejected[reduction_name]["max_pval"].mean.numpy()[:10]}')
             ## strip meter dict functionality for simpler post-processing
             reduction_dict = {}
             for k,v in rejected_p.items():
@@ -684,26 +743,38 @@ def measure_and_eval(args : Settings):
 
     expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=args.augment_measure)
     expected_transform_test = get_transform(args.transform_dataset or args.dataset, augment=args.augment_test)
-    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}.pth'
+    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{"_joint" if args.measure_joint_distribution else ""}.pth'
     if not args.recompute and os.path.exists(calibrated_path):
         all_class_ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
     else:
         ds = get_dataset(args.dataset, 'train', expected_transform_measure)
-        classes = ds.classes if hasattr(ds,'classes') else range(args.num_classes)
+        if args.measure_joint_distribution:
+            classes = ['all']
+        else:
+            classes = ds.classes if hasattr(ds,'classes') else range(args.num_classes)
         if args.limit_measure:
             ds=limit_ds(ds,args.limit_measure,per_class=True)
         all_class_ref_stats=[]
         targets = th.tensor(ds.targets) if hasattr(ds,'targets') else  th.tensor(ds.labels)
         for class_id,class_name in enumerate(classes):
             logging.info(f'collecting stats for class {class_name}')
-            sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0])
+            if not args.measure_joint_distribution:
+                sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0])
+            else:
+                sampler = th.utils.data.RandomSampler(ds)
+
             train_loader = th.utils.data.DataLoader(
                     ds, sampler=sampler,
                     batch_size=args.batch_size, shuffle=False,
                     num_workers=8, pin_memory=True, drop_last=True)
-
-            all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs, model_device=args.device,
-                                                collector_device=args.collector_device, batch_size=args.batch_size))
+            measure_settings = BatchStatsCollectorCfg(args.batch_size,reduction_dictionary=args.reduction_dictionary,
+                                                      # todo: maybe split measure and test include fn in Settings
+                                                      include_matcher_fn=args.include_matcher_fn)
+            all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs,
+                                                               model_device=args.device,
+                                                               collector_device=args.collector_device,
+                                                               batch_size=args.batch_size,
+                                                               measure_settings=measure_settings))
         logging.info('saving reference stats dict')
         th.save(all_class_ref_stats, calibrated_path)
 
@@ -713,8 +784,8 @@ def measure_and_eval(args : Settings):
     # get the pvalue estimators per class per reduction for the channel and final output functions
     # here we can implement subsample channles and other layer reductions exept Fisher
     # todo add Specs to fuse the pvalue matcher and OODDetector as they are tightly coupled.
-    output_pval_matcher = extract_output_distribution(all_class_ref_stats,right_sided_fisher_pvalue=args.right_sided_fisher_pvalue)
-    detector = OODDetector(model,args.num_classes,gen_simes_reducer_fn(all_class_ref_stats),output_pval_matcher)
+    detector = OODDetector(model,all_class_ref_stats,right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
+                           include_matcher_fn=args.include_matcher_fn)
 
     # todo replace all targets to in or out of distribution?
     # todo add adversarial samples test
@@ -728,13 +799,8 @@ def measure_and_eval(args : Settings):
             num_workers=8, pin_memory=True, drop_last=True)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,in_dist=True)
     logging.info(f'evaluating outliers')
-    ood_datasets = ['folder-LSUN_resize', 'folder-Imagenet_resize']
-    if args.dataset == 'SVHN':
-        ood_datasets += ['cifar10']
-    else:
-        ood_datasets += ['SVHN']
 
-    for ood_dataset in ood_datasets:
+    for ood_dataset in args.ood_datasets:
         ood_ds = get_dataset(ood_dataset, 'val',expected_transform_test)
         if args.limit_test:
             ood_ds = limit_ds(ood_ds,args.limit_test,per_class=False)
@@ -788,12 +854,32 @@ if __name__ == '__main__':
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_svhn.pth',
     )
 
+
+    ## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
+    # specifically for denesent)
+    def include_densenet_even_layers_fn(n, m):
+        #n is the trace name, m is the actual module which can be used to target modules with specific attributes
+        return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or isinstance(m, th.nn.Linear)
+    # helper functions for more expressive layer filtering
+    def gen_filter_by_name_list(list_of_layer_names):
+        def include_layer_by_name_fn(n, m):
+            return n in list_of_layer_names
+        return include_layer_by_name_fn
+
+    import re
+    def gen_filter_by_regx(pattern):
+        def include_layer_by_name_fn(n, m):
+            #n is the trace name, m is the actual module which can be used to target modules with specific attributes
+            return bool(re.fullmatch(pattern,n))
+        return include_layer_by_name_fn
+
     densenet_cifar10 = ExpGroupSettings(
         model='DenseNet3',
         dataset='cifar10',
         num_classes=10,
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_cifar10_ported.pth',
+        include_matcher_fn=include_densenet_even_layers_fn
     )
 
     densenet_cifar100 = ExpGroupSettings(
@@ -803,6 +889,7 @@ if __name__ == '__main__':
         model_cfg={'num_classes': 100,'depth':100},
         ckt_path='densenet_cifar100_ported.pth',
         batch_size=500,
+        include_matcher_fn=include_densenet_even_layers_fn
         )
 
     densenet_svhn = ExpGroupSettings(
@@ -811,11 +898,25 @@ if __name__ == '__main__':
         num_classes = 10,
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_svhn_ported.pth',
+        include_matcher_fn=include_densenet_even_layers_fn
     )
-    if device_id%2==0:
-        experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
-    else:
-        experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
+
+    # this can be used used to produced measure stats dict on ood data for a given model
+    densenet_svhn_cross_cifar10 = ExpGroupSettings(
+        model='DenseNet3',
+        dataset='cifar10',
+        transform_dataset='SVHN',
+        num_classes = 10,
+        model_cfg={'num_classes': 10,'depth':100},
+        ckt_path='densenet_svhn_ported.pth',
+        include_matcher_fn=include_densenet_even_layers_fn
+    )
+
+    # if device_id%2==0:
+    #     experiments = [resnet34_svhn] #[resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
+    # else:
+    #     experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
+    experiments = [densenet_svhn_cross_cifar10]
     setup_logging()
     for args in experiments:
         logging.info(args)
