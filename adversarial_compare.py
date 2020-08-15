@@ -16,6 +16,10 @@ from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 from functools import partial
 from typing import Callable,List,Dict
 
+
+def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
+    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)
+
 @dataclass
 class Settings:
     def get_args_dict(self):
@@ -23,10 +27,6 @@ class Settings:
 
     def __repr__(self):
         return str(self.__class__.__name__) + str(self.get_args_dict())
-
-    @staticmethod
-    def _default_matcher_fn(n,m):
-        return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)
 
     def __init__(self, model: str,
                  model_cfg: dict,
@@ -46,22 +46,19 @@ class Settings:
                  transform_dataset: str = None,
                  spatial_reductions : Dict[str,Callable[[th.Tensor],th.Tensor]] = None,
                  measure_joint_distribution : bool = False,
+                 tag :str = '',
                  ood_datasets : List[str] = None,
-                 include_matcher_fn : Callable[[str,th.nn.Module],bool]= None):
+                 include_matcher_fn : Callable[[str,th.nn.Module],bool]= _default_matcher_fn):
 
         self._dict = {}
         arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
             setattr(self, name, local_vars[name])
             self._dict[name] = getattr(self,name)
-        self.include_matcher_fn = include_matcher_fn or Settings._default_matcher_fn
-
-        if ood_datasets is None:
-            if self.dataset == 'SVHN':
-                self.ood_datasets = ['cifar10']
-            else:
-                self.ood_datasets = ['SVHN']
-            self.ood_datasets += ['folder-Imagenet_resize', 'folder-LSUN_resize']
+        if self.ood_datasets is None:
+            self.ood_datasets = ['cifar10', 'SVHN', 'folder-Imagenet_resize', 'folder-LSUN_resize']
+        if self.dataset in self.ood_datasets:
+            self.ood_datasets.pop(self.ood_datasets.index(self.dataset))
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
     var1 = var1.clamp(min=epsilon)
@@ -260,10 +257,17 @@ class PvalueMatcher():
             return 1-matching_percentiles
         return matching_percentiles
 
-def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.0005,0.001, 0.0025, 0.005, 0.025, 0.05, 0.1, 0.15,
-                                                                                  0.2, 0.25, 0.35, 0.5, 0.65, 0.75, 0.8, 0.85, 0.9,
-                                                                                  0.95, 0.975, 0.995, 0.9975,0.999,0.9995]),
+def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.05,
+                                                                                  0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+                                                                                  # decision for fisher is right sided
+                                                                                  0.945, 0.94625, 0.9475, 0.94875,
+                                                                                  0.95,# target alpha upper 5%
+                                                                                  0.95125, 0.9525,0.95375, 0.955,
+                                                                                  # add more abnormal percentiles for fusions
+                                                                                  0.97,0.98,0.99, 0.995,0.999,0.9995,0.9999]),
                                 right_sided_fisher_pvalue = False,filter_layer=None):
+
+
     # this function should return pvalues in the format of (Batch x num_classes)
     per_class_record = []
     # reduce all layers (e.g. fisher)
@@ -283,10 +287,11 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
         # update fisher pvalue per reduction
         fisher_pvals_per_reduction = {}
         for reduction_name, sum_pval in sum_pval_per_reduction.items():
-            meter = OnlineMeter(batched=True, track_percentiles=True,
-                                target_percentiles= target_percentiles.clamp_(
-                                1/sum_pval.shape[0],1-1/sum_pval.shape[0]).unique(),
-                                                                per_channel=False, number_edge_samples=70,
+            # adjust percentiles to the total number of samples
+            adjusted_target_percentiles = (((target_percentiles + (1 / sum_pval.shape[0] / 2)) // (1 / sum_pval.shape[0])) /
+                                  sum_pval.shape[0]).unique()
+            meter = OnlineMeter(batched=True, track_percentiles=True, target_percentiles= adjusted_target_percentiles,
+                                                                per_channel=False, number_edge_samples=10,
                                                                 track_cov=False)
             meter.update(sum_pval)
             # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
@@ -310,7 +315,7 @@ class OODDetector():
 
         self.output_pval_matcher = extract_output_distribution(all_class_ref_stats,
                                                                right_sided_fisher_pvalue=right_sided_fisher_pvalue,
-                                                               filter_layer=lambda n: n not in self.stats_recorder.tracked_modules)
+                                                               filter_layer=lambda n: n not in self.stats_recorder.tracked_modules.keys())
         self.num_classes = len(all_class_ref_stats)
 
 
@@ -427,9 +432,12 @@ class BatchStatsCollectorCfg():
     partial_stats: bool = False
     update_tracker: bool = True
     find_simes: bool = False
-    target_percentiles = [0.001, 0.005, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.5,
-               0.75, 0.8, 0.85, 0.9, 0.95, 0.975, 0.995, 0.999]
-    num_edge_samples: int = 70
+    target_percentiles = th.tensor([0.001, 0.002, 0.005,0.01,
+                          # estimate more percentiles next to the target alpha
+                          0.02, 0.022, 0.024,0.025,0.0226, 0.027 ,0.03,
+                          # collect intervals for better layer reduction statistic approximation
+                          0.05, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5]) # percentiles will be mirrored
+    num_edge_samples: int = 150
 
     def __init__(self,batch_size,reduction_dictionary = None,include_matcher_fn = None):
         # which reductions to use ?
@@ -442,9 +450,10 @@ class BatchStatsCollectorCfg():
         }
         # which layers to collect?
         self.include_matcher_fn = include_matcher_fn or (lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear))
+        assert 0.5 == self.target_percentiles[-1], 'tensor must include median'
+        self.target_percentiles = th.cat([self.target_percentiles, (1 - self.target_percentiles).sort()[0]])
         # adjust percentiles to the specified batch size
-        if self.target_percentiles:
-            self.target_percentiles = th.tensor(self.target_percentiles).clamp_(1/batch_size,1-1/batch_size).unique()
+        self.target_percentiles = (((self.target_percentiles+(1/batch_size/2)) // (1/batch_size))/batch_size ).unique()
 
 def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collector_device='same', batch_size=1000,
                             measure_settings : BatchStatsCollectorCfg = None):
@@ -712,13 +721,13 @@ def result_summary(res_dict,args_dict):
         logging.info(red)
         for n, p in vd.items():
             rejected = {}
-            pvalues_under_alpha = [i for i in p.mean.tolist() if i < 0.051]
+            pvalues_under_alpha = [i for i in p.mean.tolist() if i < 0.056]
             pvalues_id = len(pvalues_under_alpha)
             for k, ood_v in res_dict.items():
                 if k != in_dist and n in ood_v[red]:
-                    rejected[k] = (ood_v[red][n].mean[pvalues_id].numpy())
+                    rejected[k] = (ood_v[red][n].mean[max(pvalues_id- 1,0)].numpy())
             ids.append(pvalues_id)
-            res.append(pvalues_under_alpha[pvalues_id - 1])
+            res.append( p.mean[0] if pvalues_id==0 else pvalues_under_alpha[pvalues_id- 1])
             logging.info(f'\t {n}: {res[-1]:.3f} ({pvalues_id / 100})')
             for kk, vv in rejected.items():
                 logging.info(f'\t\t{kk}: {vv:0.3f}')
@@ -736,14 +745,17 @@ def measure_and_eval(args : Settings):
 
     model.load_state_dict(checkpoint)
 
+
+    expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=args.augment_measure)
+    expected_transform_test = get_transform(args.transform_dataset or args.dataset, augment=args.augment_test)
     if args.augment_measure:
+        import torchvision.transforms.transforms as ttf
+        expected_transform_measure.transforms[0] = ttf.RandomResizedCrop((32, 32), scale=(0.7, 1))
         epochs = 5
     else:
         epochs = 1
 
-    expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=args.augment_measure)
-    expected_transform_test = get_transform(args.transform_dataset or args.dataset, augment=args.augment_test)
-    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{"_joint" if args.measure_joint_distribution else ""}.pth'
+    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{"_joint" if args.measure_joint_distribution else ""}{args.tag}.pth'
     if not args.recompute and os.path.exists(calibrated_path):
         all_class_ref_stats = th.load(calibrated_path,map_location=lambda storage, loc: storage)
     else:
@@ -758,16 +770,19 @@ def measure_and_eval(args : Settings):
         targets = th.tensor(ds.targets) if hasattr(ds,'targets') else  th.tensor(ds.labels)
         for class_id,class_name in enumerate(classes):
             logging.info(f'collecting stats for class {class_name}')
+            # if not args.measure_joint_distribution:
+            #     sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0])
+            # else:
             if not args.measure_joint_distribution:
-                sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0])
+                ds_ = th.utils.data.Subset(ds,th.where(targets==class_id)[0])
             else:
-                sampler = th.utils.data.RandomSampler(ds)
-
+                ds_ = ds
+            sampler = th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
             train_loader = th.utils.data.DataLoader(
-                    ds, sampler=sampler,
-                    batch_size=args.batch_size, shuffle=False,
-                    num_workers=8, pin_memory=True, drop_last=True)
-            measure_settings = BatchStatsCollectorCfg(args.batch_size,reduction_dictionary=args.reduction_dictionary,
+                    ds_, sampler=sampler,
+                    batch_size=args.batch_size, shuffle=False if sampler else True,
+                    num_workers=8, pin_memory=True, drop_last=False)
+            measure_settings = BatchStatsCollectorCfg(args.batch_size,reduction_dictionary=args.spatial_reductions,
                                                       # todo: maybe split measure and test include fn in Settings
                                                       include_matcher_fn=args.include_matcher_fn)
             all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs,
@@ -811,112 +826,115 @@ def measure_and_eval(args : Settings):
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device)
 
-    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}.pth')
+    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}{args.tag}.pth')
     result_summary(rejection_results,args.get_args_dict())
 
+## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
+# specifically for denesent)
+def include_densenet_even_layers_fn(n, m):
+    #n is the trace name, m is the actual module which can be used to target modules with specific attributes
+    return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or isinstance(m, th.nn.Linear)
+# helper functions for more expressive layer filtering
+class WhiteListInclude():
+    def __init__(self,layer_white_list):
+        self.layer_white_list = layer_white_list
+    def __call__(self,n, m):
+        return n in self.layer_white_list
+
+import re
+class RegxInclude():
+    def __init__(self,pattern):
+        self.pattern = pattern
+
+    def __call__(self,n, m):
+        #n is the trace name, m is the actual module which can be used to target modules with specific attributes
+        return bool(re.fullmatch(self.pattern,n))
+
+# reminder we look at the input of layers, following layers used by mhalanobis paper
+densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3','avg_pool'])
+resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
-    device_id = 0
-    # helper class used to overwrite default settings for a group of experiments
-    class ExpGroupSettings(Settings):
+    exp_id = 0
+    # resnet18_cats_dogs = Settings(
+    #     model='resnet',
+    #     dataset='cats_vs_dogs',
+    #     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
+    #     ckt_path='/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
+    #     device=f'cuda:{device_id}'
+    # )
+    class R34ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
-            super().__init__(device=f'cuda:{device_id}',**kwargs)
-
-    resnet18_cats_dogs = ExpGroupSettings(
-        model='resnet',
-        dataset='cats_vs_dogs',
-        model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
-        ckt_path='/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar'
-    )
-
-    resnet34_cifar10 = ExpGroupSettings(
-        model='ResNet34',
+            super().__init__(model='ResNet34', #include_matcher_fn=resnet_mahalanobis_matcher_fn,, tag='-@mahalanobis',
+                             device=f'cuda:{exp_id % th.cuda.device_count()}',
+                             augment_measure=False, recompute=True, **kwargs)
+    resnet34_cifar10 = R34ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
         model_cfg={'num_c': 10},
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth',
     )
 
-    resnet34_cifar100 = ExpGroupSettings(
-        model='ResNet34',
+    resnet34_cifar100 = R34ExpGroupSettings(
         dataset='cifar100',
         num_classes=100,
         model_cfg={'num_c': 100},
-        batch_size=500,
+        batch_size=1000,
+        collector_device='cuda:3',
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
     )
 
-    resnet34_svhn = ExpGroupSettings(
-        model='ResNet34',
+    resnet34_svhn = R34ExpGroupSettings(
         dataset='SVHN',
         num_classes=10,
         model_cfg={'num_c': 10},
         batch_size=1000,
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_svhn.pth',
     )
-
-
-    ## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
-    # specifically for denesent)
-    def include_densenet_even_layers_fn(n, m):
-        #n is the trace name, m is the actual module which can be used to target modules with specific attributes
-        return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or isinstance(m, th.nn.Linear)
-    # helper functions for more expressive layer filtering
-    def gen_filter_by_name_list(list_of_layer_names):
-        def include_layer_by_name_fn(n, m):
-            return n in list_of_layer_names
-        return include_layer_by_name_fn
-
-    import re
-    def gen_filter_by_regx(pattern):
-        def include_layer_by_name_fn(n, m):
-            #n is the trace name, m is the actual module which can be used to target modules with specific attributes
-            return bool(re.fullmatch(pattern,n))
-        return include_layer_by_name_fn
-
-    densenet_cifar10 = ExpGroupSettings(
-        model='DenseNet3',
+    class DN3ExpGroupSettings(Settings):
+        def __init__(self,**kwargs):
+            super().__init__(model='DenseNet3', include_matcher_fn=densenet_mahalanobis_matcher_fn,
+                             device=f'cuda:{exp_id}', tag='-@mhalanobis', **kwargs)
+    densenet_cifar10 = DN3ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_cifar10_ported.pth',
-        include_matcher_fn=include_densenet_even_layers_fn
     )
 
-    densenet_cifar100 = ExpGroupSettings(
-        model='DenseNet3',
+    densenet_cifar100 = DN3ExpGroupSettings(
         dataset='cifar100',
         num_classes=100,
         model_cfg={'num_classes': 100,'depth':100},
         ckt_path='densenet_cifar100_ported.pth',
         batch_size=500,
-        include_matcher_fn=include_densenet_even_layers_fn
+        collector_device='cuda:3'
         )
 
-    densenet_svhn = ExpGroupSettings(
-        model='DenseNet3',
+    densenet_svhn = DN3ExpGroupSettings(
         dataset='SVHN',
         num_classes = 10,
         model_cfg={'num_classes': 10,'depth':100},
         ckt_path='densenet_svhn_ported.pth',
-        include_matcher_fn=include_densenet_even_layers_fn
     )
 
-    # this can be used used to produced measure stats dict on ood data for a given model
-    densenet_svhn_cross_cifar10 = ExpGroupSettings(
-        model='DenseNet3',
-        dataset='cifar10',
-        transform_dataset='SVHN',
-        num_classes = 10,
-        model_cfg={'num_classes': 10,'depth':100},
-        ckt_path='densenet_svhn_ported.pth',
-        include_matcher_fn=include_densenet_even_layers_fn
-    )
+    # # this can be used used to produced measure stats dict on ood data for a given model
+    # densenet_svhn_cross_cifar10 = ExpGroupSettings(
+    #     model='DenseNet3',
+    #     dataset='cifar10',
+    #     transform_dataset='SVHN',
+    #     num_classes = 10,
+    #     model_cfg={'num_classes': 10,'depth':100},
+    #     ckt_path='densenet_svhn_ported.pth',
+    #     include_matcher_fn=densenet_mahalanobis_matcher_fn
+    # )
 
     # if device_id%2==0:
-    #     experiments = [resnet34_svhn] #[resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
+    #     experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
     # else:
     #     experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
-    experiments = [densenet_svhn_cross_cifar10]
+    #experiments = [densenet_svhn_cross_cifar10]
+    experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
+    experiments = [experiments[exp_id]]
     setup_logging()
     for args in experiments:
         logging.info(args)
