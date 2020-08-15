@@ -95,6 +95,7 @@ class DenseNet3(nn.Module):
         # global average pooling and classifier
         self.bn1 = nn.BatchNorm2d(in_planes)
         self.relu = nn.ReLU(inplace=True)
+        self.avg_pool = nn.AvgPool2d(8)
         self.fc = nn.Linear(in_planes, num_classes)
         self.in_planes = in_planes
 
@@ -114,7 +115,7 @@ class DenseNet3(nn.Module):
         out = self.trans2(self.block2(out))
         out = self.block3(out)
         out = self.relu(self.bn1(out))
-        out = F.avg_pool2d(out, 8)
+        out = self.avg_pool(out)
         out = out.view(-1, self.in_planes)
         return self.fc(out)
     
