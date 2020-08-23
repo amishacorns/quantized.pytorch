@@ -218,6 +218,12 @@ def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False
     return dataset
 
 def limit_ds(dataset, n_samples,per_class=True,shuffle=True,seed=0,allowed_classes=None):
+    if not hasattr(dataset,'targets'):
+        if hasattr(dataset,'labels'):
+            dataset.targets=dataset.labels
+        else:
+            assert 0, 'dataset not supported'
+
     if per_class:
         id_reg_per_class = {}
         # map id to class label
@@ -241,7 +247,7 @@ def limit_ds(dataset, n_samples,per_class=True,shuffle=True,seed=0,allowed_class
         ids = torch.cat(ids)
     else:
         if shuffle:
-            ids = torch.randperm(len(dataset.targets), generator=torch.Generator().manual_seed(seed))[:n_samples]
+            ids = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:n_samples]
         else:
             ids = torch.arange(0,n_samples)
     ds = torch.utils.data.Subset(dataset,ids)
