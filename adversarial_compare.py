@@ -16,7 +16,6 @@ from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 from functools import partial
 from typing import Callable,List,Dict
 
-
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
     return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)
 
@@ -219,22 +218,24 @@ def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ra
     # fig.waitforbuttonpress()
     pass
 
-def gen_simes_reducer_fn(ref_stats_dict):
-    def _batch_calc_simes(trace_name, m, inputs):
+def gen_inference_fn(ref_stats_dict):
+    def _batch_calc(trace_name, m, inputs):
         class_specific_stats = []
         for class_stat_dict in ref_stats_dict:
             reduction_specific_record = {}
             for reduction_name, reduction_stat in class_stat_dict[trace_name[:-8]].items():
                 pval_per_input = []
                 for e, per_input_stat in enumerate(reduction_stat):
+                    ret_channel_strategy={}
+                    assert isinstance(per_input_stat,BatchStatsCollectorRet)
                     reduced = per_input_stat.reduction_fn(inputs[e])
-                    pval = per_input_stat.meter.pval_matcher(reduced)
-                    ## for now just reduce channles using simes
-                    pval_per_input.append(calc_simes(pval))
+                    for channle_reduction_name,rec in per_input_stat.channel_reduction_record.items():
+                        ret_channel_strategy[channle_reduction_name] = rec['fn'](reduced)
+                    pval_per_input.append(ret_channel_strategy)
                 reduction_specific_record[reduction_name] = pval_per_input
             class_specific_stats.append(reduction_specific_record)
         return class_specific_stats
-    return _batch_calc_simes
+    return _batch_calc
 
 
 class PvalueMatcher():
@@ -242,9 +243,8 @@ class PvalueMatcher():
         self.percentiles = percentiles
         self.quantiles = quantiles.t().unsqueeze(0)
         self.num_percentiles = percentiles.shape[0]
-        self.two_side = two_side
         self.right_side = right_side
-        assert not (self.two_side and self.right_side)
+        self.two_side = (not right_side) and two_side
 
     ## todo document!
     def __call__(self, x):
@@ -266,6 +266,96 @@ class PvalueMatcher():
             return 1-matching_percentiles
         return matching_percentiles
 
+class PvalueMatcherFromSamples(PvalueMatcher):
+    def __init__(self, samples, target_percentiles=th.tensor([0.05,
+                                                                  0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+                                                                  # decision for fisher is right sided
+                                                                  0.945, 0.94625, 0.9475, 0.94875,
+                                                                  0.95,  # target alpha upper 5%
+                                                                  0.95125, 0.9525, 0.95375, 0.955,
+                                                                  # add more abnormal percentiles for fusions
+                                                                  0.97, 0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999]),
+                 two_side=True, right_side=False,):
+            num_samples = samples.shape[0]
+            adjusted_target_percentiles = (
+                    ((target_percentiles + (1 / num_samples / 2)) // (1 / num_samples)) / num_samples
+            ).clamp(1 / num_samples, 1 - 1 / num_samples).unique()
+            meter = OnlineMeter(batched=True, track_percentiles=True,
+                                target_percentiles=adjusted_target_percentiles,
+                                per_channel=False, number_edge_samples=10,
+                                track_cov=False)
+            meter.update(samples)
+            logging.debug(
+                f'adjusted percentiles {"right tail" if (right_side and not two_side) else "sym"}:\n'
+                f'\t{adjusted_target_percentiles.cpu().numpy()}')
+
+            super().__init__(*meter.get_distribution_histogram(),two_side=two_side, right_side=right_side)
+
+def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=False, class_id=None):
+    # this function summarises all layer pvalues using fisher statistic
+    # since we may have multiple channel reduction strategies (e.g. simes, cond-fisher) the strategy dict should have
+    # a mapping from reduction output to the actual pvalue (in simes this is just the returned value, for fisher we need
+    # to calculate the distribution for each layer statistic)
+    sum_pval_per_reduction={}
+    for layer_name, layer_stats_dict in ref_stats.items():
+        if filter_layer and filter_layer(layer_name):
+            continue
+        if class_id is not None:
+            layer_stats_dict = layer_stats_dict[class_id]
+        for spatial_reduction_name, record_per_input in layer_stats_dict.items():
+            if spatial_reduction_name not in sum_pval_per_reduction:
+                sum_pval_per_reduction[spatial_reduction_name] = {}
+                if using_ref_record:
+                    channel_reduction_names = record_per_input[0].channel_reduction_record.keys()
+                else:
+                    channel_reduction_names = record_per_input[0].keys()
+
+                for channel_reduction_name in channel_reduction_names:
+                    sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] = 0.
+            # all layer inputs are reduced together for now
+            for record in record_per_input:
+                if using_ref_record:
+                    assert isinstance(record, BatchStatsCollectorRet)
+                    for channel_reduction_name ,channel_reduction_record in record.channel_reduction_record.items():
+                        pval = channel_reduction_record['record']
+                        if 'pval_matcher' in channel_reduction_record:
+                            # need to get pvalues first
+                            pval = channel_reduction_record['pval_matcher'](pval)
+                        # free memory after extracting stats
+                        del channel_reduction_record['record']
+                        sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
+                else:
+                    for channel_reduction_name, pval in record.items():
+                        sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
+
+    return sum_pval_per_reduction
+
+def extract_output_distribution_single_class(layer_wise_ref_stats,target_percentiles=th.tensor([0.05,
+                                                                      0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+                                                                      # decision for fisher is right sided
+                                                                      0.945, 0.94625, 0.9475, 0.94875,
+                                                                      0.95,# target alpha upper 5%
+                                                                      0.95125, 0.9525,0.95375, 0.955,
+                                                                      # add more abnormal percentiles for fusions
+                                                                      0.97,0.98,0.99, 0.995,0.999,0.9995,0.9999]),
+                                right_sided_fisher_pvalue = False,filter_layer=None):
+    # reduce all layers (e.g. fisher)
+    sum_pval_per_reduction = fisher_reduce_all_layers(layer_wise_ref_stats, filter_layer, using_ref_record=True)
+    # update replace fisher output with pvalue per reduction
+    fisher_pvals_per_reduction = {}
+    for spatial_reduction_name, sum_pval_record in sum_pval_per_reduction.items():
+        logging.info(f'\t{spatial_reduction_name}:')
+        fisher_pvals_per_reduction[spatial_reduction_name]={}
+        # different channle reduction strategies will have different pvalues
+        for channel_reduction_name,sum_pval in sum_pval_record.items():
+            # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
+            kwargs = {'target_percentiles':target_percentiles}
+            if right_sided_fisher_pvalue:
+                kwargs.update({'two_side':False,'right_side':True})
+            fisher_pvals_per_reduction[spatial_reduction_name][channel_reduction_name] = PvalueMatcherFromSamples(samples=sum_pval,**kwargs)
+            logging.info(f'\t\t{channel_reduction_name}:\t mean:{sum_pval.mean()}\tstd:{sum_pval.std():0.3f}')
+    return fisher_pvals_per_reduction
+
 def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.05,
                                                                                   0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
                                                                                   # decision for fisher is right sided
@@ -275,54 +365,27 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
                                                                                   # add more abnormal percentiles for fusions
                                                                                   0.97,0.98,0.99, 0.995,0.999,0.9995,0.9999]),
                                 right_sided_fisher_pvalue = False,filter_layer=None):
-
-
-    # this function should return pvalues in the format of (Batch x num_classes)
     per_class_record = []
-    # reduce all layers (e.g. fisher)
-    for class_stats_per_layer_dict in all_class_ref_stats:
-        sum_pval_per_reduction = {}
-        for layer_name,layer_stats_per_input_dict in class_stats_per_layer_dict.items():
-            if filter_layer and filter_layer(layer_name):
-                continue
-            for reduction_name, record_per_input in layer_stats_per_input_dict.items():
-                for record in record_per_input:
-                    if reduction_name in sum_pval_per_reduction:
-                        sum_pval_per_reduction[reduction_name] -= 2*th.log(record.simes_pval)
-                    else:
-                        sum_pval_per_reduction[reduction_name] = -2*th.log(record.simes_pval)
-                    if record.meter.pval_matcher is None:
-                        record.meter.pval_matcher = PvalueMatcher(*record.meter.get_distribution_histogram())
-        # update fisher pvalue per reduction
-        fisher_pvals_per_reduction = {}
-        for reduction_name, sum_pval in sum_pval_per_reduction.items():
-            # adjust percentiles to the total number of samples
-            adjusted_target_percentiles = (((target_percentiles + (1 / sum_pval.shape[0] / 2)) // (1 / sum_pval.shape[0])) /
-                                  sum_pval.shape[0]).clamp(1 / sum_pval.shape[0],1 - 1 / sum_pval.shape[0]).unique()
-            meter = OnlineMeter(batched=True, track_percentiles=True, target_percentiles= adjusted_target_percentiles,
-                                                                per_channel=False, number_edge_samples=10,
-                                                                track_cov=False)
-            meter.update(sum_pval)
-            # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
-            kwargs = {}
-            if right_sided_fisher_pvalue:
-                kwargs = {'two_side':False,'right_side':True}
-            fisher_pvals_per_reduction[reduction_name] = PvalueMatcher(*meter.get_distribution_histogram(),**kwargs)
-
+    for e,class_stats_per_layer_dict in enumerate(all_class_ref_stats):
+        logging.info(f'Constructing H0 Pvalue matchers for fisher statistic of class {e}/{len(all_class_ref_stats)}')
+        fisher_pvals_per_reduction=extract_output_distribution_single_class(class_stats_per_layer_dict,
+                                                                            target_percentiles=target_percentiles,
+                                                                            right_sided_fisher_pvalue=right_sided_fisher_pvalue,
+                                                                            filter_layer=filter_layer)
         per_class_record.append(fisher_pvals_per_reduction)
 
-    logging.info(f'adjusted percentiles {"right tail" if right_sided_fisher_pvalue else "sym"} fisher test:{adjusted_target_percentiles.numpy()}')
     return per_class_record
 
 class OODDetector():
-    def __init__(self, model, all_class_ref_stats, right_sided_fisher_pvalue,
+    def __init__(self, model, all_class_ref_stats, right_sided_fisher_pvalue=True,
                  include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)):
 
         self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
                                        include_matcher_fn=include_matcher_fn,
-                                       input_fn=gen_simes_reducer_fn(all_class_ref_stats),
+                                       input_fn=gen_inference_fn(all_class_ref_stats),
                                        recursive=True, device_modifier='same')
-
+        #channle_reduction = ['simes_pval', 'cond_fisher'],
+        #self.channel_reduction = channle_reduction
         self.output_pval_matcher = extract_output_distribution(all_class_ref_stats,
                                                                right_sided_fisher_pvalue=right_sided_fisher_pvalue,
                                                                filter_layer=lambda n: n not in self.stats_recorder.tracked_modules.keys())
@@ -350,20 +413,12 @@ class OODDetector():
         per_class_record = []
         # reduce all layers (e.g. fisher)
         for class_id in range(self.num_classes):
-            sum_pval_per_reduction = {}
-            # iterate over recorder to aggregate per layer statistics for the new batch
-            for layer_pvalues_per_class in self.stats_recorder.record.values():
-                for reduction_name,pval_per_input in layer_pvalues_per_class[class_id].items():
-                    for pval in pval_per_input:
-                        if reduction_name in sum_pval_per_reduction:
-                            sum_pval_per_reduction[reduction_name] -= 2*th.log(pval)
-                        else:
-                            sum_pval_per_reduction[reduction_name] = -2*th.log(pval)
-
+            sum_pval_per_reduction = fisher_reduce_all_layers(self.stats_recorder.record,class_id=class_id,using_ref_record=False)
             # update fisher pvalue per reduction
             fisher_pvals_per_reduction = {}
-            for reduction_name, sum_pval in sum_pval_per_reduction.items():
-                fisher_pvals_per_reduction[reduction_name] = self.output_pval_matcher[class_id][reduction_name](sum_pval)
+            for reduction_name, sum_pval_record in sum_pval_per_reduction.items():
+                for s, sum_pval in sum_pval_record.items():
+                    fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
 
             per_class_record.append(fisher_pvals_per_reduction)
 
@@ -376,6 +431,14 @@ def calc_simes(pval):
     rank = th.arange(1, pval.shape[1] + 1,device=pval.device).repeat(pval.shape[0], 1)
     simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
     return simes_pval.unsqueeze(1)
+
+def calc_cond_fisher(pval, thresh=0.5):
+    pval[pval>thresh]=1
+    return -2*pval.log().sum(1).unsqueeze(1)
+
+# rescaled fisher test
+def calc_mean_fisher(pval):
+    return -2*pval.log().mean(1).unsqueeze(1)
 
 def spatial_mean(x):
     return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
@@ -413,8 +476,26 @@ def spatial_fuse(x,k=1):
 def spatial_l2(x):
     if x.dim() < 3:
         return x
-
     return th.norm(dim_reducer(x), dim=-1)
+
+
+class PickleableFunctionComposition():
+    def __init__(self,f1, f2):
+        self.f1 = f1
+        self.f2 = f2
+
+    def __call__(self,x):
+        return self.f2(self.f1(x))
+
+
+class MahalanobisDistance():
+    def __init__(self,mean,inv_cov):
+        self.mean = mean
+        self.inv_cov = inv_cov
+
+    def __call__(self,x):
+        x_c = x-self.mean
+        return (x_c.matmul(self.inv_cov).matmul(x_c.t())).diag().unsqueeze(1)
 
 
 ## auxilary data containers
@@ -424,29 +505,33 @@ class BatchStatsCollectorRet():
                  reduction_fn = lambda x: x,
                  cov: th.Tensor = None,
                  num_observations: int = 0,
-                 simes_pval: th.Tensor = None,
-                 meter :AverageMeter = None,
-                 pval_matcher : PvalueMatcher = None):
+                 meter :AverageMeter = None):
         self.reduction_name = reduction_name
+        self.reduction_fn = reduction_fn
+        ## collected stats
         self.cov = cov
         self.num_observations = num_observations
-        self.simes_pval = simes_pval
+        # spatial reduction meter
         self.meter = meter
-        self.reduction_fn = reduction_fn
-        #self.pval_matcher = pval_matcher
+        # record to hold all information on channel reduction methods
+        self.channel_reduction_record = {}
+
 
 @dataclass()
 class BatchStatsCollectorCfg():
-    cov_off : bool = True
+    cov_off : bool = False # True
     _track_cov: bool = False
-    partial_stats: bool = False
+    # using partial stats for mahalanobis covariance estimate
+    partial_stats: bool = True # False
     update_tracker: bool = True
     find_simes: bool = False
+    find_cond_fisher: bool = False
+    mahalanobis : bool = False
     target_percentiles = th.tensor([0.001, 0.002, 0.005,0.01,
                           # estimate more percentiles next to the target alpha
                           0.02, 0.023, 0.024,0.025,0.026, 0.027 ,0.03,
                           # collect intervals for better layer reduction statistic approximation
-                          0.05, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5]) # percentiles will be mirrored
+                          0.045,0.047,0.049,0.05,0.051,0.053,0.055, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5]) # percentiles will be mirrored
     num_edge_samples: int = 100
 
     def __init__(self,batch_size,reduction_dictionary = None,include_matcher_fn = None):
@@ -466,12 +551,13 @@ class BatchStatsCollectorCfg():
         self.target_percentiles = (((self.target_percentiles+(1/batch_size/2)) // (1/batch_size))/batch_size ).unique()
         logging.info(f'measure target percentiles {self.target_percentiles.numpy()}')
 
+
 def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collector_device='same', batch_size=1000,
                             measure_settings : BatchStatsCollectorCfg = None):
 
     measure_settings = measure_settings or BatchStatsCollectorCfg(batch_size)
     compute_cov_on_partial_stats = measure_settings.partial_stats and not measure_settings.cov_off
-    ## bypass the simple recorder dictionary with a meter dictionary to track statistics
+    ## bypass the simple recorder dictionary with a meter dictionary to track per layer statistics
     tracker = MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True, track_percentiles=True,
                                                                target_percentiles=measure_settings.target_percentiles,
                                                                per_channel=True,number_edge_samples=measure_settings.num_edge_samples,
@@ -500,15 +586,54 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                     tracker.update({tracker_name: i_})
                 # save a reference to the meter for convenience
                 reduction_ret_obj.meter = tracker[tracker_name]
+                ## typically second phase measurements
+                # this requires first collecting reduction statistics (covariance), then in a second pass we can collect
+                if measure_settings.mahalanobis:
+                    mahalanobis_fn = MahalanobisDistance(tracker[tracker_name].mean,tracker[tracker_name].inv_cov)
+                    # reduce all per channels stats to a single score
+                    i_m = mahalanobis_fn(i_)
+                    # measure the distribution per layer
+                    tracker.update({f'{tracker_name}-@mahalabobis': i_m})
+                    reduction_ret_obj.channel_reduction_record.update( {'mahalanobis':
+                                                                           # used for layer fusion (concatinate over all batches)
+                                                                          {'record' : i_m,
+                                                                           ## used to extract the pval from the output of the spatial reduction output
+                                                                           # channel reduction transformation
+                                                                           'right_side_pval': True,
+                                                                           'fn' : mahalanobis_fn,
+                                                                           # meter for the channel reduction (used to create pval matcher)
+                                                                           'meter': tracker[f'{tracker_name}-@mahalabobis'],
+                                                                           }
+                                                          } )
 
-                if measure_settings.find_simes:
+                if measure_settings.find_simes or measure_settings.find_cond_fisher:
                     if not hasattr(reduction_ret_obj.meter,'pval_matcher'):
-                        # asssume here that dict is not updated from this point on
-                        reduction_ret_obj.meter.pval_matcher = PvalueMatcher(
-                            *reduction_ret_obj.meter.get_distribution_histogram())
-                    #reduction_ret_obj.pval_matcher = reduction_ret_obj.meter.pval_matcher
+                        p,q=reduction_ret_obj.meter.get_distribution_histogram()
+                        reduction_ret_obj.meter.pval_matcher = PvalueMatcher(percentiles=p,quantiles=q)
+                    # here we first seek the pvalue for the observated reduction value
                     pval = reduction_ret_obj.meter.pval_matcher(i_)
-                    reduction_ret_obj.simes_pval = calc_simes(pval)
+
+                    if measure_settings.find_simes :
+                        reduction_ret_obj.channel_reduction_record.update({'simes_c':
+                                                                   {
+                                                                   'right_side_pval': False,
+                                                                   'record':calc_simes(pval),
+                                                                   'fn': PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
+                                                                   }
+                                                               })
+
+                    if measure_settings.find_cond_fisher:
+                        fisher_out = calc_cond_fisher(pval)
+                        # result is not normalized as pvalues, we need to measure the distribution
+                        # of this value to return to pval terms
+                        tracker.update({f'{tracker_name}-@fisher_c': fisher_out})
+                        reduction_ret_obj.channel_reduction_record.update({'fisher_c':
+                                                                   {'record': fisher_out,
+                                                                    'meter':tracker[f'{tracker_name}-@fisher_c'],
+                                                                    'right_side_pval':True,
+                                                                    'fn':PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_cond_fisher)
+                                                                    }
+                                                              })
 
                 # calculate covariance, can be used to compute covariance with global mean instead of running mean
                 if measure_settings._track_cov:
@@ -532,23 +657,19 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                 assert reduction_ret_obj.reduction_name == new_reduction_ret_obj.reduction_name
                 # compute global mean covariance update
                 if new_reduction_ret_obj.cov is not None:
-                    if reduction_ret_obj.cov is None:
-                        reduction_ret_obj.cov = new_reduction_ret_obj.cov
-                        reduction_ret_obj.num_observations = new_reduction_ret_obj.num_observations
-                    else:
-                        reduction_ret_obj.num_observations += new_reduction_ret_obj.num_observations
-                        scale = new_reduction_ret_obj.num_observations / reduction_ret_obj.num_observations
-                        # delta
-                        delta = new_reduction_ret_obj.cov.sub(reduction_ret_obj.cov)
-                        # update mean covariance
-                        reduction_ret_obj.cov.add_(delta.mul_(scale))
+                    reduction_ret_obj.num_observations += new_reduction_ret_obj.num_observations
+                    scale = new_reduction_ret_obj.num_observations / reduction_ret_obj.num_observations
+                    # delta
+                    delta = new_reduction_ret_obj.cov.sub(reduction_ret_obj.cov)
+                    # update mean covariance
+                    reduction_ret_obj.cov.add_(delta.mul_(scale))
+                    reduction_ret_obj.meter.cov = reduction_ret_obj.cov
 
-                # Simes aggregated (for now we collect all of the observed values and process them later for simplicity)
-                if new_reduction_ret_obj.simes_pval is not None:
-                    if reduction_ret_obj.simes_pval is None:
-                        reduction_ret_obj.simes_pval=new_reduction_ret_obj.simes_pval
-                    else:
-                        reduction_ret_obj.simes_pval = th.cat([reduction_ret_obj.simes_pval, new_reduction_ret_obj.simes_pval])
+                # aggregate all observed channel reduction values per method
+                for channel_reduction_name in new_reduction_ret_obj.channel_reduction_record.keys():
+                    reduction_ret_obj.channel_reduction_record[channel_reduction_name]['record'] = \
+                        th.cat([reduction_ret_obj.channel_reduction_record[channel_reduction_name]['record'],
+                                new_reduction_ret_obj.channel_reduction_record[channel_reduction_name]['record']])
 
                 reductions_per_input.append(reduction_ret_obj)
             stats_per_input.append(reductions_per_input)
@@ -572,15 +693,19 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
     #     # todo compare aginst meter cov
     #     measure_settings._track_cov = True
 
-    logging.info('\t\tmeasuring mean and percentiles')
+    logging.info(f'\t\tmeasuring {"covariance " if compute_cov_on_partial_stats else ""} mean and percentiles')
     _loop_over_data()
-    logging.info('\t\tcalculating covariance and Simes pvalues using measured mean and quantiles')
+    logging.info(f'\t\tcalculating {"covariance and " if measure_settings._track_cov and not compute_cov_on_partial_stats else ""}Simes pvalues using measured mean and quantiles')
     measure_settings.update_tracker = False
+    measure_settings.mahalanobis = True
+    measure_settings.update_channel_trackers = False
     measure_settings.find_simes = True
+    measure_settings.find_cond_fisher = True
     measure_settings._track_cov = not (measure_settings._track_cov or measure_settings.cov_off)
+    r.record.clear()
     _loop_over_data()
 
-    ## build reference dictionary
+    ## build reference dictionary with per layer information per reduction (reversing collection order)
     ret_stat_dict = {}
     for k in r.tracked_modules.keys():
         ret_stat_dict[k] = {}
@@ -589,11 +714,16 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                 for inp_id, reduction_records in enumerate(stats_per_input):
                     for reduction_record in reduction_records:
                         assert isinstance(reduction_record,BatchStatsCollectorRet)
-                        ## move to cpu to avoid oom when model has many classes
-                        # reduction_record.meter.cpu()
-                        del reduction_record.meter.val
-                        del reduction_record.meter.percentiles.val
-                        reduction_record.simes_pval = reduction_record.simes_pval.cpu()
+                        # #todo create a channel reduction pval matcher right here
+                        for channel_reduction_entry in reduction_record.channel_reduction_record.values():
+                            channel_reduction_entry['record'] = channel_reduction_entry['record'].cpu()
+                            if 'meter' in channel_reduction_entry:
+                                p,q = channel_reduction_entry['meter'].get_distribution_histogram()
+                                pval_matcher = PvalueMatcher(quantiles=q,percentiles=p,right_side=channel_reduction_entry['right_side_pval'])
+                                channel_reduction_entry['pval_matcher'] = pval_matcher
+                                # create the final function to retrive the layer pvalue from a given spatial reduction
+                                channel_reduction_entry['fn'] = PickleableFunctionComposition(channel_reduction_entry['fn'], pval_matcher)
+
                         if reduction_record.reduction_name in ret_stat_dict[k]:
                             ret_stat_dict[k][reduction_record.reduction_name] += [reduction_record]
                         else:
@@ -624,6 +754,13 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
             predicted = out.argmax(1)
             pvalues_dict = detector.get_fisher()
             last_reduction_pvalues = {}
+            if in_dist:
+                correct_predictions = l == predicted
+                t1, t5 = accuracy(out, l, (1, 5))
+                top1.update(t1, out.shape[0])
+                top5.update(t5, out.shape[0])
+                logging.info(f'\nModel Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
+                             f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
             for reduction_name,pvalues in pvalues_dict.items():
                 pvalues=pvalues.squeeze().cpu()
                 # aggragate pvalues or return per reduction score
@@ -644,12 +781,6 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
                     'max_pval': _gen_curve(best_class_pval),
                 })
                 if in_dist:
-                    correct_predictions = l == predicted
-                    t1, t5 = accuracy(out, l, (1, 5))
-                    top1.update(t1, out.shape[0])
-                    top5.update(t5, out.shape[0])
-                    logging.info(f'\nModel Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
-                                 f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
                     correct_pred_conditional_pval = class_conditional_pval[correct_predictions]
                     true_class_pval = pvalues[th.arange(l.shape[0]), l]
                     last_reduction_pvalues[reduction_name].update({
@@ -663,30 +794,30 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
                     })
 
             ## in this section we can fuse different reductions to produce a potentially stronger rejection method
-            if 'fused_pval_min_max' not in rejected:
-                # prime fusion meters
-                for fusion in ['fused_pval_mean_margin','fused_pval_min_max','fused_pval_min_max_mean', 'fused_pval_all']:
-                    rejected[fusion]=MeterDict(meter_factory=batched_meter_factory)
-
-            # for now we only do this for max-pval rejection method
-            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
-                                 last_reduction_pvalues['spatial-margin']['max_pval']], 1)).squeeze()
-            rejected['fused_pval_mean_margin'].update({'max_pval': _gen_curve(fused_pval)})
-
-            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-min']['max_pval'],
-                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            rejected['fused_pval_min_max'].update({'max_pval': _gen_curve(fused_pval)})
-
-            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
-                                              last_reduction_pvalues['spatial-min']['max_pval'],
-                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            rejected['fused_pval_min_max_mean'].update({'max_pval': _gen_curve(fused_pval)})
-
-            fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-margin']['max_pval'],
-                                              last_reduction_pvalues['spatial-mean']['max_pval'],
-                                              last_reduction_pvalues['spatial-min']['max_pval'],
-                                              last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            rejected['fused_pval_all'].update({'max_pval': _gen_curve(fused_pval)})
+            # if 'fused_pval_min_max' not in rejected:
+            #     # prime fusion meters
+            #     for fusion in ['fused_pval_mean_margin','fused_pval_min_max','fused_pval_min_max_mean', 'fused_pval_all']:
+            #         rejected[fusion]=MeterDict(meter_factory=batched_meter_factory)
+            #
+            # # for now we only do this for max-pval rejection method
+            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
+            #                      last_reduction_pvalues['spatial-margin']['max_pval']], 1)).squeeze()
+            # rejected['fused_pval_mean_margin'].update({'max_pval': _gen_curve(fused_pval)})
+            #
+            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-min']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            # rejected['fused_pval_min_max'].update({'max_pval': _gen_curve(fused_pval)})
+            #
+            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-min']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            # rejected['fused_pval_min_max_mean'].update({'max_pval': _gen_curve(fused_pval)})
+            #
+            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-margin']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-mean']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-min']['max_pval'],
+            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
+            # rejected['fused_pval_all'].update({'max_pval': _gen_curve(fused_pval)})
 
             ## end batch report
             # report accuracy and pvalue stats for in-dist dataset
@@ -803,11 +934,12 @@ def measure_and_eval(args : Settings):
             measure_settings = BatchStatsCollectorCfg(args.batch_size,reduction_dictionary=args.spatial_reductions,
                                                       # todo: maybe split measure and test include fn in Settings
                                                       include_matcher_fn=args.include_matcher_fn)
-            all_class_ref_stats.append(measure_data_statistics(train_loader, model, epochs=epochs,
+            class_stats=measure_data_statistics(train_loader, model, epochs=epochs,
                                                                model_device=args.device,
                                                                collector_device=args.collector_device,
                                                                batch_size=args.batch_size,
-                                                               measure_settings=measure_settings))
+                                                               measure_settings=measure_settings)
+            all_class_ref_stats.append(class_stats)
         logging.info('saving reference stats dict')
         th.save(all_class_ref_stats, calibrated_path)
 
@@ -825,7 +957,8 @@ def measure_and_eval(args : Settings):
     # run in-dist data evaluate per class to simplify analysis
     logging.info(f'evaluating inliers')
     #for class_id,class_name in enumerate(val_ds.classes):
-    sampler = None #th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+    #    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
+    sampler = None
     val_loader = th.utils.data.DataLoader(
             val_ds, sampler=sampler,
             batch_size=args.batch_size, shuffle=False,
@@ -873,7 +1006,9 @@ densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3',
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
     exp_id = 0
+    device_id = exp_id % th.cuda.device_count()
     recompute = True
+    tag=''
     # resnet18_cats_dogs = Settings(
     #     model='resnet',
     #     dataset='cats_vs_dogs',
@@ -884,7 +1019,7 @@ if __name__ == '__main__':
     class R34ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
             super().__init__(model='ResNet34', #include_matcher_fn=resnet_mahalanobis_matcher_fn,, tag='-@mahalanobis',
-                             device=f'cuda:{exp_id % th.cuda.device_count()}',
+                             device=f'cuda:{device_id}',
                              augment_measure=False,recompute=recompute, **kwargs)
     resnet34_cifar10 = R34ExpGroupSettings(
         dataset='cifar10',
@@ -910,8 +1045,8 @@ if __name__ == '__main__':
     )
     class DN3ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
-            super().__init__(model='DenseNet3', include_matcher_fn=include_densenet_even_layers_fn,
-                             device=f'cuda:{exp_id % th.cuda.device_count()}', tag='-@even',recompute=recompute, **kwargs)
+            super().__init__(model='DenseNet3', #include_matcher_fn=include_densenet_even_layers_fn,
+                             device=f'cuda:{exp_id % th.cuda.device_count()}', tag=tag,recompute=recompute, **kwargs)
     densenet_cifar10 = DN3ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
