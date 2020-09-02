@@ -1,6 +1,9 @@
 import torch as th
 import torchvision as tv
-from matplotlib import pyplot as plt
+#from matplotlib import pyplot as plt
+import matplotlib.pylab as plt
+import matplotlib
+import numpy as np
 import models
 from data import get_dataset,limit_ds
 from preprocess import get_transform
@@ -13,17 +16,74 @@ from dataclasses import dataclass
 import inspect
 from utils.misc import Recorder
 from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
-from functools import partial
 from typing import Callable,List,Dict
 
+
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
-    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)
+    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d)
+
+
+def spatial_mean(x):
+    return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
+
+
+def dim_reducer(x):
+    if x.dim() <= 3:
+        return x
+
+    return x.view(x.shape[0], x.shape[1], -1)
+
+
+# k will ignore k-1 most extreme values
+def spatial_edges(x,k=1,is_max=True,):
+    if x.dim() < 3:
+        return x
+    x_ = dim_reducer(x)
+
+    ret = x_.topk(k, -1, is_max)[0]
+    if is_max:
+        return ret[:,:,0]
+
+    return ret[:,:,k-1]
+
+
+def spatial_min(x,k=1):
+    return spatial_edges(x,k,False)
+
+
+def spatial_max(x,k=1):
+    return spatial_edges(x,k,True)
+
+
+def spatial_margin(x,k=1):
+    return spatial_max(x,k)-spatial_min(x,k)
+
+
+def spatial_min_max(x,k=1):
+    return th.stack(spatial_max(x,k),spatial_min(x,k),1).view(x.shape[0],-1)
+
+
+def spatial_l2(x):
+    if x.dim() < 3:
+        return x
+    return th.norm(dim_reducer(x), dim=-1)
+
+
+_DEFAULT_SPATIAL_REDDUCTIONS = {
+            'spatial-mean': spatial_mean,
+            'spatial-max': spatial_max,
+            'spatial-min': spatial_min,
+            #'spatial-margin': partial(spatial_margin, k=1),
+            # 'spatial-l2':spatial_l2
+        }
 
 @dataclass
 class Settings:
     def get_args_dict(self):
         ret = {k:getattr(self,k) for k in list(inspect.signature(Settings.__init__).parameters.keys())[1:]}
-        ret.update({'spatial_reductions':ret['spatial_reductions'],'include_matcher_fn':str(ret['include_matcher_fn'])})
+        #workaround to avoid save/load issues
+        ret.update({'spatial_reductions':ret['spatial_reductions'],'include_matcher_fn_measure':
+            str(ret['include_matcher_fn_measure']),'include_matcher_fn_test':str(ret['include_matcher_fn_test'])})
         return ret
 
     def __repr__(self):
@@ -46,11 +106,16 @@ class Settings:
                  alphas : List[float] = [i/500 for i in range(1,100)] + [i/10 for i in range(2,11)],
                  right_sided_fisher_pvalue: bool = True,
                  transform_dataset: str = None,
-                 spatial_reductions : Dict[str,Callable[[th.Tensor],th.Tensor]] = None,
+                 spatial_reductions : Dict[str,Callable[[th.Tensor],th.Tensor]] = _DEFAULT_SPATIAL_REDDUCTIONS,
                  measure_joint_distribution : bool = False,
                  tag :str = '',
                  ood_datasets : List[str] = None,
-                 include_matcher_fn : Callable[[str,th.nn.Module],bool]= _default_matcher_fn):
+                 #matcher used for stat collection
+                 include_matcher_fn_measure : Callable[[str, th.nn.Module], bool]= _default_matcher_fn,
+                 # mather used for test
+                 include_matcher_fn_test: Callable[[str, th.nn.Module], bool] = _default_matcher_fn,
+                 # this will try to choose layers to reduce final statistic variance over H0
+                 auto_layer_selection:bool = False):
 
         self._dict = {}
         arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
@@ -59,7 +124,7 @@ class Settings:
             self._dict[name] = getattr(self,name)
         if self.ood_datasets is None:
             self.ood_datasets = ['folder-Imagenet_resize', 'folder-LSUN_resize', 'cifar100']
-            if self.dataset == 'SVHN':
+            if self.dataset == 'SVHN' or self.dataset == 'cifar100':
                 self.ood_datasets.insert(0, 'cifar10')
             else:
                 self.ood_datasets.insert(0, 'SVHN')
@@ -248,7 +313,7 @@ class PvalueMatcher():
 
     ## todo document!
     def __call__(self, x):
-        if x.device != self.percentiles.device:
+        if x.device != self.quantiles.device:
             self.percentiles=self.percentiles.to(x.device)
             self.quantiles = self.quantiles.to(x.device)
         stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], self.num_percentiles)
@@ -285,9 +350,9 @@ class PvalueMatcherFromSamples(PvalueMatcher):
                                 per_channel=False, number_edge_samples=10,
                                 track_cov=False)
             meter.update(samples)
-            logging.debug(
-                f'adjusted percentiles {"right tail" if (right_side and not two_side) else "sym"}:\n'
-                f'\t{adjusted_target_percentiles.cpu().numpy()}')
+            # logging.debug(
+            #     f'adjusted percentiles {"right tail" if (right_side and not two_side) else "sym"}:\n'
+            #     f'\t{adjusted_target_percentiles.cpu().numpy()}')
 
             super().__init__(*meter.get_distribution_histogram(),two_side=two_side, right_side=right_side)
 
@@ -344,7 +409,7 @@ def extract_output_distribution_single_class(layer_wise_ref_stats,target_percent
     # update replace fisher output with pvalue per reduction
     fisher_pvals_per_reduction = {}
     for spatial_reduction_name, sum_pval_record in sum_pval_per_reduction.items():
-        logging.info(f'\t{spatial_reduction_name}:')
+        logging.debug(f'\t{spatial_reduction_name}:')
         fisher_pvals_per_reduction[spatial_reduction_name]={}
         # different channle reduction strategies will have different pvalues
         for channel_reduction_name,sum_pval in sum_pval_record.items():
@@ -353,7 +418,7 @@ def extract_output_distribution_single_class(layer_wise_ref_stats,target_percent
             if right_sided_fisher_pvalue:
                 kwargs.update({'two_side':False,'right_side':True})
             fisher_pvals_per_reduction[spatial_reduction_name][channel_reduction_name] = PvalueMatcherFromSamples(samples=sum_pval,**kwargs)
-            logging.info(f'\t\t{channel_reduction_name}:\t mean:{sum_pval.mean()}\tstd:{sum_pval.std():0.3f}')
+            logging.debug(f'\t\t{channel_reduction_name}:\t mean:{sum_pval.mean():0.3f}\tstd:{sum_pval.std():0.3f}')
     return fisher_pvals_per_reduction
 
 def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor([0.05,
@@ -367,7 +432,7 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
                                 right_sided_fisher_pvalue = False,filter_layer=None):
     per_class_record = []
     for e,class_stats_per_layer_dict in enumerate(all_class_ref_stats):
-        logging.info(f'Constructing H0 Pvalue matchers for fisher statistic of class {e}/{len(all_class_ref_stats)}')
+        logging.debug(f'Constructing H0 Pvalue matchers for fisher statistic of class {e}/{len(all_class_ref_stats)}')
         fisher_pvals_per_reduction=extract_output_distribution_single_class(class_stats_per_layer_dict,
                                                                             target_percentiles=target_percentiles,
                                                                             right_sided_fisher_pvalue=right_sided_fisher_pvalue,
@@ -378,7 +443,7 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
 
 class OODDetector():
     def __init__(self, model, all_class_ref_stats, right_sided_fisher_pvalue=True,
-                 include_matcher_fn=lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear)):
+                 include_matcher_fn=_default_matcher_fn):
 
         self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
                                        include_matcher_fn=include_matcher_fn,
@@ -440,44 +505,6 @@ def calc_cond_fisher(pval, thresh=0.5):
 def calc_mean_fisher(pval):
     return -2*pval.log().mean(1).unsqueeze(1)
 
-def spatial_mean(x):
-    return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
-
-def dim_reducer(x):
-    if x.dim() <= 3:
-        return x
-
-    return x.view(x.shape[0], x.shape[1], -1)
-
-# k will ignore k-1 most extreme values, todo choose value to match percentile ()
-def spatial_edges(x,k=1,is_max=True,):
-    if x.dim() < 3:
-        return x
-    x_ = dim_reducer(x)
-
-    ret = x_.topk(k, -1, is_max)[0]
-    if is_max:
-        return ret[:,:,0]
-
-    return ret[:,:,k-1]
-
-def spatial_min(x,k=1):
-    return spatial_edges(x,k,False)
-
-def spatial_max(x,k=1):
-    return spatial_edges(x,k,True)
-
-def spatial_margin(x,k=1):
-    return spatial_max(x,k)-spatial_min(x,k)
-
-def spatial_fuse(x,k=1):
-    return 0.5*(spatial_mean(x)+spatial_margin(x,k))
-
-def spatial_l2(x):
-    if x.dim() < 3:
-        return x
-    return th.norm(dim_reducer(x), dim=-1)
-
 
 class PickleableFunctionComposition():
     def __init__(self,f1, f2):
@@ -494,6 +521,9 @@ class MahalanobisDistance():
         self.inv_cov = inv_cov
 
     def __call__(self,x):
+        if x.device!=self.mean.device:
+            self.mean= self.mean.to(x.device)
+            self.inv_cov=self.inv_cov.to(x.device)
         x_c = x-self.mean
         return (x_c.matmul(self.inv_cov).matmul(x_c.t())).diag().unsqueeze(1)
 
@@ -536,13 +566,7 @@ class BatchStatsCollectorCfg():
 
     def __init__(self,batch_size,reduction_dictionary = None,include_matcher_fn = None):
         # which reductions to use ?
-        self.reduction_dictionary = reduction_dictionary or {
-            'spatial-mean': spatial_mean,
-            'spatial-max': spatial_max,
-            'spatial-min': spatial_min,
-            'spatial-margin': partial(spatial_margin, k=1),
-            # 'spatial-l2':spatial_l2
-        }
+        self.reduction_dictionary = reduction_dictionary or _DEFAULT_SPATIAL_REDDUCTIONS
         # which layers to collect?
         self.include_matcher_fn = include_matcher_fn or (lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear))
         assert 0.5 == self.target_percentiles[-1], 'tensor must include median'
@@ -737,16 +761,41 @@ def batched_meter_factory(k, v):
 
 def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=False):
     alpha_list = alpha_list or [0.05]
+    TNR95_id = alpha_list.index(0.05)
     def _gen_curve(pvalues_for_val):
         rejected_ = []
         for alpha_ in alpha_list:
             rejected_.append((pvalues_for_val < alpha_).float().unsqueeze(1))
         return th.cat(rejected_, 1)
+    def _report(level=logging.INFO):
+        log_fn = lambda msg : logging.log(level=level,msg=msg)
+        if in_dist:
+            log_fn(f'\nModel: Prec@1 {accuracy_dict["model_t1"].avg:.3f} ({accuracy_dict["model_t1"].std:.3f}) \t'
+                     f'Prec@5 {accuracy_dict["model_t5"].avg:.3f} ({accuracy_dict["model_t5"].std:.3f})')
+        for reduction_name in rejected.keys():
+            log_fn(f'\t{reduction_name} metric:')
+            if in_dist:
+                # report mean accuracy
+                log_fn(f'\t\tPVAL: Prec@1 {accuracy_dict[f"{reduction_name}-pval_t1"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-pval_t1"].std:.3f}) \t'
+                             f'Prec@5 {accuracy_dict[f"{reduction_name}-pval_t5"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-pval_t5"].std:.3f})')
+                log_fn(f'\t\tSCALED: Prec@1 {accuracy_dict[f"{reduction_name}-rescaled_t1"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-rescaled_t1"].std:.3f}) \t'
+                             f'Prec@5 {accuracy_dict[f"{reduction_name}-rescaled_t5"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-rescaled_t5"].std:.3f})')
+                log_fn(f'\t\tSCALED-SMX: Prec@1 {accuracy_dict[f"{reduction_name}-rescaled_t1_smx"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-rescaled_t1_smx"].std:.3f}) \t'
+                             f'Prec@5 {accuracy_dict[f"{reduction_name}-rescaled_t5_smx"].avg:.3f} '
+                             f'({accuracy_dict[f"{reduction_name}-rescaled_t5_smx"].std:.3f})')
+            # report rejection results
+            log_fn(f'\t\tMAX_PVAL-Rejected: {rejected[reduction_name]["max_pval_roc"].mean.numpy()[TNR95_id-5:TNR95_id+5]}')
+            log_fn(f'\t\tCOND_PVAL-Rejected: {rejected[reduction_name]["class_conditional_pval_roc"].mean.numpy()[TNR95_id-5:TNR95_id+5]}')
+        log_fn(f'\tRejection results around TNR:{alpha_list[TNR95_id]}\tTNR_ID:{TNR95_id}')
+
     model.eval()
     model.to(model_device)
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-
+    accuracy_dict = MeterDict(AverageMeter)
     rejected = {}
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
@@ -755,12 +804,14 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
             pvalues_dict = detector.get_fisher()
             last_reduction_pvalues = {}
             if in_dist:
+                # model accuracy
                 correct_predictions = l == predicted
                 t1, t5 = accuracy(out, l, (1, 5))
-                top1.update(t1, out.shape[0])
-                top5.update(t5, out.shape[0])
-                logging.info(f'\nModel Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
-                             f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
+                accuracy_dict.update({
+                    'model_t1':(t1,out.shape[0]),
+                    'model_t5': (t5, out.shape[0]),
+                })
+
             for reduction_name,pvalues in pvalues_dict.items():
                 pvalues=pvalues.squeeze().cpu()
                 # aggragate pvalues or return per reduction score
@@ -770,27 +821,55 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
                 if reduction_name not in rejected:
                     rejected[reduction_name] = MeterDict(meter_factory=batched_meter_factory)
                 # keep track of pvalue predictions
-                last_reduction_pvalues[reduction_name]={
-                    'class_conditional_pval': class_conditional_pval,
-                    'max_pval': best_class_pval,
-                    'max_pval_id': best_class_pval_id
-                }
+                # last_reduction_pvalues[reduction_name]={
+                #     #'class_conditional_pval': class_conditional_pval,
+                #     #'max_pval': best_class_pval,
+                #     'max_pval_id': best_class_pval_id
+                # }
 
                 rejected[reduction_name].update({
-                    'class_conditional_pval': _gen_curve(class_conditional_pval),
-                    'max_pval': _gen_curve(best_class_pval),
+                    'class_conditional_pval_roc': _gen_curve(class_conditional_pval),
+                    'max_pval_roc': _gen_curve(best_class_pval),
                 })
                 if in_dist:
-                    correct_pred_conditional_pval = class_conditional_pval[correct_predictions]
+                    t1_likely, t5_likely = accuracy(pvalues, l, (1, 5))
+
+                    rescaled_outputs = out*pvalues
+                    t1_rescaled, t5_rescaled = accuracy(rescaled_outputs, l, (1, 5))
+
+                    rescaled_outputs_post_smx = th.nn.functional.softmax(out,-1)*pvalues
+                    t1_rescaled_smx, t5_rescaled_smx = accuracy(rescaled_outputs_post_smx, l, (1, 5))
+
+                    accuracy_dict.update({
+                        f'{reduction_name}-pval_t1': (t1_likely, out.shape[0]),
+                        f'{reduction_name}-pval_t5': (t5_likely, out.shape[0]),
+                        f'{reduction_name}-rescaled_t1': (t1_rescaled, out.shape[0]),
+                        f'{reduction_name}-rescaled_t5': (t5_rescaled, out.shape[0]),
+                        f'{reduction_name}-rescaled_t1_smx': (t1_rescaled_smx, out.shape[0]),
+                        f'{reduction_name}-rescaled_t5_smx': (t5_rescaled_smx, out.shape[0]),
+                    })
+                    # # additional in-dist results per reduction
+                    # # model prediction agrees with selected pvalue
+                    # agreement = (best_class_pval_id == predicted)
+                    # # agreement only on predictions that are correct
+                    # agreement_true = (agreement == correct_predictions)
+                    # logging.info(f'\tMAX_PVAL-Agreement with model prediction: {agreement.float().mean():.3f},'
+                    #              f'\n\tMAX_PVAL-Agreement with correct predictions: {agreement_true.float().mean():.3f}')
+
+                    # pvalue of the annotated class
                     true_class_pval = pvalues[th.arange(l.shape[0]), l]
-                    last_reduction_pvalues[reduction_name].update({
-                        'true_class_pval' : true_class_pval,
-                        'class_conditional_correct_only_pval' : correct_pred_conditional_pval
+                    # the pvalue of correct class prediction
+                    correct_pred_pvalues = pvalues[correct_predictions,l[correct_predictions]]
+                    # what was the pvalue of the correct class pval when prediction was wrong
+                    false_pred_pvalues = pvalues[th.logical_not(correct_predictions),l[th.logical_not(correct_predictions)]]
+                    rejected[reduction_name].update({
+                        'true_class_pval_mean' : true_class_pval,
+                        'true_pred_pval_mean' : correct_pred_pvalues,
+                        'false_pred_pval_mean':false_pred_pvalues,
                     })
 
                     rejected[reduction_name].update({
-                        'true_class_pval' : _gen_curve(true_class_pval),
-                        'class_conditional_correct_only_pval' : _gen_curve(correct_pred_conditional_pval)
+                        'true_class_pval_roc' : _gen_curve(true_class_pval),
                     })
 
             ## in this section we can fuse different reductions to produce a potentially stronger rejection method
@@ -818,71 +897,113 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
             #                                   last_reduction_pvalues['spatial-min']['max_pval'],
             #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
             # rejected['fused_pval_all'].update({'max_pval': _gen_curve(fused_pval)})
-
-            ## end batch report
-            # report accuracy and pvalue stats for in-dist dataset
-            if in_dist:
-                t1_likely, t5_likely = accuracy(pvalues.squeeze(), l, (1, 5))
-                false_pred_pvalus = pvalues[th.logical_not(correct_predictions)]
-                logging.info(f'Prec@1 {t1_likely:0.3f}, Prec@5 {t5_likely:.3f}'
-                             f'\tFalse pred avg pvalue {false_pred_pvalus.float().mean():.3f}')
-            # per reduction summary
-            for reduction_name in rejected.keys():
-                logging.info(f'{reduction_name}:')
-                if in_dist and reduction_name in last_reduction_pvalues:
-                    # additional in-dist results per reduction
-                    best_class_pval_id = last_reduction_pvalues[reduction_name]['max_pval_id']
-                    # model prediction agrees with selected pvalue
-                    agreement = (best_class_pval_id == predicted)
-                    # agreement only on predictions that are correct
-                    agreement_true = (agreement == correct_predictions)
-                    logging.info(f'\tagreement: {agreement.float().mean():.3f},'
-                                 f'\tagreement on true: {agreement_true.float().mean():.3f}')
-                # reduction rejected report
-                logging.info(f'\tRejected: {rejected[reduction_name]["max_pval"].mean.numpy()[20:30]}')
-
+            _report(logging.DEBUG)
         ## end of eval report
-        if in_dist:
-            logging.info(f'\nModel prediction :Prec@1 {top1.avg:.3f} ({top1.std:.3f}) \t'
-                         f'Prec@5 {top5.avg:.3f} ({top5.std:.3f})')
+        logging.info(f'DONE: {loader.dataset.root}')
+        _report()
+
         ## pack results
         ret_dict = {}
         for reduction_name, rejected_p in rejected.items():
-            logging.info(f'{reduction_name} rejected: {rejected[reduction_name]["max_pval"].mean.numpy()[:10]}')
             ## strip meter dict functionality for simpler post-processing
             reduction_dict = {}
             for k,v in rejected_p.items():
                 # keeping meter object - potentially remove it here
                 reduction_dict[k] = v
             ret_dict[reduction_name] = reduction_dict
+        for reduction_name_accuracy, accuracy_d in accuracy_dict.items():
+            ret_dict[reduction_name_accuracy]=accuracy_d
     return ret_dict
 
     # Important! recorder hooks should be removed when done
 
-def result_summary(res_dict,args_dict):
+def result_summary(res_dict,args_dict,TNR_target=0.05):
     ## if not configured setup logging for external caller
     if not logging.getLogger('').handlers:
         setup_logging()
     in_dist=args_dict['dataset']
     alphas = args_dict['alphas']
     logging.info(f'Report for {args_dict["model"]} - {in_dist}')
-    for red, vd in res_dict[in_dist].items():
-        logging.info(red)
-        for n, p in vd.items():
-            rejected = {}
-            pvalues_under_alpha = [i for i in p.mean.tolist() if i < 0.051]
-            pvalues_id = len(pvalues_under_alpha)
-            for k, ood_v in res_dict.items():
-                if k != in_dist and n in ood_v[red]:
-                    rejected[k] = (ood_v[red][n].mean[max(pvalues_id- 1,0)].numpy())
-            res= p.mean[0] if pvalues_id==0 else pvalues_under_alpha[pvalues_id- 1]
-            logging.info(f'\t {n}: {res:.3f} ({alphas[pvalues_id]})')
-            for kk, vv in rejected.items():
-                logging.info(f'\t\t{kk}: {vv:0.3f}')
+    # read indist results to calibrate alpha value for target TNR
+    for reduction_name, reduction_metrics in res_dict[in_dist].items():
+        logging.info(reduction_name)
+        if type(reduction_metrics) != dict:
+            # report simple metric
+            logging.info(f'\t{reduction_metrics.mean:0.3f}\t({reduction_metrics.std:0.3f})')
+            continue
+        # report reduction specific metrics
+        for metric_name, meter_object in reduction_metrics.items():
+            if not metric_name.endswith('_roc'):
+                # in-dist metric with a single value (e.g. mean pvalues, prediction accuracy etc)
+                logging.info(f'\t{metric_name}: {meter_object.mean.numpy():0.3}')
+                continue
+            indist_pvalues_roc = meter_object.mean
+            calibrated_alpha_id = (indist_pvalues_roc < TNR_target).sum() - 1
+
+            if calibrated_alpha_id == -1:
+                # all pvalues are larger than alpha
+                calibrated_alpha_raw = meter_object.mean[0]
+                interp_alpha = indist_pvalues_roc[0]
+                calibrated_alpha_id = 0
+            else:
+                calibrated_alpha_raw = indist_pvalues_roc[calibrated_alpha_id]
+                # actual rejection threshold to use for TNR 95%
+                interp_alpha = np.interp(0.05, indist_pvalues_roc ,alphas)
+
+            logging.info(f'\t{metric_name} - in-dist raw rejected: '
+                         f'raw-{calibrated_alpha_raw:0.3f} ({alphas[calibrated_alpha_id]:0.3f}), '
+                         f'interp-{TNR_target:0.3f} ({interp_alpha:0.3f}), '
+                         f'next-{indist_pvalues_roc[calibrated_alpha_id+1]:0.3f} ({alphas[calibrated_alpha_id+1]})')
+
+            for target_dataset_name, reduction_metrics in res_dict.items():
+                if target_dataset_name != in_dist and metric_name in reduction_metrics[reduction_name]:
+                    interp_rejected = np.interp(interp_alpha, alphas, reduction_metrics[reduction_name][metric_name].mean.numpy())
+                    raw_rejected = reduction_metrics[reduction_name][metric_name].mean.numpy()[calibrated_alpha_id]
+                    logging.info(f'\t\t{target_dataset_name}:\traw-{raw_rejected:0.3f}\tinterp-{interp_rejected:0.3f}')
+
 
 def report_from_file(path):
     res = th.load(path,map_location='cpu')
     result_summary(res['results'], res['settings'])
+
+
+def measure(model,measure_ds,args:Settings):
+    if args.measure_joint_distribution:
+        classes = ['all']
+    else:
+        classes = measure_ds.classes if hasattr(measure_ds, 'classes') else range(args.num_classes)
+
+    if args.limit_measure:
+        measure_ds = limit_ds(measure_ds, args.limit_measure, per_class=True)
+
+    all_class_ref_stats = []
+    targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
+    for class_id, class_name in enumerate(classes):
+        logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
+        if not args.measure_joint_distribution:
+            ds_ = th.utils.data.Subset(measure_ds, th.where(targets == class_id)[0])
+        else:
+            ds_ = measure_ds
+
+        sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
+        train_loader = th.utils.data.DataLoader(
+            ds_, sampler=sampler,
+            batch_size=args.batch_size, shuffle=False if sampler else True,
+            num_workers=8, pin_memory=True, drop_last=False)
+
+        measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
+                                                  # todo: maybe split measure and test include fn in Settings
+                                                  include_matcher_fn=args.include_matcher_fn_measure)
+
+        class_stats = measure_data_statistics(train_loader, model, epochs=5 if args.augment_measure else 1,
+                                              model_device=args.device,
+                                              collector_device=args.collector_device,
+                                              batch_size=args.batch_size,
+                                              measure_settings=measure_settings)
+        all_class_ref_stats.append(class_stats)
+
+    return all_class_ref_stats
+
 
 def measure_and_eval(args : Settings):
     rejection_results = {} # dataset , out
@@ -892,8 +1013,6 @@ def measure_and_eval(args : Settings):
         checkpoint=checkpoint['state_dict']
 
     model.load_state_dict(checkpoint)
-
-
     expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=args.augment_measure)
     expected_transform_test = get_transform(args.transform_dataset or args.dataset, augment=args.augment_test)
     ## this part is meant to improve percentile collection for cifar100 where the number of samples per class is small
@@ -902,67 +1021,42 @@ def measure_and_eval(args : Settings):
     #     expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=True)
     #     expected_transform_measure.transforms[0] = ttf.RandomResizedCrop((32, 32), scale=(0.8, 1))
 
-    if args.augment_measure:
-        epochs = 5
-    else:
-        epochs = 1
-
-    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{"_joint" if args.measure_joint_distribution else ""}{args.tag}.pth'
+    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{args.tag}.pth'
     if not args.recompute and os.path.exists(calibrated_path):
-        all_class_ref_stats = th.load(calibrated_path,map_location=args.device)
+        ref_stats = th.load(calibrated_path,map_location=args.collector_device if args.collector_device!='same' else args.device)
     else:
         ds = get_dataset(args.dataset, 'train', expected_transform_measure)
-        if args.measure_joint_distribution:
-            classes = ['all']
-        else:
-            classes = ds.classes if hasattr(ds,'classes') else range(args.num_classes)
-        if args.limit_measure:
-            ds=limit_ds(ds,args.limit_measure,per_class=True)
-        all_class_ref_stats=[]
-        targets = th.tensor(ds.targets) if hasattr(ds,'targets') else  th.tensor(ds.labels)
-        for class_id,class_name in enumerate(classes):
-            logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
-            if not args.measure_joint_distribution:
-                ds_ = th.utils.data.Subset(ds,th.where(targets==class_id)[0])
-            else:
-                ds_ = ds
-            sampler = None #th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
-            train_loader = th.utils.data.DataLoader(
-                    ds_, sampler=sampler,
-                    batch_size=args.batch_size, shuffle=False if sampler else True,
-                    num_workers=8, pin_memory=True, drop_last=False)
-            measure_settings = BatchStatsCollectorCfg(args.batch_size,reduction_dictionary=args.spatial_reductions,
-                                                      # todo: maybe split measure and test include fn in Settings
-                                                      include_matcher_fn=args.include_matcher_fn)
-            class_stats=measure_data_statistics(train_loader, model, epochs=epochs,
-                                                               model_device=args.device,
-                                                               collector_device=args.collector_device,
-                                                               batch_size=args.batch_size,
-                                                               measure_settings=measure_settings)
-            all_class_ref_stats.append(class_stats)
+        ref_stats=measure(model,ds,args)
         logging.info('saving reference stats dict')
-        th.save(all_class_ref_stats, calibrated_path)
+        th.save(ref_stats, calibrated_path)
 
+    if args.auto_layer_selection:
+        logging.info(f'layer clustering')
+        selected_layers_names = findClusterMain(args,ref_stats,cut_off_thres=[0.4])
+        # currently we can only look at
+        selected_layers_names = selected_layers_names['spatial-mean'][len(selected_layers_names['spatial-mean'])//2]
+        logging.info(f'selected {len(selected_layers_names)}/{len(ref_stats[0])} layers: {selected_layers_names}')
+        args.include_matcher_fn_test = WhiteListInclude(selected_layers_names)
+    # if not specified use all layers
+    if args.include_matcher_fn_test is None:
+        args.include_matcher_fn_test=args.include_matcher_fn_measure
+    logging.info(f'building OOD detector')
+    detector = OODDetector(model, ref_stats, right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
+                           include_matcher_fn=args.include_matcher_fn_test)
+
+    logging.info(f'evaluating inliers')
     val_ds = get_dataset(args.dataset, args.test_split ,expected_transform_test)
     if args.limit_test:
         val_ds = limit_ds(val_ds,args.limit_test,per_class=False)
-    # get the pvalue estimators per class per reduction for the channel and final output functions
-    # here we can implement subsample channles and other layer reductions exept Fisher
-    # todo add Specs to fuse the pvalue matcher and OODDetector as they are tightly coupled.
-    detector = OODDetector(model,all_class_ref_stats,right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
-                           include_matcher_fn=args.include_matcher_fn)
-
-    # todo replace all targets to in or out of distribution?
     # todo add adversarial samples test
-    # run in-dist data evaluate per class to simplify analysis
-    logging.info(f'evaluating inliers')
+    # optional run in-dist data evaluate per class to simplify analysis
     #for class_id,class_name in enumerate(val_ds.classes):
     #    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     sampler = None
     val_loader = th.utils.data.DataLoader(
             val_ds, sampler=sampler,
             batch_size=args.batch_size, shuffle=False,
-            num_workers=8, pin_memory=True, drop_last=True)
+            num_workers=0, pin_memory=True, drop_last=True)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
     logging.info(f'evaluating outliers')
 
@@ -979,6 +1073,118 @@ def measure_and_eval(args : Settings):
 
     th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}{args.tag}.pth')
     result_summary(rejection_results,args.get_args_dict())
+
+
+### 'maxclust' is used to choose number of clusters, 'distance' to choose according to threshold
+def findCluster(h0_data, spatial_reduction_name, name_data_set, t=0.8, criterion='distance', plot_layer=False,
+                plot_summary=False,channle_reduction_method='mahalanobis'):
+    import seaborn as sns
+    import scipy.cluster.hierarchy as spc
+
+    corr_list = list()
+    all_layers = [str(i) for i in h0_data[0].keys()]
+    for class_id in range(0, len(h0_data)):
+        dim_num = np.array([i for i in range(1, len(all_layers) + 1)])
+        full_class = []
+        for layer_name in all_layers:
+            layer_pval = h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[channle_reduction_method]['record']
+            full_class.append(layer_pval)
+        full_dat_log = th.log(th.stack(full_class, 1).squeeze(-1)).cpu().numpy()
+        corr = np.corrcoef(full_dat_log.T) ## correlation
+        if np.isnan(corr).sum() > 0:
+            import pdb; pdb.set_trace()
+        corr_list.append(corr)
+        if plot_layer:
+            # fig, axes = plt.subplots(ncols = 2, nrows = 1, sharex = True, figsize = (14, 8), sharey = False)
+            #First create the clustermap figure
+            clustermap = sns.clustermap(corr, col_cluster=False, linewidth = 0.0, figsize = (12, 8), method = 'complete',
+                                        cbar_pos = (1, .2, .03, .4))
+            clustermap.fig.suptitle(f'Correlation_{name_data_set}_{spatial_reduction_name}_class_{class_id}')
+            # set the gridspec to only cover half of the figure
+            clustermap.gs.update(left=0.05, right=0.45)
+            #create new gridspec for the right part
+            gs2 = matplotlib.gridspec.GridSpec(1, 1, left = 0.6, top = 0.9)
+            # create axes within this new gridspec
+            ax2 = clustermap.fig.add_subplot(gs2[0])
+            # plot boxplot in the new axes
+            #axes[0].title.set_text('Correlation between layers')
+            for l in range(1, 5, 2):
+                fisher_statistic = np.apply_along_axis(lambda x: -sum(x), 1, full_dat_log[:, range(0, full_dat_log.shape[1], l)])
+                np.var(fisher_statistic)
+                sns.kdeplot(fisher_statistic, shade = True, label = f'each {l} column - var {np.var(fisher_statistic):.3f}', ax = ax2)
+            plt.legend()
+            plt.show()
+            clustermap.savefig(f'Images/Correlation_{name_data_set}_{spatial_reduction_name}_class_{class_id}.png')
+    #### Select dimensions according to correlation
+    ### Heirarchal clustering
+    avg_corr = sum(corr_list) / max(len(corr_list),1)
+    pwdist = 1 - abs(avg_corr)
+    # take upper half of the distance metric 1-corr
+    #pwdist  = spc.distance.pdist(1 - abs(avg_corr)) ### abs for sake of correctness
+    pwdist = pwdist[np.triu_indices_from(pwdist, 1)]
+    linkage = spc.linkage(pwdist, method='ward')
+    # apply thershold to trim connections between weakly correlated layers
+    cluster = spc.fcluster(linkage, t = t, criterion = criterion)
+    ### Sample from clusters
+    chosen_layers = []
+    for j in range(1, max(cluster) + 1):
+        temp_dims = dim_num[np.where(cluster == j)[0]] - 1
+        # take layer with maximum correlation with other layers (avg)
+        chosen_dim = temp_dims[np.argmax(avg_corr[temp_dims, :][:, temp_dims].sum(1))]
+        chosen_layers.append(chosen_dim)
+
+    if plot_summary:
+        fig, axes = plt.subplots(ncols = 2, nrows = 1, figsize = (12, 4), sharey = False, sharex = False)
+        fig.suptitle(f'cutoff = {t}, selecting from clusters' , fontsize=14)
+        sns.heatmap(avg_corr[chosen_layers, :][:, chosen_layers], ax = axes[0])
+        all_fisher_statistic = np.apply_along_axis(lambda x: -sum(x), 1, full_dat_log)
+        sns.kdeplot(all_fisher_statistic, label = f'All - var {np.var(all_fisher_statistic):.1f}', shade = True,  ax = axes[1])
+        fisher_statistic = np.apply_along_axis(lambda x: -sum(x), 1, full_dat_log[:, chosen_layers])
+        sns.kdeplot(fisher_statistic, label = f'{len(chosen_layers)} clusters - var {np.var(fisher_statistic):.1f}, expected - {(len(chosen_layers) / len(dim_num)) * np.var(all_fisher_statistic):.1f} ', shade = True,  ax = axes[1])
+        plt.legend()
+    return [all_layers[k] for k in chosen_layers], chosen_layers, corr_list, full_dat_log
+
+def findClusterMain(settings: Settings, h0_data,cut_off_thres=None,plot=False):
+    # corr distance required to consider correlated layers as separate clusters, higher value will lead to less clusters
+    cut_off_thres = cut_off_thres or [i / 20 for i in range(0, 20)]
+    net = settings.model
+    data_set = settings.dataset
+    reudction_list = settings.spatial_reductions.keys()
+    res_dict = {}
+    if plot:
+        #### Create variance as function of t plots
+        plt.figure(figsize=(14, 8))
+
+    for j in reudction_list:
+        result_t_fisher = []
+        result_t_conditional = []
+        res_dict[j]=[]
+        for t in cut_off_thres:
+            layer_name, ind, var_corr, full_dat_log = findCluster(h0_data, spatial_reduction_name=j, name_data_set=data_set, t=t,
+                                                                  criterion='distance')
+            res_dict[j].append(layer_name)
+            if plot:
+                #### Condiditional fisher output distribution
+                fisher_statistic = np.apply_along_axis(lambda x: -sum(x), 1, full_dat_log[:, ind])
+                result_t_fisher.append(np.var(fisher_statistic))
+                full_dat_log[full_dat_log > np.log(0.1)] = 0
+                fisher_statistic = np.apply_along_axis(lambda x: -sum(x), 1, full_dat_log[:, ind])
+                result_t_conditional.append(np.var(fisher_statistic))
+        if plot:
+            plt.plot(cut_off_thres, result_t_fisher, label=f'reduction - {j}, {data_set}, {net}, Fisher')
+            plt.plot(cut_off_thres, result_t_conditional, label=f'reduction - {j}, {data_set}, {net}, Fisher_conditional')
+            plt.legend()
+        # res_dict[i][j] = result_t
+        # res_dict[i][j] = layer_name
+        # avg_corr = sum(var_corr) / len(var_corr)
+        # var_list = [(i - avg_corr)**2 for i in var_corr]
+        # ax = plt.axes()
+        # sns.heatmap(sum(var_list) / len(var_list), label = 'Variance of correlation matrix')
+        # ax.set_title('Variance of correlation matrix')
+
+    # layer_name, ind, var_corr, fisher = findCluster(h0_data, spatial_reduction_name='spatial-max', name_data_set=data_set, t=0.5,
+    #                                                 criterion='distance')
+    return res_dict
 
 ## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
 # specifically for denesent)
@@ -1005,11 +1211,13 @@ class RegxInclude():
 densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3','avg_pool'])
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
-    exp_id = 0
+    np.set_printoptions(3)
+    exp_id = 4
     device_id = exp_id % th.cuda.device_count()
     recompute = True
     tag=''
-    # resnet18_cats_dogs = Settings(
+    auto_select_layers=False
+    # resnet18_cats_dogs = Seattings(
     #     model='resnet',
     #     dataset='cats_vs_dogs',
     #     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
@@ -1020,6 +1228,7 @@ if __name__ == '__main__':
         def __init__(self,**kwargs):
             super().__init__(model='ResNet34', #include_matcher_fn=resnet_mahalanobis_matcher_fn,, tag='-@mahalanobis',
                              device=f'cuda:{device_id}',
+                             auto_layer_selection=auto_select_layers,
                              augment_measure=False,recompute=recompute, **kwargs)
     resnet34_cifar10 = R34ExpGroupSettings(
         dataset='cifar10',
@@ -1033,6 +1242,7 @@ if __name__ == '__main__':
         num_classes=100,
         model_cfg={'num_c': 100},
         batch_size=500,
+        collector_device='cpu',
         ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
     )
 
@@ -1045,8 +1255,10 @@ if __name__ == '__main__':
     )
     class DN3ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
-            super().__init__(model='DenseNet3', #include_matcher_fn=include_densenet_even_layers_fn,
-                             device=f'cuda:{exp_id % th.cuda.device_count()}', tag=tag,recompute=recompute, **kwargs)
+            super().__init__(model='DenseNet3',
+                             device=f'cuda:{exp_id % th.cuda.device_count()}', tag=tag, recompute=recompute,
+                             auto_layer_selection=auto_select_layers, **kwargs)
+
     densenet_cifar10 = DN3ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
@@ -1060,7 +1272,8 @@ if __name__ == '__main__':
         model_cfg={'num_classes': 100,'depth':100},
         ckt_path='densenet_cifar100_ported.pth',
         batch_size=500,
-        )
+        collector_device='cpu'
+    )
 
     densenet_svhn = DN3ExpGroupSettings(
         dataset='SVHN',
@@ -1080,10 +1293,6 @@ if __name__ == '__main__':
     #     include_matcher_fn=densenet_mahalanobis_matcher_fn
     # )
 
-    # if device_id%2==0:
-    #     experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn]
-    # else:
-    #     experiments = [densenet_cifar10, densenet_cifar100, densenet_svhn]
     #experiments = [densenet_svhn_cross_cifar10]
     experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn, densenet_cifar10, densenet_cifar100, densenet_svhn]
     experiments = [experiments[exp_id]]
