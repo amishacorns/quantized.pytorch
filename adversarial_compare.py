@@ -14,11 +14,16 @@ from utils.log import setup_logging
 from utils.absorb_bn import get_bn_params
 from dataclasses import dataclass
 import inspect
+import gc
 from utils.misc import Recorder
 from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
 from typing import Callable,List,Dict
-
-
+import torch.nn.functional as F
+from functools import partial
+_EDGE_SAMPLES=100
+_NUM_EDGE_FISHER=100
+# use this setting to save gpu memory
+_USE_PERCENTILE_DEVICE = True
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
     return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d)
 
@@ -63,6 +68,14 @@ def spatial_min_max(x,k=1):
     return th.stack([spatial_max(x,k),spatial_min(x,k)],1).view(x.shape[0],-1)
 
 
+def spatial_mean_max(x,k=1):
+    return th.stack([spatial_max(x,k),spatial_mean(x)],1).view(x.shape[0],-1)
+
+
+def spatial_min_mean_max(x,k=1):
+    return th.stack([spatial_max(x,k),spatial_mean(x),spatial_min(x,k)],1).view(x.shape[0],-1)
+
+
 def spatial_l2(x):
     if x.dim() < 3:
         return x
@@ -73,11 +86,63 @@ _DEFAULT_SPATIAL_REDDUCTIONS = {
             'spatial-mean': spatial_mean,
             'spatial-max': spatial_max,
             #'spatial-min': spatial_min,
-            'spatial-min_max': spatial_min_max,
+            #'spatial-min_max': spatial_min_max,
+            'spatial-mean_max': spatial_mean_max,
+            #'spatial-min_mean_max': spatial_min_mean_max,
+            #'spatial-l2':spatial_l2,
             # 'spatial-l2':spatial_l2
         }
 
-def sample_random_channels(tracker_dict_per_class,relative_cut=0.1):
+def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class = 5, relative_cut = 0.05):
+    all_class_channel_dict = [{}]*len(tracker_dict_per_class)
+# =============================================================================
+#     layer_list = [i for i in tracker_dict_per_class[0].keys()]
+#     layer_dict = dict.fromkeys(layer_list)
+# =============================================================================
+    for temp_layer in tracker_dict_per_class[0].keys():
+        def extractNormalizedQuants():
+            layer_quants = []
+            for class_temp in range(0, len(tracker_dict_per_class)):
+                layer_quants.append(tracker_dict_per_class[class_temp][temp_layer].get_distribution_histogram()[1])
+            quants = th.stack(layer_quants, -1)
+            quants_norm = quants
+            quants_norm = F.normalize(quants_norm, dim = [0, 2], p = 2)
+            return quants_norm
+        quants_norm = extractNormalizedQuants()
+        for temp_base_class in range(0, len(tracker_dict_per_class)):
+            quant_base_class = quants_norm[:,:,temp_base_class].unsqueeze(-1).expand([quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
+            var_per_quant = ((quants_norm - quant_base_class)**2).sum(2)
+            var_per_channel = var_per_quant.sum(0)
+            _, ranked_channels = th.sort(var_per_channel)
+            nchannels = min(np.ceil(len(ranked_channels)*relative_cut).astype(np.int32),max_per_class)
+            all_class_channel_dict[temp_base_class][temp_layer] = ranked_channels[-(nchannels + 1):-1]
+    return all_class_channel_dict
+
+def find_most_seperable_channels(tracker_dict_per_class, max_channels_per_class = 5):
+    layer_list = [i for i in tracker_dict_per_class[0].keys()]
+    layer_dict = dict.fromkeys(layer_list)
+    for temp_layer in layer_dict.keys():
+        def extractNormalizedQuants():
+            layer_quants = []
+            for class_temp in range(0, len(tracker_dict_per_class)):
+                layer_quants.append(tracker_dict_per_class[class_temp][temp_layer].get_distribution_histogram()[1])
+            quants = th.stack(layer_quants, -1)
+            quants_norm = quants
+            quants_norm = F.normalize(quants_norm, dim = [0, 2], p = 2)
+            return quants_norm
+        quants_norm = extractNormalizedQuants()
+        chosen_channels = list()
+        for temp_base_class in range(0, len(tracker_dict_per_class)):
+            quant_base_class = quants_norm[:,:,temp_base_class].unsqueeze(-1).expand([quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
+            var_per_quant = ((quants_norm - quant_base_class)**2).sum(2)
+            var_per_channel = var_per_quant.sum(0)
+            _, ranked_channels = th.sort(var_per_channel)
+            chosen_channels.append(ranked_channels[-(max_channels_per_class + 1):-1])
+        layer_dict[temp_layer] = th.unique(th.cat(chosen_channels))
+    return(layer_dict)
+
+
+def sample_random_channels(tracker_dict_per_class,relative_cut=0.05):
     ret = {}
     for k,v in tracker_dict_per_class[0].items():
         nchannels = v.mean.shape[0]
@@ -310,18 +375,24 @@ def gen_inference_fn(ref_stats_dict):
 
 
 class PvalueMatcher():
-    def __init__(self,percentiles,quantiles, two_side=True, right_side=False):
+    def __init__(self,percentiles,quantiles, two_side=True, right_side=False,use_percentiles_device=_USE_PERCENTILE_DEVICE):
         self.percentiles = percentiles
         self.quantiles = quantiles.t().unsqueeze(0)
         self.num_percentiles = percentiles.shape[0]
+        self.use_percentiles_device = use_percentiles_device
         self.right_side = right_side
         self.two_side = (not right_side) and two_side
 
     ## todo document!
     def __call__(self, x):
         if x.device != self.quantiles.device:
-            self.percentiles=self.percentiles.to(x.device)
-            self.quantiles = self.quantiles.to(x.device)
+            if not hasattr(self,'use_percentiles_device') or self.use_percentiles_device != _USE_PERCENTILE_DEVICE:
+                self.use_percentiles_device=_USE_PERCENTILE_DEVICE
+            if self.use_percentiles_device:
+                x = x.to(self.percentiles.device)
+            else:
+                self.percentiles=self.percentiles.to(x.device)
+                self.quantiles = self.quantiles.to(x.device)
         stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], self.num_percentiles)
         quant_layer = self.quantiles.expand(stat_layer.shape[0], stat_layer.shape[1], self.num_percentiles)
 
@@ -353,7 +424,7 @@ class PvalueMatcherFromSamples(PvalueMatcher):
             ).clamp(1 / num_samples, 1 - 1 / num_samples).unique()
             meter = OnlineMeter(batched=True, track_percentiles=True,
                                 target_percentiles=adjusted_target_percentiles,
-                                per_channel=False, number_edge_samples=10,
+                                per_channel=False, number_edge_samples=_NUM_EDGE_FISHER,
                                 track_cov=False)
             meter.update(samples)
             # logging.debug(
@@ -575,7 +646,7 @@ class BatchStatsCollectorCfg():
                           0.02, 0.023, 0.024,0.025,0.026, 0.027 ,0.03,
                           # collect intervals for better layer reduction statistic approximation
                           0.045,0.047,0.049,0.05,0.051,0.053,0.055, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5]) # percentiles will be mirrored
-    num_edge_samples: int = 100
+    num_edge_samples: int = _EDGE_SAMPLES
 
     def __init__(self,batch_size,reduction_dictionary = None,include_matcher_fn = None,
                  sampled_channels : Dict[str,th.Tensor] = None):
@@ -583,7 +654,7 @@ class BatchStatsCollectorCfg():
         # which reductions to use ?
         self.reduction_dictionary = reduction_dictionary or _DEFAULT_SPATIAL_REDDUCTIONS
         # which layers to collect?
-        self.include_matcher_fn = include_matcher_fn or (lambda n, m: isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.Linear))
+        self.include_matcher_fn = include_matcher_fn or _default_matcher_fn
         assert 0.5 == self.target_percentiles[-1], 'tensor must include median'
         self.target_percentiles = th.cat([self.target_percentiles, (1 - self.target_percentiles).sort()[0]])
         # adjust percentiles to the specified batch size
@@ -817,7 +888,7 @@ def measure_v2(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=0, pin_memory=True, drop_last=False)
+            num_workers=8, pin_memory=True, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
@@ -848,12 +919,13 @@ def measure_v2(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=0, pin_memory=True, drop_last=False)
+            num_workers=8, pin_memory=True, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
                                                   include_matcher_fn=args.include_matcher_fn_measure,
-                                                  sampled_channels = sampled_channels_dict)
+                                                  sampled_channels = sampled_channels_dict[class_id] if \
+                                                      type(sampled_channels_dict)==list else sampled_channels_dict)
 
         # collect basic reduction stats
         class_stats = measure_data_statistics_part2(all_class_stat_trackers[class_id],train_loader, model, epochs=5 if args.augment_measure else 1,
@@ -1279,7 +1351,7 @@ def measure(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=0, pin_memory=True, drop_last=False)
+            num_workers=8, pin_memory=True, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
@@ -1310,8 +1382,12 @@ def measure_and_eval(args : Settings):
     #     import torchvision.transforms.transforms as ttf
     #     expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=True)
     #     expected_transform_measure.transforms[0] = ttf.RandomResizedCrop((32, 32), scale=(0.8, 1))
+    exp_tag = f'{args.model}-{args.dataset}'
+    if args.augment_measure:
+        exp_tag+=f'-{"augment"}'
 
-    calibrated_path = f'measured_stats_per_class-{args.model}-{args.dataset}-{"augment" if args.augment_measure else "no_augment"}{args.tag}.pth'
+    exp_tag+=f'-{args.tag}'
+    calibrated_path = f'measured_stats_per_class-{exp_tag}.pth'
     if not args.recompute and os.path.exists(calibrated_path):
         ref_stats = th.load(calibrated_path,map_location=args.collector_device if args.collector_device!='same' else args.device)
     else:
@@ -1334,7 +1410,7 @@ def measure_and_eval(args : Settings):
     logging.info(f'building OOD detector')
     detector = OODDetector(model, ref_stats, right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
                            include_matcher_fn=args.include_matcher_fn_test)
-
+    gc.collect()
     logging.info(f'evaluating inliers')
     val_ds = get_dataset(args.dataset, args.test_split ,expected_transform_test)
     if args.limit_test:
@@ -1347,7 +1423,7 @@ def measure_and_eval(args : Settings):
     val_loader = th.utils.data.DataLoader(
             val_ds, sampler=sampler,
             batch_size=args.batch_size, shuffle=False,
-            num_workers=0, pin_memory=True, drop_last=True)
+            num_workers=8, pin_memory=False, drop_last=True)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
     logging.info(f'evaluating outliers')
 
@@ -1362,7 +1438,7 @@ def measure_and_eval(args : Settings):
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,alpha_list=args.alphas)
 
-    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{args.model}-{args.dataset}{args.tag}.pth')
+    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{exp_tag}.pth')
     result_summary(rejection_results,args.get_args_dict())
 
 
@@ -1508,32 +1584,128 @@ densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3',
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
     np.set_printoptions(3)
-    exp_id = 0
-    device_id = 0#exp_id % th.cuda.device_count()
-    recompute = 1
-    channel_selection_fn = sample_random_channels
-    auto_select_layers=0#True
-    tag='-@random_channels'
-    # resnet18_cats_dogs = Seattings(
+    exp_ids = [8]
+    device_id = 2 #exp_ids[0] % th.cuda.device_count()
+    recompute = 0
+    #
+    tag = '-@baseline'
+    channel_selection_fn = None
+    auto_select_layers=0
+    #
+    # tag = '-@layers_select'
+    # channel_selection_fn = None
+    # auto_select_layers = 1
+    #
+    # tag = '-@random_c_select_0.05'
+    # channel_selection_fn = partial(sample_random_channels,relative_cut=0.05)
+    # auto_select_layers = 0
+    #
+    # tag = '-@layers+random_c_select_0.05'
+    # channel_selection_fn = partial(sample_random_channels,relative_cut=0.05)
+    # auto_select_layers = 1
+    #
+    # tag = f'-@chosen_channels_all_class'
+    # channel_selection_fn = partial(find_most_seperable_channels,max_channels_per_class = 5)
+    # auto_select_layers=False
+
+    # tag = f'-@chosen_channels_per_class'
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent,max_per_class = 5, relative_cut = 0.05)
+    # auto_select_layers=False
+
+    # resnet18_cats_dogs = Settings(
     #     model='resnet',
     #     dataset='cats_vs_dogs',
     #     model_cfg={'dataset': 'imagenet', 'depth': 18, 'num_classes': 2},
     #     ckt_path='/home/mharoush/myprojects/convNet.pytorch/results/r18_cats_N_dogs/checkpoint.pth.tar',
     #     device=f'cuda:{device_id}'
     # )
+
     class R34ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
             super().__init__(model='ResNet34',#limit_measure=1000,limit_test=1000,
-                             #include_matcher_fn=resnet_mahalanobis_matcher_fn,, tag='-@mahalanobis',
+                             #include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+                             tag=tag,
                              device=f'cuda:{device_id}',
                              auto_layer_selection=auto_select_layers,
                              channel_selection_fn = channel_selection_fn,
                              augment_measure=False,recompute=recompute, **kwargs)
+
+    class DN3ExpGroupSettings(Settings):
+        def __init__(self,**kwargs):
+            super().__init__(model='DenseNet3',
+                             # include_matcher_fn_test=include_densenet_even_layers_fn if not auto_select_layers else
+                             #                                                                _default_matcher_fn,
+                             device=f'cuda:{device_id}', tag=tag, recompute=recompute,
+                             auto_layer_selection=auto_select_layers,
+                             channel_selection_fn=channel_selection_fn, **kwargs)
+
+    r18_places = Settings(
+        model='resnet',  # limit_measure=1000,limit_test=1000,
+        dataset='places365_standard',
+        batch_size=512,
+        model_cfg={'num_classes': 365, 'depth': 18, 'dataset': 'imagenet'},
+        ckt_path='model_zoo/resnet18_places365.pth.tar',
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        tag=tag,
+        device=f'cuda:{device_id}',
+        collector_device='cpu',
+        ood_datasets=['imagenet','DomainNet-sketch-A+DomainNet-sketch-B',
+                      'DomainNet-quickdraw-A+DomainNet-quickdraw-B',
+                      'DomainNet-infograph-A+DomainNet-infograph-B','random-imagenet'],
+        transform_dataset='imagenet',
+        auto_layer_selection=auto_select_layers,
+        channel_selection_fn=channel_selection_fn,
+        augment_measure=False, recompute=recompute
+    )
+    r18_lsun = Settings(
+        model='resnet',  # limit_measure=1000,limit_test=1000,
+        dataset='LSUN-raw',
+        limit_measure=100000,
+        model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
+        ckt_path='model_zoo/resnet18_lsun.pth.tar',
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        tag=tag,
+        device=f'cuda:{device_id}',
+        collector_device='cpu',
+        ood_datasets=['imagenet','places365_standard-lsun','random-imagenet'],
+        transform_dataset='imagenet',
+        auto_layer_selection=auto_select_layers,
+        channel_selection_fn=channel_selection_fn,
+        augment_measure=False, recompute=recompute
+    )
+
+    oe_cifar10 = Settings(
+        model='WideResNet',  # limit_measure=1000,limit_test=1000,
+        dataset='cifar10',
+        model_cfg={'num_classes': 10, 'depth': 40, 'widen_factor': 2},
+        ckt_path='model_zoo/cifar10_wrn_oe_scratch_epoch_99.pt',
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        tag=tag,
+        device=f'cuda:{device_id}',
+        auto_layer_selection=auto_select_layers,
+        channel_selection_fn=channel_selection_fn,
+        augment_measure=False, recompute=recompute
+    )
+
+    oe_cifar100 = Settings(
+        model='WideResNet',  # limit_measure=1000,limit_test=1000,
+        dataset='cifar100',
+        model_cfg={'num_classes': 100, 'depth': 40, 'widen_factor': 2},
+        ckt_path='model_zoo/cifar100_wrn_oe_scratch_epoch_99.pt',
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        tag=tag,
+        device=f'cuda:{device_id}',
+        auto_layer_selection=auto_select_layers,
+        channel_selection_fn=channel_selection_fn,
+        batch_size=500,
+        collector_device='cpu',
+        augment_measure=False, recompute=recompute
+    )
     resnet34_cifar10 = R34ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
         model_cfg={'num_c': 10},
-        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar10.pth',
+        ckt_path='model_zoo/resnet_cifar10.pth',
     )
 
     resnet34_cifar100 = R34ExpGroupSettings(
@@ -1542,7 +1714,7 @@ if __name__ == '__main__':
         model_cfg={'num_c': 100},
         batch_size=500,
         collector_device='cpu',
-        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_cifar100.pth',
+        ckt_path='model_zoo/resnet_cifar100.pth',
     )
 
     resnet34_svhn = R34ExpGroupSettings(
@@ -1550,29 +1722,21 @@ if __name__ == '__main__':
         num_classes=10,
         model_cfg={'num_c': 10},
         batch_size=1000,
-        ckt_path='/home/mharoush/myprojects/Residual-Flow/pre_trained/resnet_svhn.pth',
+        ckt_path='model_zoo/resnet_svhn.pth',
     )
-    class DN3ExpGroupSettings(Settings):
-        def __init__(self,**kwargs):
-            super().__init__(model='DenseNet3',
-                             include_matcher_fn_test=include_densenet_even_layers_fn if not auto_select_layers else
-                                                                                            _default_matcher_fn,
-                             device=f'cuda:{device_id}', tag=tag, recompute=recompute,
-                             auto_layer_selection=auto_select_layers,
-                             channel_selection_fn=channel_selection_fn, **kwargs)
 
     densenet_cifar10 = DN3ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
         model_cfg={'num_classes': 10,'depth':100},
-        ckt_path='densenet_cifar10_ported.pth',
+        ckt_path='model_zoo/densenet_cifar10_ported.pth',
     )
 
     densenet_cifar100 = DN3ExpGroupSettings(
         dataset='cifar100',
         num_classes=100,
         model_cfg={'num_classes': 100,'depth':100},
-        ckt_path='densenet_cifar100_ported.pth',
+        ckt_path='model_zoo/densenet_cifar100_ported.pth',
         batch_size=500,
         collector_device='cpu'
     )
@@ -1581,7 +1745,7 @@ if __name__ == '__main__':
         dataset='SVHN',
         num_classes = 10,
         model_cfg={'num_classes': 10,'depth':100},
-        ckt_path='densenet_svhn_ported.pth',
+        ckt_path='model_zoo/densenet_svhn_ported.pth',
     )
 
     # # this can be used used to produced measure stats dict on ood data for a given model
@@ -1596,8 +1760,9 @@ if __name__ == '__main__':
     # )
 
     #experiments = [densenet_svhn_cross_cifar10]
-    experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn, densenet_cifar10, densenet_cifar100, densenet_svhn]
-    experiments = [experiments[exp_id]]
+    experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn, densenet_cifar10, densenet_cifar100,
+                   densenet_svhn, oe_cifar10, oe_cifar100,r18_places,r18_lsun]
+    experiments = [experiments[exp_id] for exp_id in exp_ids]
     setup_logging()
     for args in experiments:
         logging.info(args)
