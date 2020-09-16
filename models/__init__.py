@@ -9,5 +9,6 @@ from .mobilenet import *
 from .mobilenet_tv import *
 from .mobilenet_quantized import *
 from .densenet_tv import *
-from .densenet_mahalanobis import *
-from .resnet_mahalanobis import *
+from .densenet_mahalanobis import DenseNet3
+from .resnet_mahalanobis import ResNet
+from .wrn_oe import WideResNet

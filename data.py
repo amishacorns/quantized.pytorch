@@ -55,10 +55,20 @@ def get_dataset(name, split='train', transform=None,
                 ds += ds_
         return ds
     if name.endswith('-raw'):
-        assert name[:-4] in ['cifar10','cifar100']
         ds_dir_name = name[:-4]
     elif name.startswith('folder-'):
         ds_dir_name = name[7:]
+    elif name == 'places365_standard-lsun':
+        ds_dir_name = 'places365_standard'
+        name = ds_dir_name
+        class_ids = filter(lambda x: x not in [52, 66, 91, 92, 102, 121, 203, 215, 284, 334],range(365))
+
+    elif name.startswith('DomainNet-'):
+        # real,A
+        _ ,domain,set = name.split('-')
+        ds_dir_name = os.path.join('DomainNet',split,domain)
+        class_ids = range(173) if set == 'A' else range(173,345)
+
     elif name.endswith('-dogs') or name.endswith('-cats'):
         if name.startswith('imagenet-'):
             if name.endswith('dogs'):
@@ -136,7 +146,7 @@ def get_dataset(name, split='train', transform=None,
         ds = balance_image_folder_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
                                      seed=limit_shuffle_seed, class_ids=class_ids)
         return ds
-    elif name in ['imagenet', 'cats_vs_dogs'] or any(i in name for i in ['imagine-', '-raw']):
+    elif name in ['imagenet', 'cats_vs_dogs','places365_standard'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
             root = os.path.join(root, 'train')
         else:
@@ -150,6 +160,12 @@ def get_dataset(name, split='train', transform=None,
             else:
                 ds=balance_image_folder_ds(ds, limit,per_class=per_class_limit,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
         return ds
+    elif name.startswith('DomainNet-'):
+        ds = datasets.ImageFolder(root=root,
+                                    transform=transform,
+                                    target_transform=target_transform)
+        return limit_ds(ds,-1,shuffle=False,allowed_classes=class_ids)
+
     elif name.startswith('random-'):
         ds_name = name[7:]
         if ds_name in _DATASET_META_DATA:
@@ -217,7 +233,7 @@ def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False
     dataset.samples = samps
     return dataset
 
-def limit_ds(dataset, n_samples,per_class=True,shuffle=True,seed=0,allowed_classes=None):
+def limit_ds(dataset, n_samples=-1,per_class=True,shuffle=True,seed=0,allowed_classes=None):
     if not hasattr(dataset,'targets'):
         if hasattr(dataset,'labels'):
             dataset.targets=dataset.labels
@@ -252,6 +268,11 @@ def limit_ds(dataset, n_samples,per_class=True,shuffle=True,seed=0,allowed_class
             ids = torch.arange(0,n_samples)
     ds = torch.utils.data.Subset(dataset,ids)
     ds.targets = torch.tensor(dataset.targets)[ids]
+    if allowed_classes:
+        ds.classes = [c for c in dataset.classes if c in allowed_classes]
+    else:
+        ds.classes = dataset.classes
+
     return ds
 
 _imagenet_dogs = {
