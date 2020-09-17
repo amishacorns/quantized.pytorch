@@ -1,15 +1,19 @@
 import os
-import torchvision.datasets as datasets
+import warnings
+
 import torch
+import torchvision.datasets as datasets
+
 from utils.dataset import RandomDatasetGenerator
 from utils.misc import _META
-import warnings
+
 warnings.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
 
 
 class _DS_META(_META):
-    _ATTRS=['nclasses','shape','mean','std']
-    def __init__(self,**kwargs):
+    _ATTRS = ['nclasses', 'shape', 'mean', 'std']
+
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def get_normalization(self):
@@ -61,13 +65,16 @@ def get_dataset(name, split='train', transform=None,
     elif name == 'places365_standard-lsun':
         ds_dir_name = 'places365_standard'
         name = ds_dir_name
-        class_ids = filter(lambda x: x not in [52, 66, 91, 92, 102, 121, 203, 215, 284, 334],range(365))
+        class_ids = filter(lambda x: x not in [52, 66, 91, 92, 102, 121, 203, 215, 284, 334], range(365))
 
     elif name.startswith('DomainNet-'):
-        # real,A
-        _ ,domain,set = name.split('-')
-        ds_dir_name = os.path.join('DomainNet',split,domain)
-        class_ids = range(173) if set == 'A' else range(173,345)
+        domain, set = name.split('-')[1:3]
+        class_ids = range(173) if set == 'A' else range(173, 345)
+        if name.endswith('-measure') and train:
+            ds_dir_name = os.path.join('DomainNet', 'measure', domain)
+        else:
+            ds_dir_name = os.path.join('DomainNet', 'train' if train else 'test', domain)
+
 
     elif name.endswith('-dogs') or name.endswith('-cats'):
         if name.startswith('imagenet-'):
@@ -126,19 +133,24 @@ def get_dataset(name, split='train', transform=None,
     elif 'stl10' in name:
         if train and name.endswith('train_test'):
             return datasets.STL10(root=root,
-                              split='train',
-                              transform=transform,
-                              target_transform=target_transform,
-                              download=download) + datasets.STL10(root=root,
-                              split='test',
-                              transform=transform,
-                              target_transform=target_transform,
-                              download=download)
+                                  split='train',
+                                  transform=transform,
+                                  target_transform=target_transform,
+                                  download=download) + datasets.STL10(root=root,
+                                                                      split='test',
+                                                                      transform=transform,
+                                                                      target_transform=target_transform,
+                                                                      download=download)
         return datasets.STL10(root=root,
                               split=split,
                               transform=transform,
                               target_transform=target_transform,
                               download=download)
+    elif name == 'LSUN':
+        return datasets.LSUN(root=root,
+                             classes=split,
+                             transform=transform,
+                             target_transform=target_transform)
     elif name.startswith('folder'):
         ds = datasets.ImageFolder(root=root,
                                   transform=transform,
@@ -146,17 +158,18 @@ def get_dataset(name, split='train', transform=None,
         ds = balance_image_folder_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
                                      seed=limit_shuffle_seed, class_ids=class_ids)
         return ds
-    elif name in ['imagenet', 'cats_vs_dogs','places365_standard'] or any(i in name for i in ['imagine-', '-raw']):
+    elif name in ['imagenet', 'cats_vs_dogs', 'places365_standard'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
             root = os.path.join(root, 'train')
         else:
             root = os.path.join(root, 'val')
-        ds= datasets.ImageFolder(root=root,
-                                    transform=transform,
-                                    target_transform=target_transform)
+        ds = datasets.ImageFolder(root=root,
+                                  transform=transform,
+                                  target_transform=target_transform)
         if limit or class_ids:
             if 'no_dd' in name:
-                ds = balance_image_folder_ds(ds, limit*len(ds.classes),per_class=False,shuffle=shuffle_before_limit,seed=limit_shuffle_seed)
+                ds = balance_image_folder_ds(ds, limit * len(ds.classes), per_class=False, shuffle=shuffle_before_limit,
+                                             seed=limit_shuffle_seed)
             else:
                 ds=balance_image_folder_ds(ds, limit,per_class=per_class_limit,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
         return ds
@@ -180,11 +193,7 @@ def get_dataset(name, split='train', transform=None,
         else:
             return get_dataset(name[7:],split, transform, target_transform,download, limit=limit,
                                shuffle_before_limit=shuffle_before_limit, datasets_path=__DATASETS_DEFAULT_PATH)
-    elif name == 'LSUN':
-        return datasets.LSUN(root=root,
-                                classes=split,
-                                transform=transform,
-                                target_transform=target_transform)
+
     elif hasattr(datasets,name):
         return getattr(datasets,name)(root=root,
                                 split=train,
@@ -265,11 +274,11 @@ def limit_ds(dataset, n_samples=-1,per_class=True,shuffle=True,seed=0,allowed_cl
         if shuffle:
             ids = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:n_samples]
         else:
-            ids = torch.arange(0,n_samples)
+            ids = torch.arange(0, len(dataset))[:n_samples]
     ds = torch.utils.data.Subset(dataset,ids)
     ds.targets = torch.tensor(dataset.targets)[ids]
     if allowed_classes:
-        ds.classes = [c for c in dataset.classes if c in allowed_classes]
+        ds.classes = [c for i, c in enumerate(dataset.classes) if i in allowed_classes]
     else:
         ds.classes = dataset.classes
 
