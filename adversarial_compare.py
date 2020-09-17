@@ -1,31 +1,37 @@
-import torch as th
-import torchvision as tv
-#from matplotlib import pyplot as plt
-import matplotlib.pylab as plt
-import matplotlib
-import numpy as np
-import models
-from data import get_dataset,limit_ds
-from preprocess import get_transform
-import os
-import tqdm
-import logging
-from utils.log import setup_logging
-from utils.absorb_bn import get_bn_params
-from dataclasses import dataclass
-import inspect
 import gc
-from utils.misc import Recorder
-from utils.meters import MeterDict, OnlineMeter,AverageMeter,accuracy
-from typing import Callable,List,Dict
-import torch.nn.functional as F
+import inspect
+import logging
+import os
+from dataclasses import dataclass
 from functools import partial
-_EDGE_SAMPLES=100
-_NUM_EDGE_FISHER=100
+from typing import Callable, List, Dict
+
+import matplotlib
+# from matplotlib import pyplot as plt
+import matplotlib.pylab as plt
+import numpy as np
+import torch as th
+import torch.nn.functional as F
+import tqdm
+
+import models
+from data import get_dataset, limit_ds
+from preprocess import get_transform
+from utils.log import setup_logging
+from utils.meters import MeterDict, OnlineMeter, AverageMeter, accuracy
+from utils.misc import Recorder
+
+_EDGE_SAMPLES = 100
+_NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
-_USE_PERCENTILE_DEVICE = True
+_USE_PERCENTILE_DEVICE = False
+_NUM_LOADER_WORKERS = 4
+
+
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
-    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d)
+    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d) or isinstance(m,
+                                                                                            th.nn.AdaptiveAvgPool2d) or isinstance(
+        m, th.nn.Linear)
 
 
 def spatial_mean(x):
@@ -83,63 +89,70 @@ def spatial_l2(x):
 
 
 _DEFAULT_SPATIAL_REDDUCTIONS = {
-            'spatial-mean': spatial_mean,
-            'spatial-max': spatial_max,
-            #'spatial-min': spatial_min,
-            #'spatial-min_max': spatial_min_max,
-            'spatial-mean_max': spatial_mean_max,
-            #'spatial-min_mean_max': spatial_min_mean_max,
-            #'spatial-l2':spatial_l2,
-            # 'spatial-l2':spatial_l2
-        }
+    'spatial-mean': spatial_mean,
+    'spatial-max': spatial_max,
+    # 'spatial-min': spatial_min,
+    # 'spatial-min_max': spatial_min_max,
+    'spatial-mean_max': spatial_mean_max,
+    # 'spatial-min_mean_max': spatial_min_mean_max,
+    # 'spatial-l2':spatial_l2,
+    # 'spatial-l2':spatial_l2
+}
 
-def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class = 5, relative_cut = 0.05):
-    all_class_channel_dict = [{}]*len(tracker_dict_per_class)
-# =============================================================================
-#     layer_list = [i for i in tracker_dict_per_class[0].keys()]
-#     layer_dict = dict.fromkeys(layer_list)
-# =============================================================================
-    for temp_layer in tracker_dict_per_class[0].keys():
-        def extractNormalizedQuants():
-            layer_quants = []
-            for class_temp in range(0, len(tracker_dict_per_class)):
-                layer_quants.append(tracker_dict_per_class[class_temp][temp_layer].get_distribution_histogram()[1])
-            quants = th.stack(layer_quants, -1)
-            quants_norm = quants
-            quants_norm = F.normalize(quants_norm, dim = [0, 2], p = 2)
-            return quants_norm
-        quants_norm = extractNormalizedQuants()
+
+def _extractNormalizedQuants(layer_name, tracker_dict_per_class):
+    layer_quants = []
+    min_len_perc = None
+    for class_id in range(0, len(tracker_dict_per_class)):
+        percentiles, quantiles = tracker_dict_per_class[class_id][layer_name].get_distribution_histogram()
+        layer_quants.append(quantiles)
+        if min_len_perc is None or len(percentiles) < min_len_perc:
+            min_len_perc = len(percentiles)
+    for id, q in enumerate(layer_quants):
+        num_p = len(q)
+        if num_p > min_len_perc:
+            slice_ = (num_p - min_len_perc) // 2
+            layer_quants[id] = layer_quants[id][slice_:-slice_]
+
+    quants = th.stack(layer_quants, -1)
+    quants_norm = quants
+    quants_norm = F.normalize(quants_norm, dim=[0, 2], p=2)
+    return quants_norm
+
+
+def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class=5, relative_cut=0.05):
+    all_class_channel_dict = [{}] * len(tracker_dict_per_class)
+    # =============================================================================
+    #     layer_list = [i for i in tracker_dict_per_class[0].keys()]
+    #     layer_dict = dict.fromkeys(layer_list)
+    # =============================================================================
+    for layer_name in tracker_dict_per_class[0].keys():
+        quants_norm = _extractNormalizedQuants(layer_name, tracker_dict_per_class)
         for temp_base_class in range(0, len(tracker_dict_per_class)):
-            quant_base_class = quants_norm[:,:,temp_base_class].unsqueeze(-1).expand([quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
-            var_per_quant = ((quants_norm - quant_base_class)**2).sum(2)
+            quant_base_class = quants_norm[:, :, temp_base_class].unsqueeze(-1).expand(
+                [quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
+            var_per_quant = ((quants_norm - quant_base_class) ** 2).sum(2)
             var_per_channel = var_per_quant.sum(0)
             _, ranked_channels = th.sort(var_per_channel)
-            nchannels = min(np.ceil(len(ranked_channels)*relative_cut).astype(np.int32),max_per_class)
-            all_class_channel_dict[temp_base_class][temp_layer] = ranked_channels[-(nchannels + 1):-1]
+            nchannels = min(np.ceil(len(ranked_channels) * relative_cut).astype(np.int32), max_per_class)
+            all_class_channel_dict[temp_base_class][layer_name] = ranked_channels[-(nchannels + 1):-1]
     return all_class_channel_dict
 
 def find_most_seperable_channels(tracker_dict_per_class, max_channels_per_class = 5):
     layer_list = [i for i in tracker_dict_per_class[0].keys()]
     layer_dict = dict.fromkeys(layer_list)
-    for temp_layer in layer_dict.keys():
-        def extractNormalizedQuants():
-            layer_quants = []
-            for class_temp in range(0, len(tracker_dict_per_class)):
-                layer_quants.append(tracker_dict_per_class[class_temp][temp_layer].get_distribution_histogram()[1])
-            quants = th.stack(layer_quants, -1)
-            quants_norm = quants
-            quants_norm = F.normalize(quants_norm, dim = [0, 2], p = 2)
-            return quants_norm
-        quants_norm = extractNormalizedQuants()
+    for layer_name in layer_dict.keys():
+        quants_norm = _extractNormalizedQuants(layer_name, tracker_dict_per_class)
         chosen_channels = list()
         for temp_base_class in range(0, len(tracker_dict_per_class)):
-            quant_base_class = quants_norm[:,:,temp_base_class].unsqueeze(-1).expand([quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
-            var_per_quant = ((quants_norm - quant_base_class)**2).sum(2)
+            quant_base_class = quants_norm[:, :, temp_base_class].unsqueeze(-1).expand(
+                [quants_norm.shape[0], quants_norm.shape[1], len(tracker_dict_per_class)])
+            var_per_quant = ((quants_norm - quant_base_class) ** 2).sum(2)
             var_per_channel = var_per_quant.sum(0)
             _, ranked_channels = th.sort(var_per_channel)
             chosen_channels.append(ranked_channels[-(max_channels_per_class + 1):-1])
-        layer_dict[temp_layer] = th.unique(th.cat(chosen_channels))
-    return(layer_dict)
+        layer_dict[layer_name] = th.unique(th.cat(chosen_channels))
+    return (layer_dict)
 
 
 def sample_random_channels(tracker_dict_per_class,relative_cut=0.05):
@@ -465,7 +478,10 @@ def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=Fals
                             pval = channel_reduction_record['pval_matcher'](pval)
                         # free memory after extracting stats
                         del channel_reduction_record['record']
+                        if hasattr(channel_reduction_record, 'meter'):
+                            del channel_reduction_record['meter']
                         sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
+                    del record.meter
                 else:
                     for channel_reduction_name, pval in record.items():
                         sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
@@ -888,7 +904,7 @@ def measure_v2(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=8, pin_memory=True, drop_last=False)
+            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
@@ -919,7 +935,7 @@ def measure_v2(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=8, pin_memory=True, drop_last=False)
+            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
@@ -1351,7 +1367,7 @@ def measure(model,measure_ds,args:Settings):
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
             batch_size=args.batch_size, shuffle=False if sampler else True,
-            num_workers=8, pin_memory=True, drop_last=False)
+            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
         measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
@@ -1421,9 +1437,9 @@ def measure_and_eval(args : Settings):
     #    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     sampler = None
     val_loader = th.utils.data.DataLoader(
-            val_ds, sampler=sampler,
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=8, pin_memory=False, drop_last=True)
+        val_ds, sampler=sampler,
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
     logging.info(f'evaluating outliers')
 
@@ -1434,7 +1450,7 @@ def measure_and_eval(args : Settings):
         ood_loader = th.utils.data.DataLoader(
             ood_ds, sampler=None,
             batch_size=args.batch_size, shuffle=False,
-            num_workers=8, pin_memory=False, drop_last=True)
+            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,alpha_list=args.alphas)
 
@@ -1584,13 +1600,14 @@ densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3',
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
     np.set_printoptions(3)
-    exp_ids = [8]
-    device_id = 2 #exp_ids[0] % th.cuda.device_count()
+    exp_ids = exp_ids = [0, 1, 2, 3.4, 5, 6, 7]  # [8.9.10]
+    device_id = 6  # exp_ids[0] % th.cuda.device_count()
     recompute = 0
+
     #
-    tag = '-@baseline'
-    channel_selection_fn = None
-    auto_select_layers=0
+    # tag = '-@baseline+avg+fc'
+    # channel_selection_fn = None
+    # auto_select_layers=0
     #
     # tag = '-@layers_select'
     # channel_selection_fn = None
@@ -1608,9 +1625,10 @@ if __name__ == '__main__':
     # channel_selection_fn = partial(find_most_seperable_channels,max_channels_per_class = 5)
     # auto_select_layers=False
 
-    # tag = f'-@chosen_channels_per_class'
-    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent,max_per_class = 5, relative_cut = 0.05)
-    # auto_select_layers=False
+    tag = f'-@chosen_channels_per_class'
+    channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=5, relative_cut=0.05)
+    auto_select_layers = False
+
 
     # resnet18_cats_dogs = Settings(
     #     model='resnet',
@@ -1622,16 +1640,17 @@ if __name__ == '__main__':
 
     class R34ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
-            super().__init__(model='ResNet34',#limit_measure=1000,limit_test=1000,
+            super().__init__(model='ResNet34',  #limit_measure=1000,limit_test=1000,
                              #include_matcher_fn=resnet_mahalanobis_matcher_fn,,
                              tag=tag,
                              device=f'cuda:{device_id}',
                              auto_layer_selection=auto_select_layers,
                              channel_selection_fn = channel_selection_fn,
-                             augment_measure=False,recompute=recompute, **kwargs)
+                             augment_measure=False, recompute=recompute, **kwargs)
+
 
     class DN3ExpGroupSettings(Settings):
-        def __init__(self,**kwargs):
+        def __init__(self, **kwargs):
             super().__init__(model='DenseNet3',
                              # include_matcher_fn_test=include_densenet_even_layers_fn if not auto_select_layers else
                              #                                                                _default_matcher_fn,
@@ -1639,19 +1658,42 @@ if __name__ == '__main__':
                              auto_layer_selection=auto_select_layers,
                              channel_selection_fn=channel_selection_fn, **kwargs)
 
+
+    r18_domainnet = Settings(
+        model='resnet',  # limit_measure=1000,limit_test=1000,
+        dataset='DomainNet-real-A-measure',
+        batch_size=500,
+        num_classes=173,
+        model_cfg={'num_classes': 173, 'depth': 18, 'dataset': 'imagenet'},
+        ckt_path='model_zoo/resnet18_domainnet.pth.tar',
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        tag=tag,
+        device=f'cuda:{device_id}',
+        collector_device='cpu',
+        ood_datasets=['DomainNet-real-B', 'DomainNet-sketch-A', 'DomainNet-sketch-B',
+                      'DomainNet-quickdraw-A', 'DomainNet-quickdraw-B',
+                      'DomainNet-infograph-A', 'DomainNet-infograph-B',
+                      'random-imagenet'],
+        transform_dataset='imagenet',
+        auto_layer_selection=auto_select_layers,
+        channel_selection_fn=channel_selection_fn,
+        augment_measure=False, recompute=recompute
+    )
+
     r18_places = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='places365_standard',
-        batch_size=512,
+        batch_size=1000,
+        num_classes=365,
         model_cfg={'num_classes': 365, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_places365.pth.tar',
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         tag=tag,
         device=f'cuda:{device_id}',
         collector_device='cpu',
-        ood_datasets=['imagenet','DomainNet-sketch-A+DomainNet-sketch-B',
+        ood_datasets=['imagenet', 'DomainNet-sketch-A+DomainNet-sketch-B',
                       'DomainNet-quickdraw-A+DomainNet-quickdraw-B',
-                      'DomainNet-infograph-A+DomainNet-infograph-B','random-imagenet'],
+                      'DomainNet-infograph-A+DomainNet-infograph-B', 'random-imagenet'],
         transform_dataset='imagenet',
         auto_layer_selection=auto_select_layers,
         channel_selection_fn=channel_selection_fn,
@@ -1660,14 +1702,14 @@ if __name__ == '__main__':
     r18_lsun = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='LSUN-raw',
-        limit_measure=100000,
+        limit_measure=50000,
         model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_lsun.pth.tar',
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         tag=tag,
         device=f'cuda:{device_id}',
         collector_device='cpu',
-        ood_datasets=['imagenet','places365_standard-lsun','random-imagenet'],
+        ood_datasets=['imagenet', 'places365_standard-lsun', 'random-imagenet'],
         transform_dataset='imagenet',
         auto_layer_selection=auto_select_layers,
         channel_selection_fn=channel_selection_fn,
@@ -1761,7 +1803,7 @@ if __name__ == '__main__':
 
     #experiments = [densenet_svhn_cross_cifar10]
     experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn, densenet_cifar10, densenet_cifar100,
-                   densenet_svhn, oe_cifar10, oe_cifar100,r18_places,r18_lsun]
+                   densenet_svhn, oe_cifar10, oe_cifar100, r18_places, r18_lsun, r18_domainnet]
     experiments = [experiments[exp_id] for exp_id in exp_ids]
     setup_logging()
     for args in experiments:
