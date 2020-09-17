@@ -29,9 +29,8 @@ _NUM_LOADER_WORKERS = 4
 
 
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
-    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d) or isinstance(m,
-                                                                                            th.nn.AdaptiveAvgPool2d) or isinstance(
-        m, th.nn.Linear)
+    return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d) or \
+           isinstance(m, th.nn.AdaptiveAvgPool2d) or isinstance(m, th.nn.Linear)
 
 
 def spatial_mean(x):
@@ -155,11 +154,12 @@ def find_most_seperable_channels(tracker_dict_per_class, max_channels_per_class 
     return (layer_dict)
 
 
-def sample_random_channels(tracker_dict_per_class,relative_cut=0.05):
+def sample_random_channels(tracker_dict_per_class,relative_cut=0.05,seed=0):
+    generator = th.Generator().manual_seed(seed)
     ret = {}
     for k,v in tracker_dict_per_class[0].items():
         nchannels = v.mean.shape[0]
-        samp = th.randperm(nchannels)[:np.ceil(nchannels*relative_cut).astype(np.int32)]
+        samp = th.randperm(nchannels,generator=generator)[:np.ceil(nchannels*relative_cut).astype(np.int32)]
         ret[k]=samp.to(v.mean.device)
     return ret
 
@@ -1600,12 +1600,12 @@ densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3',
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
     np.set_printoptions(3)
-    exp_ids = exp_ids = [0, 1, 2, 3.4, 5, 6, 7]  # [8.9.10]
-    device_id = 6  # exp_ids[0] % th.cuda.device_count()
+    exp_ids = exp_ids = [0, 1, 2, 3, 4, 5, 6, 7]  # [8.9.10]
+    device_id = 0  # exp_ids[0] % th.cuda.device_count()
     recompute = 0
 
     #
-    # tag = '-@baseline+avg+fc'
+    # tag = '-@baseline'
     # channel_selection_fn = None
     # auto_select_layers=0
     #
