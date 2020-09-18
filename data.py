@@ -180,14 +180,19 @@ def get_dataset(name, split='train', transform=None,
         return limit_ds(ds,-1,shuffle=False,allowed_classes=class_ids)
 
     elif name.startswith('random-'):
+        if name.endswith('-normal'):
+            mean, std = [0., 0., 0.], [1., 1., 1.]
+            return RandomDatasetGenerator([3, 512, 512], mean, std, limit=limit or 5000, transform=transform,
+                                          train=train)
+
         ds_name = name[7:]
         if ds_name in _DATASET_META_DATA:
-            meta=_DATASET_META_DATA[ds_name]
+            meta = _DATASET_META_DATA[ds_name]
             nclasses, data_shape, mean, std = meta.get_attrs().values()
         else:
             raise NotImplementedError
 
-        limit = limit*nclasses if limit else 1000*nclasses
+        limit = limit * nclasses if limit else 1000 * nclasses
         if train:
             return RandomDatasetGenerator(data_shape,mean,std,limit=limit,transform=transform,train=train)
         else:
