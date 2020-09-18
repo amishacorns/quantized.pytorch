@@ -24,8 +24,9 @@ from utils.misc import Recorder
 _EDGE_SAMPLES = 100
 _NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
+global _USE_PERCENTILE_DEVICE
 _USE_PERCENTILE_DEVICE = False
-_NUM_LOADER_WORKERS = 4
+_NUM_LOADER_WORKERS = 1
 
 
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
@@ -119,7 +120,7 @@ def _extractNormalizedQuants(layer_name, tracker_dict_per_class):
     return quants_norm
 
 
-def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class=5, relative_cut=0.05):
+def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class=100, relative_cut=0.05):
     all_class_channel_dict = [{}] * len(tracker_dict_per_class)
     # =============================================================================
     #     layer_list = [i for i in tracker_dict_per_class[0].keys()]
@@ -177,7 +178,8 @@ class Settings:
 
     def __init__(self, model: str,
                  model_cfg: dict,
-                 batch_size: int = 1000,
+                 batch_size_measure: int = 1000,
+                 batch_size_test: int = 1000,
                  recompute: bool = False,
                  augment_measure: bool = False,
                  augment_test: bool = False,
@@ -189,32 +191,34 @@ class Settings:
                  limit_measure: int = None,
                  test_split: str = 'val',
                  num_classes: int = 2,
-                 alphas : List[float] = [i/500 for i in range(1,100)] + [i/10 for i in range(2,11)],
+                 alphas: List[float] = [i / 500 for i in range(1, 100)] + [i / 10 for i in range(2, 11)],
                  right_sided_fisher_pvalue: bool = True,
                  transform_dataset: str = None,
-                 spatial_reductions : Dict[str,Callable[[th.Tensor],th.Tensor]] = _DEFAULT_SPATIAL_REDDUCTIONS,
-                 measure_joint_distribution : bool = False,
-                 tag :str = '',
-                 ood_datasets : List[str] = None,
-                 #matcher used for stat collection
-                 include_matcher_fn_measure : Callable[[str, th.nn.Module], bool]= _default_matcher_fn,
+                 spatial_reductions: Dict[str, Callable[[th.Tensor], th.Tensor]] = _DEFAULT_SPATIAL_REDDUCTIONS,
+                 measure_joint_distribution: bool = False,
+                 tag: str = '',
+                 ood_datasets: List[str] = None,
+                 # matcher used for stat collection
+                 include_matcher_fn_measure: Callable[[str, th.nn.Module], bool] = _default_matcher_fn,
                  # mather used for test
-                 include_matcher_fn_test: Callable[[str, th.nn.Module], bool] = _default_matcher_fn,
+                 include_matcher_fn_test: Callable[[str, th.nn.Module], bool] = None,
                  # this will try to choose layers to reduce final statistic variance over H0
-                 auto_layer_selection:bool = False,
-                 channel_selection_fn : Callable[[ List[Dict] ], Dict[str,th.Tensor]] = None
+                 select_layer_mode: bool = False,
+                 channel_selection_fn: Callable[[List[Dict]], Dict[str, th.Tensor]] = None
                  ):
 
         self._dict = {}
         arg_names, _, _, local_vars = inspect.getargvalues(inspect.currentframe())
         for name in arg_names[1:]:
             setattr(self, name, local_vars[name])
-            self._dict[name] = getattr(self,name)
+            self._dict[name] = getattr(self, name)
         if self.ood_datasets is None:
-            self.ood_datasets = ['SVHN','cifar10','folder-Imagenet_resize', 'folder-LSUN_resize', 'cifar100']
+            self.ood_datasets = ['SVHN', 'cifar10', 'folder-Imagenet_resize', 'folder-LSUN_resize', 'cifar100']
 
         if self.dataset in self.ood_datasets:
             self.ood_datasets.pop(self.ood_datasets.index(self.dataset))
+
+        self.include_matcher_fn_test = include_matcher_fn_test or include_matcher_fn_measure
 
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
@@ -903,19 +907,19 @@ def measure_v2(model,measure_ds,args:Settings):
         sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
-            batch_size=args.batch_size, shuffle=False if sampler else True,
+            batch_size=args.batch_size_measure, shuffle=False if sampler else True,
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
-        measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
+        measure_settings = BatchStatsCollectorCfg(args.batch_size_measure, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
                                                   include_matcher_fn=args.include_matcher_fn_measure)
 
         # collect basic reduction stats
         class_stats = measure_data_statistics_part1(train_loader, model, epochs=5 if args.augment_measure else 1,
-                                              model_device=args.device,
-                                              collector_device=args.collector_device,
-                                              batch_size=args.batch_size,
-                                              measure_settings=measure_settings)
+                                                    model_device=args.device,
+                                                    collector_device=args.collector_device,
+                                                    batch_size=args.batch_size_measure,
+                                                    measure_settings=measure_settings)
         all_class_stat_trackers.append(class_stats)
 
     if args.channel_selection_fn:
@@ -934,21 +938,22 @@ def measure_v2(model,measure_ds,args:Settings):
         sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
-            batch_size=args.batch_size, shuffle=False if sampler else True,
+            batch_size=args.batch_size_measure, shuffle=False if sampler else True,
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
-        measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
+        measure_settings = BatchStatsCollectorCfg(args.batch_size_measure, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
                                                   include_matcher_fn=args.include_matcher_fn_measure,
-                                                  sampled_channels = sampled_channels_dict[class_id] if \
-                                                      type(sampled_channels_dict)==list else sampled_channels_dict)
+                                                  sampled_channels=sampled_channels_dict[class_id] if \
+                                                      type(sampled_channels_dict) == list else sampled_channels_dict)
 
         # collect basic reduction stats
-        class_stats = measure_data_statistics_part2(all_class_stat_trackers[class_id],train_loader, model, epochs=5 if args.augment_measure else 1,
-                                              model_device=args.device,
-                                              collector_device=args.collector_device,
-                                              batch_size=args.batch_size,
-                                              measure_settings=measure_settings)
+        class_stats = measure_data_statistics_part2(all_class_stat_trackers[class_id], train_loader, model,
+                                                    epochs=5 if args.augment_measure else 1,
+                                                    model_device=args.device,
+                                                    collector_device=args.collector_device,
+                                                    batch_size=args.batch_size_measure,
+                                                    measure_settings=measure_settings)
         all_class_ref_stats.append(class_stats)
 
     return all_class_ref_stats
@@ -1366,17 +1371,17 @@ def measure(model,measure_ds,args:Settings):
         sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
         train_loader = th.utils.data.DataLoader(
             ds_, sampler=sampler,
-            batch_size=args.batch_size, shuffle=False if sampler else True,
+            batch_size=args.batch_size_measure, shuffle=False if sampler else True,
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
-        measure_settings = BatchStatsCollectorCfg(args.batch_size, reduction_dictionary=args.spatial_reductions,
+        measure_settings = BatchStatsCollectorCfg(args.batch_size_measure, reduction_dictionary=args.spatial_reductions,
                                                   # todo: maybe split measure and test include fn in Settings
                                                   include_matcher_fn=args.include_matcher_fn_measure)
 
         class_stats = measure_data_statistics(train_loader, model, epochs=5 if args.augment_measure else 1,
                                               model_device=args.device,
                                               collector_device=args.collector_device,
-                                              batch_size=args.batch_size,
+                                              batch_size=args.batch_size_measure,
                                               measure_settings=measure_settings)
         all_class_ref_stats.append(class_stats)
 
@@ -1400,37 +1405,65 @@ def measure_and_eval(args : Settings):
     #     expected_transform_measure.transforms[0] = ttf.RandomResizedCrop((32, 32), scale=(0.8, 1))
     exp_tag = f'{args.model}-{args.dataset}'
     if args.augment_measure:
-        exp_tag+=f'-{"augment"}'
+        exp_tag += f'-{"augment"}'
 
-    exp_tag+=f'-{args.tag}'
-    calibrated_path = f'measured_stats_per_class-{exp_tag}.pth'
+    if 'layer_select' in args.tag:
+        sub_tags = args.tag.split('+')
+        if len(sub_tags) == 1:
+            calib_tag = '-@baseline'
+        else:
+            calib_tag = '-@'
+            for t in sub_tags:
+                if 'layer_select' in t:
+                    continue
+                calib_tag += f'{t}+'
+
+            calib_tag = calib_tag[:-1]
+
+    else:
+        calib_tag = args.tag
+
+    calib_tag = f'{exp_tag}-{calib_tag}'
+    exp_tag += f'-{args.tag}'
+    calibrated_path = f'measured_stats_per_class-{calib_tag}.pth'
+
+    if 'layer_select' in exp_tag and not recompute:
+        import time
+        while (not os.path.exists(calibrated_path)):
+            print(f'waiting for file: {calibrated_path}')
+            time.sleep(500)
+
     if not args.recompute and os.path.exists(calibrated_path):
-        ref_stats = th.load(calibrated_path,map_location=args.collector_device if args.collector_device!='same' else args.device)
+        ref_stats = th.load(calibrated_path,
+                            map_location=args.collector_device if args.collector_device != 'same' else args.device)
     else:
         ds = get_dataset(args.dataset, 'train', expected_transform_measure)
-        #ref_stats = measure(model, ds, args)
-        ref_stats=measure_v2(model,ds,args)
+        # ref_stats = measure(model, ds, args)
+        ref_stats = measure_v2(model, ds, args)
         logging.info('saving reference stats dict')
         th.save(ref_stats, calibrated_path)
+    if args.select_layer_mode:
+        if args.select_layer_mode == 'auto':
+            logging.info(f'layer clustering')
+            selected_layers_names = findClusterMain(args, ref_stats, cut_off_thres=[0.3])
+            # currently we can only look at
+            selected_layers_names = selected_layers_names['spatial-mean'][0]
+            args.include_matcher_fn_test = WhiteListInclude(selected_layers_names)
+        elif args.select_layer_mode == 'logspace':
+            logging.info(f'logspace layer selection')
+            args.include_matcher_fn_test = LayerSlice(model, include_fn=args.include_matcher_fn_measure)
+            selected_layers_names = args.include_matcher_fn_test.layer_white_list
 
-    if args.auto_layer_selection:
-        logging.info(f'layer clustering')
-        selected_layers_names = findClusterMain(args,ref_stats,cut_off_thres=[0.2])
-        # currently we can only look at
-        selected_layers_names = selected_layers_names['spatial-mean'][0]
         logging.info(f'selected {len(selected_layers_names)}/{len(ref_stats[0])} layers: {selected_layers_names}')
-        args.include_matcher_fn_test = WhiteListInclude(selected_layers_names)
-    # if not specified use all layers
-    if args.include_matcher_fn_test is None:
-        args.include_matcher_fn_test=args.include_matcher_fn_measure
+
     logging.info(f'building OOD detector')
     detector = OODDetector(model, ref_stats, right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
                            include_matcher_fn=args.include_matcher_fn_test)
     gc.collect()
     logging.info(f'evaluating inliers')
-    val_ds = get_dataset(args.dataset, args.test_split ,expected_transform_test)
+    val_ds = get_dataset(args.dataset, args.test_split, expected_transform_test)
     if args.limit_test:
-        val_ds = limit_ds(val_ds,args.limit_test,per_class=False)
+        val_ds = limit_ds(val_ds, args.limit_test, per_class=False)
     # todo add adversarial samples test
     # optional run in-dist data evaluate per class to simplify analysis
     #for class_id,class_name in enumerate(val_ds.classes):
@@ -1438,7 +1471,7 @@ def measure_and_eval(args : Settings):
     sampler = None
     val_loader = th.utils.data.DataLoader(
         val_ds, sampler=sampler,
-        batch_size=args.batch_size, shuffle=False,
+        batch_size=args.batch_size_test, shuffle=False,
         num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
     logging.info(f'evaluating outliers')
@@ -1449,7 +1482,7 @@ def measure_and_eval(args : Settings):
             ood_ds = limit_ds(ood_ds,args.limit_test,per_class=False)
         ood_loader = th.utils.data.DataLoader(
             ood_ds, sampler=None,
-            batch_size=args.batch_size, shuffle=False,
+            batch_size=args.batch_size_test, shuffle=False,
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,alpha_list=args.alphas)
@@ -1577,58 +1610,121 @@ def findClusterMain(settings: Settings, h0_data,cut_off_thres=None,plot=False):
 ## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
 # specifically for denesent)
 def include_densenet_even_layers_fn(n, m):
-    #n is the trace name, m is the actual module which can be used to target modules with specific attributes
+    # n is the trace name, m is the actual module which can be used to target modules with specific attributes
     return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or isinstance(m, th.nn.AvgPool2d)
+
+
 # helper functions for more expressive layer filtering
 class WhiteListInclude():
-    def __init__(self,layer_white_list):
+    def __init__(self, layer_white_list):
         self.layer_white_list = layer_white_list
-    def __call__(self,n, m):
+
+    def __call__(self, n, m):
         return n in self.layer_white_list
 
+
+def positional_log_filter(layer_list, exp=3):
+    ln = len(layer_list)
+    sample = np.unique(np.ceil((ln / np.logspace(0, exp, ln))))
+    ids = np.min(sample) + ln - sample - 1
+    return [layer_list[int(i)] for i in ids]
+
+
+class LayerSlice(WhiteListInclude):
+    def __init__(self, model, include_fn, filter_fn=positional_log_filter):
+        all_layers = []
+        for n, m in model.named_modules():
+            if include_fn(n, m):
+                all_layers.append(n)
+        super().__init__(layer_white_list=filter_fn(all_layers))
+
+
 import re
+
+
 class RegxInclude():
-    def __init__(self,pattern):
+    def __init__(self, pattern):
         self.pattern = pattern
 
-    def __call__(self,n, m):
+    def __call__(self, n, m):
         # n is the trace name, m is the actual module which can be used to target modules with specific attributes
-        return bool(re.fullmatch(self.pattern,n))
+        return bool(re.fullmatch(self.pattern, n))
 
 # reminder we look at the input of layers, following layers used by mhalanobis paper
 densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3','avg_pool'])
 resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','layer4','avg_pool'])
 if __name__ == '__main__':
+    # global _USE_PERCENTILE_DEVICE
     np.set_printoptions(3)
-    exp_ids = exp_ids = [0, 1, 2, 3, 4, 5, 6, 7]  # [8.9.10]
-    device_id = 0  # exp_ids[0] % th.cuda.device_count()
     recompute = 0
 
-    #
-    # tag = '-@baseline'
+    # 1
+    tag = '-@baseline'
+    channel_selection_fn = None
+    select_layers_mode = 0
+    exp_ids = exp_ids = [8, 9, 10]  # [0, 1, 2, 3, 4, 5, 6, 7]
+    device_id = 0  # exp_ids[0] % th.cuda.device_count()
+
+    # 4
+    # tag = '-@layer_select_auto'
     # channel_selection_fn = None
-    # auto_select_layers=0
-    #
-    # tag = '-@layers_select'
+    # select_layers_mode = 'auto'
+    # exp_ids = exp_ids = [8, 9, 10] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 3  # exp_ids[0] % th.cuda.device_count()
+
+    # 5
+    # tag = '-@layer_select_logspace'
     # channel_selection_fn = None
-    # auto_select_layers = 1
-    #
+    # select_layers_mode = 'logspace'
+    # exp_ids = exp_ids = [8, 9, 10] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 4  # exp_ids[0] % th.cuda.device_count()
+
+    # 2.
     # tag = '-@random_c_select_0.05'
     # channel_selection_fn = partial(sample_random_channels,relative_cut=0.05)
-    # auto_select_layers = 0
-    #
-    # tag = '-@layers+random_c_select_0.05'
+    # select_layers_mode = False
+    # exp_ids = exp_ids = [9, 10, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 1  # exp_ids[0] % th.cuda.device_count()
+
+    # 9.
+    # tag = '-@layer_select_auto+random_c_select_0.05'
     # channel_selection_fn = partial(sample_random_channels,relative_cut=0.05)
-    # auto_select_layers = 1
-    #
+    # select_layers_mode = 'auto'
+    # exp_ids = exp_ids = [9, 10, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 1  # exp_ids[0] % th.cuda.device_count()
+
+    # 8.
+    tag = '-@layer_select_logspace+random_c_select_0.05'
+    channel_selection_fn = partial(sample_random_channels, relative_cut=0.05)
+    select_layers_mode = 'logspace'
+    exp_ids = exp_ids = [9, 10, 8]  # [0, 1, 2, 3, 4, 5, 6, 7]
+    device_id = 7  # exp_ids[0] % th.cuda.device_count()
+
+
     # tag = f'-@chosen_channels_all_class'
     # channel_selection_fn = partial(find_most_seperable_channels,max_channels_per_class = 5)
     # auto_select_layers=False
 
-    tag = f'-@chosen_channels_per_class'
-    channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=5, relative_cut=0.05)
-    auto_select_layers = False
+    # 3.
+    # tag = f'-@chosen_channels_per_class_0.05'
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.05)
+    # select_layers_mode = False
+    # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 2  # exp_ids[0] % th.cuda.device_count()
 
+    # 6.
+    # tag = f'-@layer_select_logspace+chosen_channels_per_class_0.5'
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.05)
+    # select_layers_mode = 'logspace'
+    # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 5  # exp_ids[0] % th.cuda.device_count()
+
+    # 7
+    # tag = f'-@layer_select_auto+chosen_channels_per_class'
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.1)
+    # select_layers_mode = 'auto'
+    # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
+    # device_id = 6  # exp_ids[0] % th.cuda.device_count()
 
     # resnet18_cats_dogs = Settings(
     #     model='resnet',
@@ -1640,12 +1736,12 @@ if __name__ == '__main__':
 
     class R34ExpGroupSettings(Settings):
         def __init__(self,**kwargs):
-            super().__init__(model='ResNet34',  #limit_measure=1000,limit_test=1000,
-                             #include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+            super().__init__(model='ResNet34',  # limit_measure=1000,limit_test=1000,
+                             # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
                              tag=tag,
                              device=f'cuda:{device_id}',
-                             auto_layer_selection=auto_select_layers,
-                             channel_selection_fn = channel_selection_fn,
+                             select_layer_mode=select_layers_mode,
+                             channel_selection_fn=channel_selection_fn,
                              augment_measure=False, recompute=recompute, **kwargs)
 
 
@@ -1655,14 +1751,14 @@ if __name__ == '__main__':
                              # include_matcher_fn_test=include_densenet_even_layers_fn if not auto_select_layers else
                              #                                                                _default_matcher_fn,
                              device=f'cuda:{device_id}', tag=tag, recompute=recompute,
-                             auto_layer_selection=auto_select_layers,
+                             select_layer_mode=select_layers_mode,
                              channel_selection_fn=channel_selection_fn, **kwargs)
 
 
     r18_domainnet = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='DomainNet-real-A-measure',
-        batch_size=500,
+        batch_size_measure=500,
         num_classes=173,
         model_cfg={'num_classes': 173, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_domainnet.pth.tar',
@@ -1673,9 +1769,9 @@ if __name__ == '__main__':
         ood_datasets=['DomainNet-real-B', 'DomainNet-sketch-A', 'DomainNet-sketch-B',
                       'DomainNet-quickdraw-A', 'DomainNet-quickdraw-B',
                       'DomainNet-infograph-A', 'DomainNet-infograph-B',
-                      'random-imagenet'],
+                      'random-normal', 'random-imagenet'],
         transform_dataset='imagenet',
-        auto_layer_selection=auto_select_layers,
+        select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
         augment_measure=False, recompute=recompute
     )
@@ -1683,7 +1779,8 @@ if __name__ == '__main__':
     r18_places = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='places365_standard',
-        batch_size=1000,
+        batch_size_measure=1000,
+        batch_size_test=500,
         num_classes=365,
         model_cfg={'num_classes': 365, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_places365.pth.tar',
@@ -1693,9 +1790,10 @@ if __name__ == '__main__':
         collector_device='cpu',
         ood_datasets=['imagenet', 'DomainNet-sketch-A+DomainNet-sketch-B',
                       'DomainNet-quickdraw-A+DomainNet-quickdraw-B',
-                      'DomainNet-infograph-A+DomainNet-infograph-B', 'random-imagenet'],
+                      'DomainNet-infograph-A+DomainNet-infograph-B',
+                      'random-normal', 'random-imagenet'],
         transform_dataset='imagenet',
-        auto_layer_selection=auto_select_layers,
+        select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
         augment_measure=False, recompute=recompute
     )
@@ -1709,9 +1807,9 @@ if __name__ == '__main__':
         tag=tag,
         device=f'cuda:{device_id}',
         collector_device='cpu',
-        ood_datasets=['imagenet', 'places365_standard-lsun', 'random-imagenet'],
+        ood_datasets=['imagenet', 'places365_standard-lsun', 'random-normal', 'random-imagenet'],
         transform_dataset='imagenet',
-        auto_layer_selection=auto_select_layers,
+        select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
         augment_measure=False, recompute=recompute
     )
@@ -1724,7 +1822,7 @@ if __name__ == '__main__':
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         tag=tag,
         device=f'cuda:{device_id}',
-        auto_layer_selection=auto_select_layers,
+        select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
         augment_measure=False, recompute=recompute
     )
@@ -1737,9 +1835,9 @@ if __name__ == '__main__':
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         tag=tag,
         device=f'cuda:{device_id}',
-        auto_layer_selection=auto_select_layers,
+        select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
-        batch_size=500,
+        batch_size_measure=500,
         collector_device='cpu',
         augment_measure=False, recompute=recompute
     )
@@ -1754,7 +1852,7 @@ if __name__ == '__main__':
         dataset='cifar100',
         num_classes=100,
         model_cfg={'num_c': 100},
-        batch_size=500,
+        batch_size_measure=500,
         collector_device='cpu',
         ckt_path='model_zoo/resnet_cifar100.pth',
     )
@@ -1763,7 +1861,6 @@ if __name__ == '__main__':
         dataset='SVHN',
         num_classes=10,
         model_cfg={'num_c': 10},
-        batch_size=1000,
         ckt_path='model_zoo/resnet_svhn.pth',
     )
 
@@ -1777,9 +1874,9 @@ if __name__ == '__main__':
     densenet_cifar100 = DN3ExpGroupSettings(
         dataset='cifar100',
         num_classes=100,
-        model_cfg={'num_classes': 100,'depth':100},
+        model_cfg={'num_classes': 100, 'depth': 100},
         ckt_path='model_zoo/densenet_cifar100_ported.pth',
-        batch_size=500,
+        batch_size_measure=500,
         collector_device='cpu'
     )
 
@@ -1808,6 +1905,8 @@ if __name__ == '__main__':
     setup_logging()
     for args in experiments:
         logging.info(args)
+        if args.num_classes > 100:
+            _USE_PERCENTILE_DEVICE = True
         measure_and_eval(args)
 pass
 
