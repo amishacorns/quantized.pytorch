@@ -120,7 +120,7 @@ def _extractNormalizedQuants(layer_name, tracker_dict_per_class):
     return quants_norm
 
 
-def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per_class=100, relative_cut=0.05):
+def find_most_seperable_channels_class_dependent(tracker_dict_per_class, relative_cut=0.05):
     all_class_channel_dict = [{}] * len(tracker_dict_per_class)
     # =============================================================================
     #     layer_list = [i for i in tracker_dict_per_class[0].keys()]
@@ -134,7 +134,7 @@ def find_most_seperable_channels_class_dependent(tracker_dict_per_class, max_per
             var_per_quant = ((quants_norm - quant_base_class) ** 2).sum(2)
             var_per_channel = var_per_quant.sum(0)
             _, ranked_channels = th.sort(var_per_channel)
-            nchannels = min(np.ceil(len(ranked_channels) * relative_cut).astype(np.int32), max_per_class)
+            nchannels = np.ceil(len(ranked_channels) * relative_cut).astype(np.int32)
             all_class_channel_dict[temp_base_class][layer_name] = ranked_channels[-(nchannels + 1):-1]
     return all_class_channel_dict
 
@@ -179,7 +179,7 @@ class Settings:
     def __init__(self, model: str,
                  model_cfg: dict,
                  batch_size_measure: int = 1000,
-                 batch_size_test: int = 1000,
+                 batch_size_test: int = None,
                  recompute: bool = False,
                  augment_measure: bool = False,
                  augment_test: bool = False,
@@ -219,6 +219,7 @@ class Settings:
             self.ood_datasets.pop(self.ood_datasets.index(self.dataset))
 
         self.include_matcher_fn_test = include_matcher_fn_test or include_matcher_fn_measure
+        self.batch_size_test = batch_size_test or batch_size_measure
 
 
 def Gaussian_KL(mu1, var1, mu2, var2, epsilon=1e-5):
@@ -482,7 +483,7 @@ def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=Fals
                             pval = channel_reduction_record['pval_matcher'](pval)
                         # free memory after extracting stats
                         del channel_reduction_record['record']
-                        if hasattr(channel_reduction_record, 'meter'):
+                        if 'meter' in (channel_reduction_record.keys()):
                             del channel_reduction_record['meter']
                         sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
                     del record.meter
@@ -546,11 +547,18 @@ class OODDetector():
                                        include_matcher_fn=include_matcher_fn,
                                        input_fn=gen_inference_fn(all_class_ref_stats),
                                        recursive=True, device_modifier='same')
-        #channle_reduction = ['simes_pval', 'cond_fisher'],
-        #self.channel_reduction = channle_reduction
+        # channle_reduction = ['simes_pval', 'cond_fisher'],
+        # self.channel_reduction = channle_reduction
+        for rc in all_class_ref_stats:
+            all_keys = list(rc.keys())
+            for k in all_keys:
+                if k not in self.stats_recorder.tracked_modules.keys():
+                    del rc[k]
+        gc.collect()
         self.output_pval_matcher = extract_output_distribution(all_class_ref_stats,
                                                                right_sided_fisher_pvalue=right_sided_fisher_pvalue,
-                                                               filter_layer=lambda n: n not in self.stats_recorder.tracked_modules.keys())
+                                                               filter_layer=lambda
+                                                                   n: n not in self.stats_recorder.tracked_modules.keys())
         self.num_classes = len(all_class_ref_stats)
 
 
@@ -624,11 +632,16 @@ class MahalanobisDistance():
         self.mean = mean
         self.inv_cov = inv_cov
 
-    def __call__(self,x):
-        if x.device!=self.mean.device:
-            self.mean= self.mean.to(x.device)
-            self.inv_cov=self.inv_cov.to(x.device)
-        x_c = x-self.mean
+    def __call__(self, x):
+        if x.device != self.mean.device:
+            if not hasattr(self, 'use_mean_device') or self.use_mean_device != _USE_PERCENTILE_DEVICE:
+                self.use_mean_device = _USE_PERCENTILE_DEVICE
+            if self.use_mean_device:
+                x = x.to(self.mean.device)
+            else:
+                self.mean = self.mean.to(x.device)
+                self.inv_cov = self.inv_cov.to(x.device)
+        x_c = x - self.mean
         return (x_c.matmul(self.inv_cov).matmul(x_c.t())).diag().unsqueeze(1).sqrt()
 
 
@@ -1707,21 +1720,21 @@ if __name__ == '__main__':
 
     # 3.
     # tag = f'-@chosen_channels_per_class_0.05'
-    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.05)
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, relative_cut=0.05)
     # select_layers_mode = False
     # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
     # device_id = 2  # exp_ids[0] % th.cuda.device_count()
 
     # 6.
-    # tag = f'-@layer_select_logspace+chosen_channels_per_class_0.5'
+    # tag = f'-@layer_select_logspace+chosen_channels_per_class_0.05'
     # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.05)
     # select_layers_mode = 'logspace'
     # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
     # device_id = 5  # exp_ids[0] % th.cuda.device_count()
 
     # 7
-    # tag = f'-@layer_select_auto+chosen_channels_per_class'
-    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, max_per_class=100, relative_cut=0.1)
+    # tag = f'-@layer_select_auto+chosen_channels_per_class_0.05'
+    # channel_selection_fn = partial(find_most_seperable_channels_class_dependent, relative_cut=0.05)
     # select_layers_mode = 'auto'
     # exp_ids = exp_ids = [10, 9, 8] # [0, 1, 2, 3, 4, 5, 6, 7]
     # device_id = 6  # exp_ids[0] % th.cuda.device_count()
@@ -1759,6 +1772,7 @@ if __name__ == '__main__':
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='DomainNet-real-A-measure',
         batch_size_measure=500,
+        batch_size_test=500,
         num_classes=173,
         model_cfg={'num_classes': 173, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_domainnet.pth.tar',
@@ -1801,6 +1815,7 @@ if __name__ == '__main__':
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='LSUN-raw',
         limit_measure=50000,
+        batch_size_test=500,
         model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_lsun.pth.tar',
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
@@ -1907,6 +1922,8 @@ if __name__ == '__main__':
         logging.info(args)
         if args.num_classes > 100:
             _USE_PERCENTILE_DEVICE = True
+        else:
+            _USE_PERCENTILE_DEVICE = False
         measure_and_eval(args)
 pass
 
