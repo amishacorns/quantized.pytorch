@@ -46,7 +46,8 @@ _IMAGINE_CONFIGS=[
 
 def get_dataset(name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path=__DATASETS_DEFAULT_PATH,
-                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None,class_ids=None,per_class_limit=True):
+                limit=None,shuffle_before_limit=False,limit_shuffle_seed=None,class_ids=None,
+                per_class_limit=True):
     train = (split == 'train')
     if '+' in name:
         ds=None
@@ -68,8 +69,11 @@ def get_dataset(name, split='train', transform=None,
         class_ids = filter(lambda x: x not in [52, 66, 91, 92, 102, 121, 203, 215, 284, 334], range(365))
 
     elif name.startswith('DomainNet-'):
-        domain, set = name.split('-')[1:3]
-        class_ids = range(173) if set == 'A' else range(173, 345)
+        parts = name.split('-')
+        domain = parts[1]
+        if name.endswith('A') or name.endswith('B'):
+            set = [2]
+            class_ids = range(173) if set == 'A' else range(173, 345)
         if name.endswith('-measure') and train:
             ds_dir_name = os.path.join('DomainNet', 'measure', domain)
         else:
@@ -155,8 +159,8 @@ def get_dataset(name, split='train', transform=None,
         ds = datasets.ImageFolder(root=root,
                                   transform=transform,
                                   target_transform=target_transform)
-        ds = balance_image_folder_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
-                                     seed=limit_shuffle_seed, class_ids=class_ids)
+        ds = limit_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
+                                     seed=limit_shuffle_seed, allowed_classes=class_ids)
         return ds
     elif name in ['imagenet', 'cats_vs_dogs', 'places365_standard'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
@@ -168,16 +172,18 @@ def get_dataset(name, split='train', transform=None,
                                   target_transform=target_transform)
         if limit or class_ids:
             if 'no_dd' in name:
-                ds = balance_image_folder_ds(ds, limit * len(ds.classes), per_class=False, shuffle=shuffle_before_limit,
+                ds = limit_ds(ds, limit * len(ds.classes), per_class=False, shuffle=shuffle_before_limit,
                                              seed=limit_shuffle_seed)
             else:
-                ds=balance_image_folder_ds(ds, limit,per_class=per_class_limit,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,class_ids=class_ids)
+                ds=limit_ds(ds, limit,per_class=per_class_limit,shuffle=shuffle_before_limit,seed=limit_shuffle_seed,allowed_classes=class_ids)
         return ds
     elif name.startswith('DomainNet-'):
         ds = datasets.ImageFolder(root=root,
                                     transform=transform,
                                     target_transform=target_transform)
-        return limit_ds(ds,-1,shuffle=False,allowed_classes=class_ids)
+        if limit or class_ids:
+            return limit_ds(ds, limit=limit, per_class=per_class_limit, shuffle=shuffle_before_limit, seed=limit_shuffle_seed, allowed_classes=class_ids)
+        return ds
 
     elif name.startswith('random-'):
         if name.endswith('-normal'):
@@ -192,7 +198,10 @@ def get_dataset(name, split='train', transform=None,
         else:
             raise NotImplementedError
 
-        limit = limit * nclasses if limit else 1000 * nclasses
+        limit = limit or 1000
+        if per_class_limit:
+            limit = limit * nclasses
+
         if train:
             return RandomDatasetGenerator(data_shape,mean,std,limit=limit,transform=transform,train=train)
         else:
@@ -207,79 +216,89 @@ def get_dataset(name, split='train', transform=None,
                                 download=download)
 
 
-def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False,seed=None,class_ids=None):
-    assert isinstance(dataset,datasets.DatasetFolder)
+# def balance_image_folder_ds(dataset, n_samples=None,per_class=True,shuffle=False,seed=None,class_ids=None):
+#     assert isinstance(dataset,datasets.DatasetFolder)
+#
+#     if shuffle:
+#         import random
+#         random.seed(seed)
+#         print(f'shufflling with seed {seed}')
+#     samps = []
+#
+#     n_samples = n_samples or len(dataset)
+#     if per_class or class_ids is not None:
+#         samp_reg_per_class={}
+#         for s in dataset.samples:
+#             if s[1] in samp_reg_per_class:
+#                 if shuffle or len(samp_reg_per_class[s[1]])<n_samples:
+#                     samp_reg_per_class[s[1]]+=[s]
+#             elif class_ids is not None and s[1] not in class_ids:
+#                 continue
+#             else:
+#                 samp_reg_per_class[s[1]]=[s]
+#
+#         for k in samp_reg_per_class.keys():
+#             if shuffle and per_class:
+#                 samps += random.sample(samp_reg_per_class[k],n_samples)
+#             else:
+#                 samps += samp_reg_per_class[k]
+#
+#         if not per_class and shuffle and len(samps)>n_samples:
+#             samps = random.sample(samps, n_samples)
+#     else:
+#         if shuffle:
+#             samps = random.sample(dataset.samples,n_samples)
+#         else:
+#             samps = dataset.samples[:n_samples]
+#
+#     if hasattr(dataset,'imgs'):
+#         dataset.imgs = samps
+#     dataset.samples = samps
+#     return dataset
 
-    if shuffle:
-        import random
-        random.seed(seed)
-        print(f'shufflling with seed {seed}')
-    samps = []
-
-    n_samples = n_samples or len(dataset)
-    if per_class or class_ids is not None:
-        samp_reg_per_class={}
-        for s in dataset.samples:
-            if s[1] in samp_reg_per_class:
-                if shuffle or len(samp_reg_per_class[s[1]])<n_samples:
-                    samp_reg_per_class[s[1]]+=[s]
-            elif class_ids is not None and s[1] not in class_ids:
-                continue
-            else:
-                samp_reg_per_class[s[1]]=[s]
-
-        for k in samp_reg_per_class.keys():
-            if shuffle and per_class:
-                samps += random.sample(samp_reg_per_class[k],n_samples)
-            else:
-                samps += samp_reg_per_class[k]
-
-        if not per_class and shuffle and len(samps)>n_samples:
-            samps = random.sample(samps, n_samples)
-    else:
-        if shuffle:
-            samps = random.sample(dataset.samples,n_samples)
-        else:
-            samps = dataset.samples[:n_samples]
-
-    if hasattr(dataset,'imgs'):
-        dataset.imgs = samps
-    dataset.samples = samps
-    return dataset
-
-def limit_ds(dataset, n_samples=-1,per_class=True,shuffle=True,seed=0,allowed_classes=None):
+def limit_ds(dataset, limit=None, per_class=True, shuffle=False, seed=0, allowed_classes=None):
     if not hasattr(dataset,'targets'):
         if hasattr(dataset,'labels'):
             dataset.targets=dataset.labels
         else:
             assert 0, 'dataset not supported'
 
-    if per_class:
-        id_reg_per_class = {}
-        # map id to class label
-        for e, t in enumerate(dataset.targets):
-            if t in id_reg_per_class:
-                id_reg_per_class[t] += [e]
-            else:
-                id_reg_per_class[t] = [e]
-
-        ids = []
-        # shuffle and clip each class
-        for t in id_reg_per_class.keys():
-            if allowed_classes and t not in allowed_classes:
-                continue
-
-            class_ids = torch.tensor(id_reg_per_class[t])
-            if shuffle:
-                class_ids = class_ids[torch.randperm(len(class_ids), generator=torch.Generator().manual_seed(seed))]
-
-            ids.append(torch.tensor(class_ids[:n_samples]))
-        ids = torch.cat(ids)
-    else:
-        if shuffle:
-            ids = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:n_samples]
+    id_reg_per_class = {}
+    global_sample_count = 0
+    # map id to class label
+    for e, t in enumerate(dataset.targets):
+        if allowed_classes and t not in allowed_classes:
+            continue
+        global_sample_count += 1
+        if t in id_reg_per_class:
+            id_reg_per_class[t] += [e]
         else:
-            ids = torch.arange(0, len(dataset))[:n_samples]
+            id_reg_per_class[t] = [e]
+
+    ids = []
+    # shuffle and clip each class
+    for t in id_reg_per_class.keys():
+        class_ids = torch.tensor(id_reg_per_class[t])
+
+        if shuffle:
+            class_ids = class_ids[torch.randperm(len(class_ids), generator=torch.Generator().manual_seed(seed))]
+
+        if limit is not None:
+            lim = limit
+            if limit >= 1 and not per_class:
+                # update limit to per class value
+                lim = max(limit // len(id_reg_per_class), 1)
+            elif 0<limit<1:
+                # limit is given as a ratio from each class
+                lim = max(int(limit * len(id_reg_per_class[t])), 1)
+                print(f'clipping {limit}: {lim}/{len(id_reg_per_class[t])} ({len(id_reg_per_class[t])/ global_sample_count:0.4f})')
+            class_ids = class_ids[:lim]
+
+        ids.append(class_ids)
+
+
+    ids = torch.cat(ids)
+
     ds = torch.utils.data.Subset(dataset,ids)
     ds.targets = torch.tensor(dataset.targets)[ids]
     if allowed_classes:

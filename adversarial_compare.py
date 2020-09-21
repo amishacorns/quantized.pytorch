@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import tqdm
 
 import models
-from data import get_dataset, limit_ds
+from data import get_dataset
 from preprocess import get_transform
 from utils.log import setup_logging
 from utils.meters import MeterDict, OnlineMeter, AverageMeter, accuracy
@@ -905,9 +905,6 @@ def measure_v2(model,measure_ds,args:Settings):
     else:
         classes = measure_ds.classes if hasattr(measure_ds, 'classes') else range(args.num_classes)
 
-    if args.limit_measure:
-        measure_ds = limit_ds(measure_ds, args.limit_measure, per_class=True)
-
     all_class_stat_trackers = []
     targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
     for class_id, class_name in enumerate(classes):
@@ -1369,9 +1366,6 @@ def measure(model,measure_ds,args:Settings):
     else:
         classes = measure_ds.classes if hasattr(measure_ds, 'classes') else range(args.num_classes)
 
-    if args.limit_measure:
-        measure_ds = limit_ds(measure_ds, args.limit_measure, per_class=True)
-
     all_class_ref_stats = []
     targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
     for class_id, class_name in enumerate(classes):
@@ -1450,7 +1444,7 @@ def measure_and_eval(args : Settings):
         ref_stats = th.load(calibrated_path,
                             map_location=args.collector_device if args.collector_device != 'same' else args.device)
     else:
-        ds = get_dataset(args.dataset, 'train', expected_transform_measure)
+        ds = get_dataset(args.dataset, 'train', expected_transform_measure, limit=args.limit_measure, per_class_limit=False)
         # ref_stats = measure(model, ds, args)
         ref_stats = measure_v2(model, ds, args)
         logging.info('saving reference stats dict')
@@ -1474,9 +1468,7 @@ def measure_and_eval(args : Settings):
                            include_matcher_fn=args.include_matcher_fn_test)
     gc.collect()
     logging.info(f'evaluating inliers')
-    val_ds = get_dataset(args.dataset, args.test_split, expected_transform_test)
-    if args.limit_test:
-        val_ds = limit_ds(val_ds, args.limit_test, per_class=False)
+    val_ds = get_dataset(args.dataset, 'val', expected_transform_test, limit=args.limit_test, per_class_limit=False)
     # todo add adversarial samples test
     # optional run in-dist data evaluate per class to simplify analysis
     #for class_id,class_name in enumerate(val_ds.classes):
@@ -1485,18 +1477,16 @@ def measure_and_eval(args : Settings):
     val_loader = th.utils.data.DataLoader(
         val_ds, sampler=sampler,
         batch_size=args.batch_size_test, shuffle=False,
-        num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
+        num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
     rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
     logging.info(f'evaluating outliers')
 
     for ood_dataset in args.ood_datasets:
-        ood_ds = get_dataset(ood_dataset, 'val',expected_transform_test)
-        if args.limit_test:
-            ood_ds = limit_ds(ood_ds,args.limit_test,per_class=False)
+        ood_ds = get_dataset(ood_dataset, 'val',expected_transform_test,limit=args.limit_test,per_class_limit=False)
         ood_loader = th.utils.data.DataLoader(
             ood_ds, sampler=None,
             batch_size=args.batch_size_test, shuffle=False,
-            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=True)
+            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
         logging.info(f'evaluating {ood_dataset}')
         rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,alpha_list=args.alphas)
 
@@ -1770,6 +1760,7 @@ if __name__ == '__main__':
 
     r18_domainnet = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
+        limit_test=5000,
         dataset='DomainNet-real-A-measure',
         batch_size_measure=500,
         batch_size_test=500,
@@ -1793,6 +1784,7 @@ if __name__ == '__main__':
     r18_places = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='places365_standard',
+        limit_test=5000,
         batch_size_measure=1000,
         batch_size_test=500,
         num_classes=365,
@@ -1802,9 +1794,9 @@ if __name__ == '__main__':
         tag=tag,
         device=f'cuda:{device_id}',
         collector_device='cpu',
-        ood_datasets=['imagenet', 'DomainNet-sketch-A+DomainNet-sketch-B',
-                      'DomainNet-quickdraw-A+DomainNet-quickdraw-B',
-                      'DomainNet-infograph-A+DomainNet-infograph-B',
+        ood_datasets=['imagenet', 'DomainNet-sketch',
+                      'DomainNet-quickdraw',
+                      'DomainNet-infograph',
                       'random-normal', 'random-imagenet'],
         transform_dataset='imagenet',
         select_layer_mode=select_layers_mode,
@@ -1814,6 +1806,7 @@ if __name__ == '__main__':
     r18_lsun = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='LSUN-raw',
+        limit_test=5000,
         limit_measure=50000,
         batch_size_test=500,
         model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
