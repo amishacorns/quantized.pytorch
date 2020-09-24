@@ -21,7 +21,7 @@ from utils.log import setup_logging
 from utils.meters import MeterDict, OnlineMeter, AverageMeter, accuracy
 from utils.misc import Recorder
 
-_EDGE_SAMPLES = 100
+_EDGE_SAMPLES = 200
 _NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
 global _USE_PERCENTILE_DEVICE
@@ -212,6 +212,7 @@ class Settings:
         for name in arg_names[1:]:
             setattr(self, name, local_vars[name])
             self._dict[name] = getattr(self, name)
+        self.collector_device = self.collector_device if self.collector_device != 'same' else self.device
         if self.ood_datasets is None:
             self.ood_datasets = ['SVHN', 'cifar10', 'folder-Imagenet_resize', 'folder-LSUN_resize', 'cifar100']
 
@@ -372,22 +373,34 @@ def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ra
     # fig.waitforbuttonpress()
     pass
 
-def gen_inference_fn(ref_stats_dict):
+
+def gen_inference_fn(ref_stats_dict, reduction_dict={}):
     def _batch_calc(trace_name, m, inputs):
+        shared_reductions_dict = {}
+        for reduction_name, reduction_fn in reduction_dict.items():
+            shared_reductions_per_input = []
+            for i in inputs:
+                shared_reductions_per_input.append(reduction_fn(i))
+            shared_reductions_dict[reduction_name] = shared_reductions_per_input
+
         class_specific_stats = []
         for class_stat_dict in ref_stats_dict:
-            reduction_specific_record = {}
+            class_specific_rediction_record = {}
             for reduction_name, reduction_stat in class_stat_dict[trace_name[:-8]].items():
                 pval_per_input = []
                 for e, per_input_stat in enumerate(reduction_stat):
-                    ret_channel_strategy={}
-                    assert isinstance(per_input_stat,BatchStatsCollectorRet)
-                    reduced = per_input_stat.reduction_fn(inputs[e])
-                    for channle_reduction_name,rec in per_input_stat.channel_reduction_record.items():
+                    ret_channel_strategy = {}
+                    assert isinstance(per_input_stat, BatchStatsCollectorRet)
+                    if reduction_name in shared_reductions_dict:
+                        assert per_input_stat.reduction_fn == reduction_dict[reduction_name]
+                        reduced = shared_reductions_dict[reduction_name][e]
+                    else:
+                        reduced = per_input_stat.reduction_fn(inputs[e])
+                    for channle_reduction_name, rec in per_input_stat.channel_reduction_record.items():
                         ret_channel_strategy[channle_reduction_name] = rec['fn'](reduced)
                     pval_per_input.append(ret_channel_strategy)
-                reduction_specific_record[reduction_name] = pval_per_input
-            class_specific_stats.append(reduction_specific_record)
+                class_specific_rediction_record[reduction_name] = pval_per_input
+            class_specific_stats.append(class_specific_rediction_record)
         return class_specific_stats
     return _batch_calc
 
@@ -541,11 +554,11 @@ def extract_output_distribution(all_class_ref_stats,target_percentiles=th.tensor
 
 class OODDetector():
     def __init__(self, model, all_class_ref_stats, right_sided_fisher_pvalue=True,
-                 include_matcher_fn=_default_matcher_fn):
+                 include_matcher_fn=_default_matcher_fn, shared_reductions=_DEFAULT_SPATIAL_REDDUCTIONS):
 
         self.stats_recorder = Recorder(model, recording_mode=[Recorder._RECORD_INPUT_MODE[1]],
                                        include_matcher_fn=include_matcher_fn,
-                                       input_fn=gen_inference_fn(all_class_ref_stats),
+                                       input_fn=gen_inference_fn(all_class_ref_stats, shared_reductions),
                                        recursive=True, device_modifier='same')
         # channle_reduction = ['simes_pval', 'cond_fisher'],
         # self.channel_reduction = channle_reduction
@@ -752,21 +765,26 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
             reduction_specific_record = []
             for reduction_name, reduction_fn in measure_settings.reduction_dictionary.items():
                 tracker_name = f'{trace_name}_{reduction_name}:{e}'
+                ## make sure input is a 2d tensor [batch, nchannels]
+                i_ = reduction_fn(i)
+
                 if measure_settings.sample_channels and tracker_name in measure_settings.sample_channels:
                     sample_channels = measure_settings.sample_channels[tracker_name]
                     # we update reduction_fn and leverage BatchStatsCollectorRet keep layer specific modifications
                     # Note that sampling before reduction is more efficient, however we reverse the order to simplify
                     # the case where spatial reductions may change the number of channels
-                    reduction_fn = PickleableFunctionComposition(f1=reduction_fn,f2=ChannelSelect(sample_channels.clone()))
+                    # reduction_fn = PickleableFunctionComposition(f1=reduction_fn,f2=ChannelSelect(sample_channels.clone()))
+                    sample_channels_fn = ChannelSelect(sample_channels.clone())
+                    i_ = sample_channels_fn(i_)
                 else:
                     sample_channels = None
-                ## make sure input is a 2d tensor [batch, nchannels]
-                i_ = reduction_fn(i)
+
                 if collector_device != 'same' and collector_device != model_device:
                     i_ = i_.to(collector_device)
 
                 num_observations, channels = i_.shape
-                reduction_ret_obj = BatchStatsCollectorRet(reduction_name,reduction_fn,num_observations=num_observations)
+                reduction_ret_obj = BatchStatsCollectorRet(reduction_name, reduction_fn,
+                                                           num_observations=num_observations)
 
                 # save a reference to the meter for convenience
                 reduction_ret_obj.meter = tracker[tracker_name]
@@ -774,25 +792,30 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                 # this requires first collecting reduction statistics (covariance), then in a second pass we can collect
                 if measure_settings.mahalanobis:
                     if sample_channels is not None:
-                        mean, inv_cov = tracker[tracker_name].mean[sample_channels],tracker[tracker_name].inv_cov(sample_channels)
+                        mean, inv_cov = tracker[tracker_name].mean[sample_channels], tracker[tracker_name].inv_cov(
+                            sample_channels)
                     else:
-                        mean,inv_cov = tracker[tracker_name].mean, tracker[tracker_name].inv_cov()
+                        mean, inv_cov = tracker[tracker_name].mean, tracker[tracker_name].inv_cov()
 
-                    mahalanobis_fn = MahalanobisDistance(mean,inv_cov)
+                    mahalanobis_fn = MahalanobisDistance(mean, inv_cov)
                     # reduce all per channels stats to a single score
                     i_m = mahalanobis_fn(i_)
                     # measure the distribution per layer
                     tracker.update({f'{tracker_name}-@mahalabobis': i_m})
-                    reduction_ret_obj.channel_reduction_record.update( {'mahalanobis':
-                                                                           # used for layer fusion (concatinate over all batches)
-                                                                          {'record' : i_m,
-                                                                           ## used to extract the pval from the output of the spatial reduction output
-                                                                           # channel reduction transformation
-                                                                           'right_side_pval': True,
-                                                                           'fn' : mahalanobis_fn,
-                                                                           # meter for the channel reduction (used to create pval matcher)
-                                                                           'meter': tracker[f'{tracker_name}-@mahalabobis'],
-                                                                           }
+                    if sample_channels:
+                        # update function channel selection for inference time # todo move all fns outside of the loop
+                        mahalanobis_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=mahalanobis_fn)
+                    reduction_ret_obj.channel_reduction_record.update({'mahalanobis':
+                                                                       # used for layer fusion (concatinate over all batches)
+                                                                           {'record': i_m,
+                                                                            ## used to extract the pval from the output of the spatial reduction output
+                                                                            # channel reduction transformation
+                                                                            'right_side_pval': True,
+                                                                            'fn': mahalanobis_fn,
+                                                                            # meter for the channel reduction (used to create pval matcher)
+                                                                            'meter': tracker[
+                                                                                f'{tracker_name}-@mahalabobis'],
+                                                                            }
                                                           } )
 
                 if measure_settings.find_simes or measure_settings.find_cond_fisher:
@@ -805,27 +828,38 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                     # here we first seek the pvalue for the observated reduction value
                     pval = reduction_ret_obj.meter.pval_matcher(i_)
 
-                    if measure_settings.find_simes :
+                    if measure_settings.find_simes:
+                        i_s = calc_simes(pval)
+                        # tracker.update({f'{tracker_name}-@simes_c': i_})
+                        simes_fn = PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
+                        if sample_channels:
+                            simes_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=simes_fn)
+
                         reduction_ret_obj.channel_reduction_record.update({'simes_c':
-                                                                   {
-                                                                   'right_side_pval': False,
-                                                                   'record':calc_simes(pval),
-                                                                   'fn': PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
-                                                                   }
-                                                               })
+                            {
+                                'right_side_pval': False,
+                                'record': i_s,
+                                'fn': simes_fn
+                            }
+                        })
 
                     if measure_settings.find_cond_fisher:
-                        fisher_out = calc_cond_fisher(pval)
+                        i_f = calc_cond_fisher(pval)
                         # result is not normalized as pvalues, we need to measure the distribution
                         # of this value to return to pval terms
-                        tracker.update({f'{tracker_name}-@fisher_c': fisher_out})
+                        tracker.update({f'{tracker_name}-@fisher_c': i_f})
+                        fisher_fn = PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher,
+                                                                  f2=calc_cond_fisher)
+                        if sample_channels:
+                            fisher_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=fisher_fn)
                         reduction_ret_obj.channel_reduction_record.update({'fisher_c':
-                                                                   {'record': fisher_out,
-                                                                    'meter':tracker[f'{tracker_name}-@fisher_c'],
-                                                                    'right_side_pval':True,
-                                                                    'fn':PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_cond_fisher)
-                                                                    }
-                                                              })
+                                                                               {'record': i_f,
+                                                                                'meter': tracker[
+                                                                                    f'{tracker_name}-@fisher_c'],
+                                                                                'right_side_pval': True,
+                                                                                'fn': fisher_fn
+                                                                                }
+                                                                           })
 
                 reduction_specific_record.append(reduction_ret_obj)
 
@@ -899,7 +933,8 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
     r.remove_model_hooks()
     return ret_stat_dict
 
-def measure_v2(model,measure_ds,args:Settings):
+
+def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
     if args.measure_joint_distribution:
         classes = ['all']
     else:
@@ -907,31 +942,37 @@ def measure_v2(model,measure_ds,args:Settings):
 
     all_class_stat_trackers = []
     targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
-    for class_id, class_name in enumerate(classes):
-        logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
-        if not args.measure_joint_distribution:
-            ds_ = th.utils.data.Subset(measure_ds, th.where(targets == class_id)[0])
-        else:
-            ds_ = measure_ds
+    if os.path.exists(measure_cache_part1):
+        all_class_stat_trackers = th.load(measure_cache_part1, map_location=args.collector_device)
+    else:
+        for class_id, class_name in enumerate(classes):
+            logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
+            if not args.measure_joint_distribution:
+                ds_ = th.utils.data.Subset(measure_ds, th.where(targets == class_id)[0])
+            else:
+                ds_ = measure_ds
 
-        sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
-        train_loader = th.utils.data.DataLoader(
-            ds_, sampler=sampler,
-            batch_size=args.batch_size_measure, shuffle=False if sampler else True,
-            num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
+            sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
+            train_loader = th.utils.data.DataLoader(
+                ds_, sampler=sampler,
+                batch_size=args.batch_size_measure, shuffle=False if sampler else True,
+                num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
 
-        measure_settings = BatchStatsCollectorCfg(args.batch_size_measure, reduction_dictionary=args.spatial_reductions,
-                                                  # todo: maybe split measure and test include fn in Settings
-                                                  include_matcher_fn=args.include_matcher_fn_measure)
+            measure_settings = BatchStatsCollectorCfg(args.batch_size_measure,
+                                                      reduction_dictionary=args.spatial_reductions,
+                                                      # todo: maybe split measure and test include fn in Settings
+                                                      include_matcher_fn=args.include_matcher_fn_measure)
 
-        # collect basic reduction stats
-        class_stats = measure_data_statistics_part1(train_loader, model, epochs=5 if args.augment_measure else 1,
-                                                    model_device=args.device,
-                                                    collector_device=args.collector_device,
-                                                    batch_size=args.batch_size_measure,
-                                                    measure_settings=measure_settings)
-        all_class_stat_trackers.append(class_stats)
-
+            # collect basic reduction stats
+            class_stats = measure_data_statistics_part1(train_loader, model, epochs=5 if args.augment_measure else 1,
+                                                        model_device=args.device,
+                                                        collector_device=args.collector_device,
+                                                        batch_size=args.batch_size_measure,
+                                                        measure_settings=measure_settings)
+            all_class_stat_trackers.append(class_stats)
+        if measure_cache_part1 is not None:
+            assert type(measure_cache_part1) == str
+            th.save(measure_cache_part1, all_class_stat_trackers)
     if args.channel_selection_fn:
         sampled_channels_dict = args.channel_selection_fn(all_class_stat_trackers)
     else:
@@ -1431,10 +1472,10 @@ def measure_and_eval(args : Settings):
         calib_tag = args.tag
 
     calib_tag = f'{exp_tag}-{calib_tag}'
-    exp_tag += f'-{args.tag}'
+    part1_cache = f'measured_stats_per_class-{exp_tag}-raw.pth'
     calibrated_path = f'measured_stats_per_class-{calib_tag}.pth'
-
-    if 'layer_select' in exp_tag and not recompute:
+    exp_tag += f'-{args.tag}'
+    if args.select_layer_mode and not recompute:
         import time
         while (not os.path.exists(calibrated_path)):
             print(f'waiting for file: {calibrated_path}')
@@ -1442,11 +1483,12 @@ def measure_and_eval(args : Settings):
 
     if not args.recompute and os.path.exists(calibrated_path):
         ref_stats = th.load(calibrated_path,
-                            map_location=args.collector_device if args.collector_device != 'same' else args.device)
+                            map_location=args.collector_device)
     else:
-        ds = get_dataset(args.dataset, 'train', expected_transform_measure, limit=args.limit_measure, per_class_limit=False)
+        ds = get_dataset(args.dataset, 'train', expected_transform_measure, limit=args.limit_measure,
+                         per_class_limit=True)
         # ref_stats = measure(model, ds, args)
-        ref_stats = measure_v2(model, ds, args)
+        ref_stats = measure_v2(model, ds, args, part1_cache)
         logging.info('saving reference stats dict')
         th.save(ref_stats, calibrated_path)
     if args.select_layer_mode:
@@ -1465,7 +1507,7 @@ def measure_and_eval(args : Settings):
 
     logging.info(f'building OOD detector')
     detector = OODDetector(model, ref_stats, right_sided_fisher_pvalue=args.right_sided_fisher_pvalue,
-                           include_matcher_fn=args.include_matcher_fn_test)
+                           include_matcher_fn=args.include_matcher_fn_test, shared_reductions=args.spatial_reductions)
     gc.collect()
     logging.info(f'evaluating inliers')
     val_ds = get_dataset(args.dataset, 'val', expected_transform_test, limit=args.limit_test, per_class_limit=False)
@@ -1774,7 +1816,8 @@ if __name__ == '__main__':
         ood_datasets=['DomainNet-real-B', 'DomainNet-sketch-A', 'DomainNet-sketch-B',
                       'DomainNet-quickdraw-A', 'DomainNet-quickdraw-B',
                       'DomainNet-infograph-A', 'DomainNet-infograph-B',
-                      'random-normal', 'random-imagenet'],
+                      # 'random-normal', 'random-imagenet'
+                      ],
         transform_dataset='imagenet',
         select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
@@ -1794,10 +1837,15 @@ if __name__ == '__main__':
         tag=tag,
         device=f'cuda:{device_id}',
         collector_device='cpu',
-        ood_datasets=['imagenet', 'DomainNet-sketch',
-                      'DomainNet-quickdraw',
-                      'DomainNet-infograph',
-                      'random-normal', 'random-imagenet'],
+        ood_datasets=['imagenet',
+                      'folder-places69',
+                      'folder-textures',
+                      'SVHN'
+                      # 'DomainNet-sketch',
+                      # 'DomainNet-quickdraw',
+                      # 'DomainNet-infograph',
+                      # 'random-normal', 'random-imagenet'
+                      ],
         transform_dataset='imagenet',
         select_layer_mode=select_layers_mode,
         channel_selection_fn=channel_selection_fn,
@@ -1807,7 +1855,7 @@ if __name__ == '__main__':
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='LSUN-raw',
         limit_test=5000,
-        limit_measure=50000,
+        limit_measure=10000,
         batch_size_test=500,
         model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_lsun.pth.tar',
