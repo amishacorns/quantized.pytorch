@@ -3,7 +3,6 @@ import inspect
 import logging
 import os
 from dataclasses import dataclass
-from functools import partial
 from typing import Callable, List, Dict
 
 import matplotlib
@@ -392,12 +391,20 @@ def gen_inference_fn(ref_stats_dict, reduction_dict={}):
                     ret_channel_strategy = {}
                     assert isinstance(per_input_stat, BatchStatsCollectorRet)
                     if reduction_name in shared_reductions_dict:
-                        assert per_input_stat.reduction_fn == reduction_dict[reduction_name]
+                        if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
+                            assert per_input_stat.reduction_fn.f1 == reduction_dict[reduction_name]
                         reduced = shared_reductions_dict[reduction_name][e]
                     else:
                         reduced = per_input_stat.reduction_fn(inputs[e])
                     for channle_reduction_name, rec in per_input_stat.channel_reduction_record.items():
+                        if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
+                            # overwrite function to match old measure file with new format, note that channels reduction can differ between classes
+                            rec['fn'] = PickleableFunctionComposition(f1=per_input_stat.reduction_fn.f2,
+                                                                      f2=per_input_stat.reduction_fn.f1)
                         ret_channel_strategy[channle_reduction_name] = rec['fn'](reduced)
+                    if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
+                        # this will make sure the fn overwite will only happen once
+                        per_input_stat.reduction_fn = per_input_stat.reduction_fn.f1
                     pval_per_input.append(ret_channel_strategy)
                 class_specific_rediction_record[reduction_name] = pval_per_input
             class_specific_stats.append(class_specific_rediction_record)
@@ -1717,6 +1724,7 @@ if __name__ == '__main__':
     # exp_ids = exp_ids = [8, 9, 10] # [0, 1, 2, 3, 4, 5, 6, 7]
     # device_id = 3  # exp_ids[0] % th.cuda.device_count()
 
+
     # 5
     # tag = '-@layer_select_logspace'
     # channel_selection_fn = None
@@ -1744,7 +1752,6 @@ if __name__ == '__main__':
     select_layers_mode = 'logspace'
     exp_ids = exp_ids = [9, 10, 8]  # [0, 1, 2, 3, 4, 5, 6, 7]
     device_id = 7  # exp_ids[0] % th.cuda.device_count()
-
 
     # tag = f'-@chosen_channels_all_class'
     # channel_selection_fn = partial(find_most_seperable_channels,max_channels_per_class = 5)
@@ -1961,7 +1968,7 @@ if __name__ == '__main__':
     setup_logging()
     for args in experiments:
         logging.info(args)
-        if args.num_classes > 100:
+        if args.num_classes > 500:
             _USE_PERCENTILE_DEVICE = True
         else:
             _USE_PERCENTILE_DEVICE = False
