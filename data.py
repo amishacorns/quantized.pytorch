@@ -71,13 +71,15 @@ def get_dataset(name, split='train', transform=None,
     elif name.startswith('DomainNet-'):
         parts = name.split('-')
         domain = parts[1]
-        if name.endswith('A') or name.endswith('B'):
-            set = [2]
-            class_ids = range(173) if set == 'A' else range(173, 345)
         if name.endswith('-measure') and train:
             ds_dir_name = os.path.join('DomainNet', 'measure', domain)
         else:
             ds_dir_name = os.path.join('DomainNet', 'train' if train else 'test', domain)
+        name = name.replace('-measure', '')
+        if name.endswith('-A') or name.endswith('-B'):
+            set = parts[2]
+            class_ids = range(173) if set == 'A' else range(173, 345)
+
 
 
     elif name.endswith('-dogs') or name.endswith('-cats'):
@@ -159,8 +161,9 @@ def get_dataset(name, split='train', transform=None,
         ds = datasets.ImageFolder(root=root,
                                   transform=transform,
                                   target_transform=target_transform)
-        ds = limit_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit,
-                                     seed=limit_shuffle_seed, allowed_classes=class_ids)
+        if limit or class_ids:
+            ds = limit_ds(ds, limit, per_class=per_class_limit, shuffle=shuffle_before_limit, seed=limit_shuffle_seed,
+                          allowed_classes=class_ids)
         return ds
     elif name in ['imagenet', 'cats_vs_dogs', 'places365_standard'] or any(i in name for i in ['imagine-', '-raw']):
         if train:
