@@ -583,13 +583,11 @@ class OODDetector():
     def _gen_output_dict(self,per_class_per_reduction_record):
         # prepare a dict with pvalues per reduction per sample per class i.e. {reduction_name : (BxC)}
         reduction_stats_collection = {}
-        for class_stats in per_class_per_reduction_record:
-            for reduction_name, pval in class_stats.items():
-                if reduction_name in reduction_stats_collection:
-                    reduction_stats_collection[reduction_name] = th.cat([reduction_stats_collection[reduction_name],
-                                                                         pval.unsqueeze(1)],1)
-                else:
-                    reduction_stats_collection[reduction_name] = pval.unsqueeze(1)
+        for reduction_name in per_class_per_reduction_record[0].keys():
+            reduction_stats_collection[reduction_name] = []
+            for class_stats in per_class_per_reduction_record:
+                reduction_stats_collection[reduction_name].append(class_stats[reduction_name].cpu())
+            reduction_stats_collection[reduction_name] = th.cat(reduction_stats_collection[reduction_name], -1)
 
         return reduction_stats_collection
 
@@ -611,13 +609,45 @@ class OODDetector():
 
             per_class_record.append(fisher_pvals_per_reduction)
 
-        self.stats_recorder.record.clear()
         return self._gen_output_dict(per_class_record)
+
+    def get_simes(self):
+        per_class_record = []
+        for class_id in range(self.num_classes):
+            pval_per_reduction = {}
+            for layer_name, layer_stats_dict in self.stats_recorder.record.items():
+                # if filter_layer and filter_layer(layer_name):
+                #     continue
+                if class_id is not None:
+                    layer_stats_dict = layer_stats_dict[class_id]
+                for spatial_reduction_name, record_per_input in layer_stats_dict.items():
+                    # prepare the registry
+                    if spatial_reduction_name not in pval_per_reduction:
+                        pval_per_reduction[spatial_reduction_name] = {}
+                        channel_reduction_names = record_per_input[0].keys()
+                        for channel_reduction_name in channel_reduction_names:
+                            pval_per_reduction[spatial_reduction_name][channel_reduction_name] = []
+                    # all layer inputs are reduced together
+                    for record in record_per_input:
+                        for channel_reduction_name, pval in record.items():
+                            pval_per_reduction[spatial_reduction_name][channel_reduction_name].append(pval)
+
+            # update fisher pvalue per reduction
+            pvals_per_reduction = {}
+            for reduction_name, sum_pval_record in pval_per_reduction.items():
+                for s, pval in sum_pval_record.items():
+                    pvals_per_reduction[f'{reduction_name}_{s}'] = calc_simes(th.cat(pval, -1))
+
+            per_class_record.append(pvals_per_reduction)
+
+        return self._gen_output_dict(per_class_record)
+
 
 # clac Simes per batch element (samples x variables)
 def calc_simes(pval):
     pval, _ = th.sort(pval, 1)
-    rank = th.arange(1, pval.shape[1] + 1,device=pval.device).repeat(pval.shape[0], 1)
+    view_shape = [-1, pval.shape[1]] + [1] * (pval.dim() - 2)
+    rank = th.arange(1, pval.shape[1] + 1, device=pval.device).view(view_shape)
     simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
     return simes_pval.unsqueeze(1)
 
@@ -1224,147 +1254,151 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
     r.remove_model_hooks()
     return ret_stat_dict
 
-def batched_meter_factory(k, v):
-    return OnlineMeter(batched=True)
 
-def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=False):
+def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dist=False, save_pvalues=False):
     alpha_list = alpha_list or [0.05]
     TNR95_id = alpha_list.index(0.05)
+    accuracy_dict = MeterDict(AverageMeter)
+    rejected = {}
+    if save_pvalues:
+        save_pvalues = {}
+
     def _gen_curve(pvalues_for_val):
         rejected_ = []
         for alpha_ in alpha_list:
-            rejected_.append((pvalues_for_val < alpha_).float().unsqueeze(1))
-        return th.cat(rejected_, 1)
-    def _report(level=logging.INFO):
-        log_fn = lambda msg : logging.log(level=level,msg=msg)
-        if in_dist:
-            log_fn(f'\nModel: Prec@1 {accuracy_dict["model_t1"].avg:.3f} ({accuracy_dict["model_t1"].std:.3f}) \t'
-                     f'Prec@5 {accuracy_dict["model_t5"].avg:.3f} ({accuracy_dict["model_t5"].std:.3f})')
-        for reduction_name in rejected.keys():
-            log_fn(f'\t{reduction_name} metric:')
-            if in_dist:
-                # report mean accuracy
-                log_fn(f'\t\tPVAL: Prec@1 {accuracy_dict[f"{reduction_name}-pval_t1"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-pval_t1"].std:.3f}) \t'
-                             f'Prec@5 {accuracy_dict[f"{reduction_name}-pval_t5"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-pval_t5"].std:.3f})')
-                log_fn(f'\t\tSCALED: Prec@1 {accuracy_dict[f"{reduction_name}-rescaled_t1"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-rescaled_t1"].std:.3f}) \t'
-                             f'Prec@5 {accuracy_dict[f"{reduction_name}-rescaled_t5"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-rescaled_t5"].std:.3f})')
-                log_fn(f'\t\tSCALED-SMX: Prec@1 {accuracy_dict[f"{reduction_name}-rescaled_t1_smx"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-rescaled_t1_smx"].std:.3f}) \t'
-                             f'Prec@5 {accuracy_dict[f"{reduction_name}-rescaled_t5_smx"].avg:.3f} '
-                             f'({accuracy_dict[f"{reduction_name}-rescaled_t5_smx"].std:.3f})')
-            # report rejection results
-            log_fn(f'\t\tMAX_PVAL-Rejected: {rejected[reduction_name]["max_pval_roc"].mean.numpy()[TNR95_id-5:TNR95_id+5]}')
-            log_fn(f'\t\tCOND_PVAL-Rejected: {rejected[reduction_name]["class_conditional_pval_roc"].mean.numpy()[TNR95_id-5:TNR95_id+5]}')
-        log_fn(f'\tRejection results around TNR:{alpha_list[TNR95_id]}\tTNR_ID:{TNR95_id}')
+            rejected_.append((pvalues_for_val < alpha_).float())  # .unsqueeze(1))
+        return th.stack(rejected_, 1)
 
-    model.eval()
-    model.to(model_device)
-    accuracy_dict = MeterDict(AverageMeter)
-    rejected = {}
-    with th.no_grad():
-        for d, l in tqdm.tqdm(loader, total=len(loader)):
-            out = model(d.to(model_device)).cpu()
-            predicted = out.argmax(1)
-            pvalues_dict = detector.get_fisher()
-            last_reduction_pvalues = {}
-            if in_dist:
-                # model accuracy
-                correct_predictions = l == predicted
-                t1, t5 = accuracy(out, l, (1, 5))
-                accuracy_dict.update({
-                    'model_t1':(t1,out.shape[0]),
-                    'model_t5': (t5, out.shape[0]),
+    def _evaluate_pvalues_dict(pvalues_dict, prefix=''):
+        for reduction_name, pvalues in pvalues_dict.items():
+            reduction_name = f'{prefix}-{reduction_name}'
+            if save_pvalues:
+                if reduction_name in save_pvalues:
+                    save_pvalues[reduction_name] = th.cat([save_pvalues[reduction_name], pvalues], 0)
+                else:
+                    save_pvalues[reduction_name] = pvalues
+
+            # measure rejection rates for a range of pvalues under each measure and each reduction
+            if reduction_name not in rejected:
+                rejected[reduction_name] = MeterDict(meter_factory=SimpleOnlineMeterFactory(batched=True))
+            if pvalues.shape[1] != out.shape[1]:
+                rejected[reduction_name].update({
+                    'joint_pval_roc': _gen_curve(pvalues.squeeze(1)),
+                    # 'max_pval_roc': _gen_curve(best_class_pval),
                 })
-
-            for reduction_name,pvalues in pvalues_dict.items():
-                pvalues=pvalues.squeeze().cpu()
+            else:
                 # aggragate pvalues or return per reduction score
-                best_class_pval, best_class_pval_id = pvalues.max(1)
+                # best_class_pval, best_class_pval_id = pvalues.max(1)
                 class_conditional_pval = pvalues[th.arange(l.shape[0]), predicted]
-                # measure rejection rates for a range of pvalues under each measure and each reduction
-                if reduction_name not in rejected:
-                    rejected[reduction_name] = MeterDict(meter_factory=batched_meter_factory)
-                # keep track of pvalue predictions
-                # last_reduction_pvalues[reduction_name]={
-                #     #'class_conditional_pval': class_conditional_pval,
-                #     #'max_pval': best_class_pval,
-                #     'max_pval_id': best_class_pval_id
-                # }
-
+                # joint dstribution: single pvalue for all classes
                 rejected[reduction_name].update({
                     'class_conditional_pval_roc': _gen_curve(class_conditional_pval),
-                    'max_pval_roc': _gen_curve(best_class_pval),
+                    # 'max_pval_roc': _gen_curve(best_class_pval),
                 })
                 if in_dist:
                     t1_likely, t5_likely = accuracy(pvalues, l, (1, 5))
 
-                    rescaled_outputs = out*pvalues
-                    t1_rescaled, t5_rescaled = accuracy(rescaled_outputs, l, (1, 5))
+                    # rescaled_outputs = out*pvalues
+                    # t1_rescaled, t5_rescaled = accuracy(rescaled_outputs, l, (1, 5))
 
-                    rescaled_outputs_post_smx = th.nn.functional.softmax(out,-1)*pvalues
+                    rescaled_outputs_post_smx = th.nn.functional.softmax(out, -1) * pvalues
                     t1_rescaled_smx, t5_rescaled_smx = accuracy(rescaled_outputs_post_smx, l, (1, 5))
 
                     accuracy_dict.update({
-                        f'{reduction_name}-pval_t1': (t1_likely, out.shape[0]),
-                        f'{reduction_name}-pval_t5': (t5_likely, out.shape[0]),
-                        f'{reduction_name}-rescaled_t1': (t1_rescaled, out.shape[0]),
-                        f'{reduction_name}-rescaled_t5': (t5_rescaled, out.shape[0]),
-                        f'{reduction_name}-rescaled_t1_smx': (t1_rescaled_smx, out.shape[0]),
-                        f'{reduction_name}-rescaled_t5_smx': (t5_rescaled_smx, out.shape[0]),
+                        f'{reduction_name}-pval_acc': (th.stack([t1_likely, t5_likely]), out.shape[0]),
+                        # f'{reduction_name}-rescaled_t1': (t1_rescaled, out.shape[0]),
+                        # f'{reduction_name}-rescaled_t5': (t5_rescaled, out.shape[0]),
+                        f'{reduction_name}-rescaled-smx_acc': (
+                            th.stack([t1_rescaled_smx, t5_rescaled_smx]), out.shape[0]),
                     })
-                    # # additional in-dist results per reduction
-                    # # model prediction agrees with selected pvalue
-                    # agreement = (best_class_pval_id == predicted)
-                    # # agreement only on predictions that are correct
-                    # agreement_true = (agreement == correct_predictions)
-                    # logging.info(f'\tMAX_PVAL-Agreement with model prediction: {agreement.float().mean():.3f},'
-                    #              f'\n\tMAX_PVAL-Agreement with correct predictions: {agreement_true.float().mean():.3f}')
 
                     # pvalue of the annotated class
                     true_class_pval = pvalues[th.arange(l.shape[0]), l]
                     # the pvalue of correct class prediction
-                    correct_pred_pvalues = pvalues[correct_predictions,l[correct_predictions]]
+                    correct_pred_pvalues = pvalues[correct_predictions, l[correct_predictions]]
                     # what was the pvalue of the correct class pval when prediction was wrong
-                    false_pred_pvalues = pvalues[th.logical_not(correct_predictions),l[th.logical_not(correct_predictions)]]
+                    false_pred_pvalues = pvalues[
+                        th.logical_not(correct_predictions), l[th.logical_not(correct_predictions)]]
                     rejected[reduction_name].update({
-                        'true_class_pval_mean' : true_class_pval,
-                        'true_pred_pval_mean' : correct_pred_pvalues,
-                        'false_pred_pval_mean':false_pred_pvalues,
+                        'true_class_pval_mean': true_class_pval,
+                        'true_pred_pval_mean': correct_pred_pvalues,
+                        'false_pred_pval_mean': false_pred_pvalues,
                     })
 
                     rejected[reduction_name].update({
-                        'true_class_pval_roc' : _gen_curve(true_class_pval),
+                        'true_class_pval_roc': _gen_curve(true_class_pval),
                     })
 
-            ## in this section we can fuse different reductions to produce a potentially stronger rejection method
-            # if 'fused_pval_min_max' not in rejected:
-            #     # prime fusion meters
-            #     for fusion in ['fused_pval_mean_margin','fused_pval_min_max','fused_pval_min_max_mean', 'fused_pval_all']:
-            #         rejected[fusion]=MeterDict(meter_factory=batched_meter_factory)
-            #
-            # # for now we only do this for max-pval rejection method
-            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
-            #                      last_reduction_pvalues['spatial-margin']['max_pval']], 1)).squeeze()
-            # rejected['fused_pval_mean_margin'].update({'max_pval': _gen_curve(fused_pval)})
-            #
-            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-min']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            # rejected['fused_pval_min_max'].update({'max_pval': _gen_curve(fused_pval)})
-            #
-            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-mean']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-min']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            # rejected['fused_pval_min_max_mean'].update({'max_pval': _gen_curve(fused_pval)})
-            #
-            # fused_pval = calc_simes(th.stack([last_reduction_pvalues['spatial-margin']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-mean']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-min']['max_pval'],
-            #                                   last_reduction_pvalues['spatial-max']['max_pval']], 1)).squeeze()
-            # rejected['fused_pval_all'].update({'max_pval': _gen_curve(fused_pval)})
+    def _report(level=logging.INFO):
+        log_fn = lambda msg: logging.log(level=level, msg=msg)
+        compose_acc_msg = lambda key: f'{accuracy_dict[key].avg.numpy()} ({accuracy_dict[key].std.numpy()})'
+        if in_dist:
+            log_fn(f'\nModel accuracy: {compose_acc_msg("model_acc")}')
+
+        for reduction_name in rejected.keys():
+            log_fn(f'\t{reduction_name} metric:')
+            if in_dist and f"{reduction_name}-pval_acc" in accuracy_dict:
+                # report mean accuracy
+                log_fn(f'\t\tPVAL accuracy: {compose_acc_msg(f"{reduction_name}-pval_acc")} \t')
+                log_fn(f'\t\tSCALED-SMX accuracy: {compose_acc_msg(f"{reduction_name}-rescaled-smx_acc")} \t')
+                # log_fn(f'\t\tSCALED: Prec@1 {accuracy_dict[f"{reduction_name}-rescaled_t1"].avg:.3f} '
+                #              f'({accuracy_dict[f"{reduction_name}-rescaled_t1"].std:.3f}) \t'
+                #              f'Prec@5 {accuracy_dict[f"{reduction_name}-rescaled_t5"].avg:.3f} '
+                #              f'({accuracy_dict[f"{reduction_name}-rescaled_t5"].std:.3f})')
+
+            # report rejection results
+            # log_fn(f'\t\tMAX_PVAL-Rejected: {rejected[reduction_name]["max_pval_roc"].mean.numpy()[TNR95_id-5:TNR95_id+5]}')
+            for n, rejection_meter in rejected[reduction_name].items():
+                if n.endswith('_pval_roc'):
+                    log_fn(
+                        f'\t\t{n[:-9]}-Rejected: {rejected[reduction_name][n].mean.numpy()[TNR95_id - 5:TNR95_id + 5]}')
+
+        log_fn(f'\tRejection results around TNR:{alpha_list[TNR95_id]}\tTNR_ID:{TNR95_id}')
+
+    def _fusion_pvalues(dict_of_methods_pvalues, max_rank=2, reductions=None):
+        # rejected['fusion']=MeterDict(meter_factory=SimpleOnlineMeterFactory(batched=True))
+        ret_pvalues = {}
+        from itertools import combinations
+        if reductions is None:
+            reductions = dict_of_methods_pvalues.keys()
+
+        for i in range(2, max_rank + 1):
+            for pval_method_comb in combinations(reductions, i):
+                fusion_name = ''
+                fused_pval = []
+                for pval_method in pval_method_comb:
+                    fusion_name += f'+{pval_method}'
+                    fused_pval.append(dict_of_methods_pvalues[pval_method])
+                fused_pval = th.stack(fused_pval, 1)
+                ret_pvalues[fusion_name] = calc_simes(fused_pval).squeeze(1)
+        return ret_pvalues
+        # rejected['fusion'].update({fusion_name + '_roc': _gen_curve(calc_simes(fused_pval))})
+
+    model.eval()
+    model.to(model_device)
+    with th.no_grad():
+        for d, l in tqdm.tqdm(loader, total=len(loader)):
+            out = model(d.to(model_device)).cpu()
+            predicted = out.argmax(1)
+            pvalues_dict_fisher = detector.get_fisher()
+            pvalues_dict_simes = detector.get_simes()
+            detector.stats_recorder.record.clear()
+
+            joint_dict = {}
+            for pval_layer_reduction_method, pval_dict in zip(['simes', 'fisher'],
+                                                              [pvalues_dict_simes, pvalues_dict_fisher]):
+                joint_dict.update({f'{pval_layer_reduction_method}-{rm}': p for rm, p in pval_dict.items()})
+            pvalues_fusion = _fusion_pvalues(joint_dict, 2)
+
+            if in_dist:
+                # model accuracy
+                correct_predictions = l == predicted
+                t1, t5 = accuracy(out, l, (1, 5))
+                accuracy_dict.update({'model_acc': (th.stack([t1, t5]), out.shape[0])})
+
+            _evaluate_pvalues_dict(pvalues_dict_simes, 'simes')
+            _evaluate_pvalues_dict(pvalues_dict_fisher, 'fisher')
+            _evaluate_pvalues_dict(pvalues_fusion, 'fusion')
             _report(logging.DEBUG)
         ## end of eval report
         logging.info(f'DONE: {getattr(loader.dataset,"root",loader.dataset)}')
@@ -1380,8 +1414,9 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
                 reduction_dict[k] = v
             ret_dict[reduction_name] = reduction_dict
         for reduction_name_accuracy, accuracy_d in accuracy_dict.items():
-            ret_dict[reduction_name_accuracy]=accuracy_d
-    return ret_dict
+            ret_dict[reduction_name_accuracy] = accuracy_d
+
+    return ret_dict, save_pvalues
 
     # Important! recorder hooks should be removed when done
 
@@ -1397,7 +1432,7 @@ def result_summary(res_dict,args_dict,TNR_target=0.05):
         logging.info(reduction_name)
         if type(reduction_metrics) != dict:
             # report simple metric
-            logging.info(f'\t{reduction_metrics.mean:0.3f}\t({reduction_metrics.std:0.3f})')
+            logging.info(f'\t{reduction_metrics.mean}\t({reduction_metrics.std})')
             continue
         # report reduction specific metrics
         for metric_name, meter_object in reduction_metrics.items():
@@ -1416,17 +1451,19 @@ def result_summary(res_dict,args_dict,TNR_target=0.05):
             else:
                 calibrated_alpha_raw = indist_pvalues_roc[calibrated_alpha_id]
                 # actual rejection threshold to use for TNR 95%
-                interp_alpha = np.interp(0.05, indist_pvalues_roc ,alphas)
+                interp_alpha = np.interp(0.05, indist_pvalues_roc.squeeze_(), alphas)
 
             logging.info(f'\t{metric_name} - in-dist raw rejected: '
-                         f'raw-{calibrated_alpha_raw:0.3f} ({alphas[calibrated_alpha_id]:0.3f}), '
+                         # f'alpha-{indist_pvalues_roc[alphas.index(TNR_target)]:0.3f} ({TNR_target:0.3f}), '
+                         f'under-{calibrated_alpha_raw:0.3f} ({alphas[calibrated_alpha_id]:0.3f}), '
                          f'interp-{TNR_target:0.3f} ({interp_alpha:0.3f}), '
-                         f'next-{indist_pvalues_roc[calibrated_alpha_id+1]:0.3f} ({alphas[calibrated_alpha_id+1]})')
+                         f'over-{indist_pvalues_roc[calibrated_alpha_id + 1]:0.3f} ({alphas[calibrated_alpha_id + 1]})')
 
             for target_dataset_name, reduction_metrics in res_dict.items():
                 if target_dataset_name != in_dist and metric_name in reduction_metrics[reduction_name]:
-                    interp_rejected = np.interp(interp_alpha, alphas, reduction_metrics[reduction_name][metric_name].mean.numpy())
-                    raw_rejected = reduction_metrics[reduction_name][metric_name].mean.numpy()[calibrated_alpha_id]
+                    interp_rejected = np.interp(interp_alpha, alphas,
+                                                reduction_metrics[reduction_name][metric_name].mean.numpy())
+                    raw_rejected = reduction_metrics[reduction_name][metric_name].mean.numpy()[alphas.index(TNR_target)]
                     logging.info(f'\t\t{target_dataset_name}:\traw-{raw_rejected:0.3f}\tinterp-{interp_rejected:0.3f}')
 
 
@@ -1544,7 +1581,8 @@ def measure_and_eval(args : Settings):
                            include_matcher_fn=args.include_matcher_fn_test, shared_reductions=args.spatial_reductions)
     gc.collect()
     logging.info(f'evaluating inliers')
-    val_ds = get_dataset(args.dataset, 'val', expected_transform_test, limit=args.limit_test, per_class_limit=False)
+    val_ds = get_dataset(args.dataset, 'val', expected_transform_test, limit=args.limit_test, per_class_limit=False,
+                         shuffle_before_limit=True, limit_shuffle_seed=0)
     # todo add adversarial samples test
     # optional run in-dist data evaluate per class to simplify analysis
     # for class_id,class_name in enumerate(val_ds.classes):
@@ -1554,20 +1592,34 @@ def measure_and_eval(args : Settings):
         val_ds, sampler=sampler,
         batch_size=args.batch_size_test, shuffle=False,
         num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
-    rejection_results[args.dataset]=evaluate_data(val_loader, model, detector,args.device,alpha_list=args.alphas,in_dist=True)
+    e_ret = evaluate_data(val_loader, model, detector, args.device, alpha_list=args.alphas, in_dist=True,
+                          save_pvalues=export_pvalues)
+    if export_pvalues:
+        pvalues_collection = {args.dataset: e_ret[1]}
+    rejection_results[args.dataset] = e_ret[0]
+
     logging.info(f'evaluating outliers')
 
     for ood_dataset in args.ood_datasets:
-        ood_ds = get_dataset(ood_dataset, 'val',expected_transform_test,limit=args.limit_test,per_class_limit=False)
+        ood_ds = get_dataset(ood_dataset, 'val', expected_transform_test, limit=args.limit_test,
+                             per_class_limit=False, shuffle_before_limit=True, limit_shuffle_seed=0)
+
         ood_loader = th.utils.data.DataLoader(
             ood_ds, sampler=None,
             batch_size=args.batch_size_test, shuffle=False,
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
         logging.info(f'evaluating {ood_dataset}')
-        rejection_results[ood_dataset] = evaluate_data(ood_loader, model, detector, args.device,alpha_list=args.alphas)
+        e_ret = evaluate_data(ood_loader, model, detector, args.device, alpha_list=args.alphas,
+                              save_pvalues=export_pvalues)
+        if export_pvalues:
+            pvalues_collection[args.dataset] = e_ret[1]
+        rejection_results[ood_dataset] = e_ret[0]
 
-    th.save({'results':rejection_results,'settings':args.get_args_dict()},f'experiment_results-{exp_tag}.pth')
-    result_summary(rejection_results,args.get_args_dict())
+    save = {'results': rejection_results, 'settings': args.get_args_dict()}
+    if export_pvalues:
+        save['pvalues_collection'] = pvalues_collection
+    th.save(save, f'experiment_results-{exp_tag}.pth')
+    result_summary(rejection_results, args.get_args_dict())
 
 
 ### 'maxclust' is used to choose number of clusters, 'distance' to choose according to threshold
