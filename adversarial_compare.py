@@ -20,12 +20,13 @@ from utils.log import setup_logging
 from utils.meters import MeterDict, OnlineMeter, AverageMeter, accuracy
 from utils.misc import Recorder
 
+th.backends.cudnn.benchmark = False
 _EDGE_SAMPLES = 200
 _NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
 global _USE_PERCENTILE_DEVICE
 _USE_PERCENTILE_DEVICE = False
-_NUM_LOADER_WORKERS = 1
+_NUM_LOADER_WORKERS = 8
 
 
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
@@ -603,12 +604,14 @@ class OODDetector():
         per_class_record = []
         # reduce all layers (e.g. fisher)
         for class_id in range(self.num_classes):
-            sum_pval_per_reduction = fisher_reduce_all_layers(self.stats_recorder.record,class_id=class_id,using_ref_record=False)
+            sum_pval_per_reduction = fisher_reduce_all_layers(self.stats_recorder.record, class_id=class_id,
+                                                              using_ref_record=False)
             # update fisher pvalue per reduction
             fisher_pvals_per_reduction = {}
             for reduction_name, sum_pval_record in sum_pval_per_reduction.items():
                 for s, sum_pval in sum_pval_record.items():
-                    fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
+                    fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = \
+                    self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
 
             per_class_record.append(fisher_pvals_per_reduction)
 
@@ -638,14 +641,17 @@ class ChannelSelect():
     def __call__(self,x):
         return x[:,self._ids]
 
-class PickleableFunctionComposition():
-    def __init__(self,f1, f2):
+
+class FunctionComposition():
+    def __init__(self, f1, f2):
         self.f1 = f1
         self.f2 = f2
 
-    def __call__(self,x):
+    def __call__(self, x):
         return self.f2(self.f1(x))
 
+
+PickleableFunctionComposition = FunctionComposition
 
 class MahalanobisDistance():
     def __init__(self,mean,inv_cov):
@@ -711,19 +717,36 @@ class BatchStatsCollectorCfg():
         assert 0.5 == self.target_percentiles[-1], 'tensor must include median'
         self.target_percentiles = th.cat([self.target_percentiles, (1 - self.target_percentiles).sort()[0]])
         # adjust percentiles to the specified batch size
-        self.target_percentiles = (((self.target_percentiles+(1/batch_size/2)) // (1/batch_size))/batch_size ).unique()
+        self.target_percentiles = (
+                    ((self.target_percentiles + (1 / batch_size / 2)) // (1 / batch_size)) / batch_size).unique()
         logging.info(f'measure target percentiles {self.target_percentiles.numpy()}')
 
 
-def measure_data_statistics_part1(loader, model, epochs=5, model_device='cuda', collector_device='same', batch_size=1000,
-                            measure_settings : BatchStatsCollectorCfg = None):
+class SimpleOnlineMeterFactory():
+    def __init__(self, target_percentiles=None, number_edge_samples=0, track_cov=False, batched=True,
+                 track_percentiles=None, per_channel=False):
+        self.target_percentiles = target_percentiles
+        self.num_edge_samples = number_edge_samples
+        self.track_cov = track_cov
+        self.batched = batched
+        self.track_percentiles = track_percentiles
+        self.per_channel = per_channel
 
+    def __call__(self, k, v):
+        return OnlineMeter(batched=self.batched, track_percentiles=self.track_percentiles,
+                           per_channel=self.per_channel, target_percentiles=self.target_percentiles,
+                           number_edge_samples=self.num_edge_samples, track_cov=self.track_cov)
+
+
+def measure_data_statistics_part1(loader, model, epochs=5, model_device='cuda', collector_device='same',
+                                  batch_size=1000,
+                                  measure_settings: BatchStatsCollectorCfg = None):
     measure_settings = measure_settings or BatchStatsCollectorCfg(batch_size)
     compute_cov_on_partial_stats = measure_settings.partial_stats and not measure_settings.cov_off
     ## bypass the simple recorder dictionary with a meter dictionary to track per layer statistics
-    tracker = MeterDict(meter_factory=lambda k, v: OnlineMeter(batched=True, track_percentiles=True,
+    tracker = MeterDict(meter_factory=SimpleOnlineMeterFactory(batched=True, track_percentiles=True, per_channel=True,
                                                                target_percentiles=measure_settings.target_percentiles,
-                                                               per_channel=True,number_edge_samples=measure_settings.num_edge_samples,
+                                                               number_edge_samples=measure_settings.num_edge_samples,
                                                                track_cov=compute_cov_on_partial_stats))
 
     # function collects statistics of a batched tensors, return the collected statistics per input tensor
@@ -809,9 +832,9 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                     i_m = mahalanobis_fn(i_)
                     # measure the distribution per layer
                     tracker.update({f'{tracker_name}-@mahalabobis': i_m})
-                    if sample_channels:
+                    if sample_channels is not None:
                         # update function channel selection for inference time # todo move all fns outside of the loop
-                        mahalanobis_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=mahalanobis_fn)
+                        mahalanobis_fn = FunctionComposition(f1=sample_channels_fn, f2=mahalanobis_fn)
                     reduction_ret_obj.channel_reduction_record.update({'mahalanobis':
                                                                        # used for layer fusion (concatinate over all batches)
                                                                            {'record': i_m,
@@ -838,9 +861,9 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                     if measure_settings.find_simes:
                         i_s = calc_simes(pval)
                         # tracker.update({f'{tracker_name}-@simes_c': i_})
-                        simes_fn = PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
-                        if sample_channels:
-                            simes_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=simes_fn)
+                        simes_fn = FunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
+                        if sample_channels is not None:
+                            simes_fn = FunctionComposition(f1=sample_channels_fn, f2=simes_fn)
 
                         reduction_ret_obj.channel_reduction_record.update({'simes_c':
                             {
@@ -855,10 +878,10 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                         # result is not normalized as pvalues, we need to measure the distribution
                         # of this value to return to pval terms
                         tracker.update({f'{tracker_name}-@fisher_c': i_f})
-                        fisher_fn = PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher,
-                                                                  f2=calc_cond_fisher)
-                        if sample_channels:
-                            fisher_fn = PickleableFunctionComposition(f1=sample_channels_fn, f2=fisher_fn)
+                        fisher_fn = FunctionComposition(f1=reduction_ret_obj.meter.pval_matcher,
+                                                        f2=calc_cond_fisher)
+                        if sample_channels is not None:
+                            fisher_fn = FunctionComposition(f1=sample_channels_fn, f2=fisher_fn)
                         reduction_ret_obj.channel_reduction_record.update({'fisher_c':
                                                                                {'record': i_f,
                                                                                 'meter': tracker[
@@ -930,7 +953,8 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
                                 pval_matcher = PvalueMatcher(quantiles=q,percentiles=p,right_side=channel_reduction_entry['right_side_pval'])
                                 channel_reduction_entry['pval_matcher'] = pval_matcher
                                 # create the final function to retrive the layer pvalue from a given spatial reduction
-                                channel_reduction_entry['fn'] = PickleableFunctionComposition(channel_reduction_entry['fn'], pval_matcher)
+                                channel_reduction_entry['fn'] = FunctionComposition(channel_reduction_entry['fn'],
+                                                                                    pval_matcher)
 
                         if reduction_record.reduction_name in ret_stat_dict[k]:
                             ret_stat_dict[k][reduction_record.reduction_name] += [reduction_record]
@@ -952,6 +976,7 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
     if os.path.exists(measure_cache_part1):
         all_class_stat_trackers = th.load(measure_cache_part1, map_location=args.collector_device)
     else:
+        logging.info(f'Measure part 1')
         for class_id, class_name in enumerate(classes):
             logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
             if not args.measure_joint_distribution:
@@ -985,6 +1010,7 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
     else:
         sampled_channels_dict = None
 
+    logging.info(f'Measure part 2')
     all_class_ref_stats = []
     for class_id, class_name in enumerate(classes):
         logging.info(f'\t{class_id}/{len(classes)}\tcollecting stats for class {class_name}')
@@ -1083,7 +1109,9 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                                                                    {
                                                                    'right_side_pval': False,
                                                                    'record':calc_simes(pval),
-                                                                   'fn': PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_simes)
+                                                                       'fn': FunctionComposition(
+                                                                           f1=reduction_ret_obj.meter.pval_matcher,
+                                                                           f2=calc_simes)
                                                                    }
                                                                })
 
@@ -1096,7 +1124,9 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                                                                    {'record': fisher_out,
                                                                     'meter':tracker[f'{tracker_name}-@fisher_c'],
                                                                     'right_side_pval':True,
-                                                                    'fn':PickleableFunctionComposition(f1=reduction_ret_obj.meter.pval_matcher, f2=calc_cond_fisher)
+                                                                    'fn': FunctionComposition(
+                                                                        f1=reduction_ret_obj.meter.pval_matcher,
+                                                                        f2=calc_cond_fisher)
                                                                     }
                                                               })
 
@@ -1187,7 +1217,8 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
                                 pval_matcher = PvalueMatcher(quantiles=q,percentiles=p,right_side=channel_reduction_entry['right_side_pval'])
                                 channel_reduction_entry['pval_matcher'] = pval_matcher
                                 # create the final function to retrive the layer pvalue from a given spatial reduction
-                                channel_reduction_entry['fn'] = PickleableFunctionComposition(channel_reduction_entry['fn'], pval_matcher)
+                                channel_reduction_entry['fn'] = FunctionComposition(channel_reduction_entry['fn'],
+                                                                                    pval_matcher)
 
                         if reduction_record.reduction_name in ret_stat_dict[k]:
                             ret_stat_dict[k][reduction_record.reduction_name] += [reduction_record]
@@ -1348,7 +1379,7 @@ def evaluate_data(loader,model, detector,model_device,alpha_list = None,in_dist=
         for reduction_name, rejected_p in rejected.items():
             ## strip meter dict functionality for simpler post-processing
             reduction_dict = {}
-            for k,v in rejected_p.items():
+            for k, v in rejected_p.items():
                 # keeping meter object - potentially remove it here
                 reduction_dict[k] = v
             ret_dict[reduction_name] = reduction_dict
@@ -1448,7 +1479,7 @@ def measure_and_eval(args : Settings):
     model = getattr(models,args.model)(**(args.model_cfg))
     checkpoint = th.load(args.ckt_path, map_location='cpu')
     if 'state_dict' in checkpoint:
-        checkpoint=checkpoint['state_dict']
+        checkpoint = checkpoint['state_dict']
 
     model.load_state_dict(checkpoint)
     expected_transform_measure = get_transform(args.transform_dataset or args.dataset, augment=args.augment_measure)
@@ -1520,7 +1551,7 @@ def measure_and_eval(args : Settings):
     val_ds = get_dataset(args.dataset, 'val', expected_transform_test, limit=args.limit_test, per_class_limit=False)
     # todo add adversarial samples test
     # optional run in-dist data evaluate per class to simplify analysis
-    #for class_id,class_name in enumerate(val_ds.classes):
+    # for class_id,class_name in enumerate(val_ds.classes):
     #    sampler = th.utils.data.SubsetRandomSampler(th.where(targets==class_id)[0]) #th.utils.data.RandomSampler(ds, replacement=True,num_samples=5000)
     sampler = None
     val_loader = th.utils.data.DataLoader(
@@ -1723,7 +1754,6 @@ if __name__ == '__main__':
     # select_layers_mode = 'auto'
     # exp_ids = exp_ids = [8, 9, 10] # [0, 1, 2, 3, 4, 5, 6, 7]
     # device_id = 3  # exp_ids[0] % th.cuda.device_count()
-
 
     # 5
     # tag = '-@layer_select_logspace'
