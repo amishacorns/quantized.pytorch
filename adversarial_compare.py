@@ -376,39 +376,35 @@ def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ra
 
 def gen_inference_fn(ref_stats_dict, reduction_dict={}):
     def _batch_calc(trace_name, m, inputs):
-        shared_reductions_dict = {}
+        class_specific_stats = [{} for _ in range(len(ref_stats_dict))]
         for reduction_name, reduction_fn in reduction_dict.items():
             shared_reductions_per_input = []
             for i in inputs:
-                shared_reductions_per_input.append(reduction_fn(i))
-            shared_reductions_dict[reduction_name] = shared_reductions_per_input
+                i_ = reduction_fn(i)
 
-        class_specific_stats = []
-        for class_stat_dict in ref_stats_dict:
-            class_specific_rediction_record = {}
-            for reduction_name, reduction_stat in class_stat_dict[trace_name[:-8]].items():
+                shared_reductions_per_input.append(i_)
+            for c, class_stat_dict in enumerate(ref_stats_dict):
+                reduction_stat = class_stat_dict[trace_name[:-8]][reduction_name]
                 pval_per_input = []
                 for e, per_input_stat in enumerate(reduction_stat):
                     ret_channel_strategy = {}
                     assert isinstance(per_input_stat, BatchStatsCollectorRet)
-                    if reduction_name in shared_reductions_dict:
-                        if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
-                            assert per_input_stat.reduction_fn.f1 == reduction_dict[reduction_name]
-                        reduced = shared_reductions_dict[reduction_name][e]
-                    else:
-                        reduced = per_input_stat.reduction_fn(inputs[e])
+                    if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
+                        assert per_input_stat.reduction_fn.f1 == reduction_dict[reduction_name]
+                    reduced = shared_reductions_per_input[e]
                     for channle_reduction_name, rec in per_input_stat.channel_reduction_record.items():
                         if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
-                            # overwrite function to match old measure file with new format, note that channels reduction can differ between classes
-                            rec['fn'] = PickleableFunctionComposition(f1=per_input_stat.reduction_fn.f2,
-                                                                      f2=per_input_stat.reduction_fn.f1)
+                            # overwrite function to match old measure file with new format, note that channels
+                            # reduction can differ between classes
+                            rec['fn'] = FunctionComposition(f1=per_input_stat.reduction_fn.f2,
+                                                            f2=per_input_stat.reduction_fn.f1)
                         ret_channel_strategy[channle_reduction_name] = rec['fn'](reduced)
+
                     if per_input_stat.reduction_fn != reduction_dict[reduction_name]:
                         # this will make sure the fn overwite will only happen once
                         per_input_stat.reduction_fn = per_input_stat.reduction_fn.f1
                     pval_per_input.append(ret_channel_strategy)
-                class_specific_rediction_record[reduction_name] = pval_per_input
-            class_specific_stats.append(class_specific_rediction_record)
+                class_specific_stats[c][reduction_name] = pval_per_input
         return class_specific_stats
     return _batch_calc
 
@@ -436,7 +432,7 @@ class PvalueMatcher():
         quant_layer = self.quantiles.expand(stat_layer.shape[0], stat_layer.shape[1], self.num_percentiles)
 
         ### find p-values based on quantiles
-        temp_location = self.num_percentiles - th.sum(stat_layer < quant_layer, -1)
+        temp_location = th.sum(stat_layer < quant_layer, -1).neg_().add_(self.num_percentiles)
         upper_quant_ind = temp_location > (self.num_percentiles // 2)
         temp_location[upper_quant_ind] += -1
         matching_percentiles = self.percentiles[temp_location]
@@ -611,7 +607,7 @@ class OODDetector():
             for reduction_name, sum_pval_record in sum_pval_per_reduction.items():
                 for s, sum_pval in sum_pval_record.items():
                     fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = \
-                    self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
+                        self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
 
             per_class_record.append(fisher_pvals_per_reduction)
 
@@ -695,14 +691,14 @@ class BatchStatsCollectorCfg():
     cov_off : bool = False # True
     _track_cov: bool = False
     # using partial stats for mahalanobis covariance estimate
-    partial_stats: bool = True # False
+    partial_stats: bool = True  # False
     update_tracker: bool = True
     find_simes: bool = False
     find_cond_fisher: bool = False
-    mahalanobis : bool = False
-    target_percentiles = th.tensor([0.001, 0.002, 0.005,0.01,
-                          # estimate more percentiles next to the target alpha
-                          0.02, 0.023, 0.024,0.025,0.026, 0.027 ,0.03,
+    mahalanobis: bool = False
+    target_percentiles = th.tensor([0.001, 0.002, 0.005, 0.01,
+                                    # estimate more percentiles next to the target alpha
+                                    0.02, 0.023, 0.024, 0.025, 0.026, 0.027, 0.03,
                           # collect intervals for better layer reduction statistic approximation
                           0.045,0.047,0.049,0.05,0.051,0.053,0.055, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5]) # percentiles will be mirrored
     num_edge_samples: int = _EDGE_SAMPLES
