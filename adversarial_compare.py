@@ -26,12 +26,12 @@ _NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
 global _USE_PERCENTILE_DEVICE
 _USE_PERCENTILE_DEVICE = False
-_NUM_LOADER_WORKERS = 8
+_NUM_LOADER_WORKERS = 4
 
 
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
     return isinstance(m, th.nn.BatchNorm2d) or isinstance(m, th.nn.AvgPool2d) or \
-           isinstance(m, th.nn.AdaptiveAvgPool2d) or isinstance(m, th.nn.Linear)
+           isinstance(m, th.nn.AdaptiveAvgPool2d) or isinstance(m, th.nn.Linear) or isinstance(m, th.nn.Identity)
 
 
 def spatial_mean(x):
@@ -411,22 +411,16 @@ def gen_inference_fn(ref_stats_dict, reduction_dict={}):
 
 
 class PvalueMatcher():
-    def __init__(self,percentiles,quantiles, two_side=True, right_side=False,use_percentiles_device=_USE_PERCENTILE_DEVICE):
+    def __init__(self, percentiles, quantiles, two_side=True, right_side=False):
         self.percentiles = percentiles
         self.quantiles = quantiles.t().unsqueeze(0)
         self.num_percentiles = percentiles.shape[0]
-        self.use_percentiles_device = use_percentiles_device
         self.right_side = right_side
         self.two_side = (not right_side) and two_side
 
     ## todo document!
     def __call__(self, x):
         if x.device != self.quantiles.device:
-            if not hasattr(self,'use_percentiles_device') or self.use_percentiles_device != _USE_PERCENTILE_DEVICE:
-                self.use_percentiles_device=_USE_PERCENTILE_DEVICE
-            if self.use_percentiles_device:
-                x = x.to(self.percentiles.device)
-            else:
                 self.percentiles=self.percentiles.to(x.device)
                 self.quantiles = self.quantiles.to(x.device)
         stat_layer = x.unsqueeze(-1).expand(x.shape[0], x.shape[1], self.num_percentiles)
@@ -1007,20 +1001,20 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
     else:
         classes = measure_ds.classes.copy()
 
-    if args.LDA and 'joint_distribution' != classes[-1]:
-        classes += ['joint_distribution']
+    if args.LDA:
+        joint_raw_path = measure_cache_part1.replace('LDA', 'joint')
+        legacy_raw_path = measure_cache_part1.replace('-LDA', '')
+        if 'joint_distribution' != classes[-1]:
+            classes += ['joint_distribution']
 
     all_class_stat_trackers = []
     targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
     if not args.recompute and os.path.exists(measure_cache_part1):
         logging.info(f'loading cached class statistics (first measure step) from file: {measure_cache_part1}')
         all_class_stat_trackers = th.load(measure_cache_part1, map_location=args.collector_device)
-    elif not args.recompute and args.LDA:
-        joint_raw_path = measure_cache_part1.replace('LDA', 'joint')
-        legacy_raw_path = measure_cache_part1.replace('-LDA', '')
-        if os.path.exists(legacy_raw_path) and os.path.exists(joint_raw_path):
-            all_class_stat_trackers = th.load(legacy_raw_path, map_location=args.collector_device)
-            all_class_stat_trackers += th.load(joint_raw_path, map_location=args.collector_device)
+    elif not args.recompute and args.LDA and os.path.exists(legacy_raw_path) and os.path.exists(joint_raw_path):
+        all_class_stat_trackers = th.load(legacy_raw_path, map_location=args.collector_device)
+        all_class_stat_trackers += th.load(joint_raw_path, map_location=args.collector_device)
     else:
         logging.info(f'Measure part 1')
         for class_id, class_name in enumerate(classes):
@@ -1028,6 +1022,9 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
             ds_ = measure_ds
             if class_name != 'joint_distribution':
                 ds_ = th.utils.data.Subset(measure_ds, th.where(targets == class_id)[0])
+            elif args.LDA and not args.recompute and os.path.exists(joint_raw_path):
+                all_class_stat_trackers += th.load(joint_raw_path, map_location=args.collector_device)
+                continue
 
             sampler = None  # th.utils.data.RandomSampler(ds_,replacement=True,num_samples=epochs*args.batch_size)
             train_loader = th.utils.data.DataLoader(
@@ -1733,11 +1730,12 @@ def findClusterMain(settings: Settings, h0_data,cut_off_thres=None,plot=False):
     #                                                 criterion='distance')
     return res_dict
 
-## limit layers used to a subset (variace reduction), replace this function with your own (this filter is
-# specifically for denesent)
-def include_densenet_even_layers_fn(n, m):
+
+## this filter will allow us to collect the convolution layers outputs as well as avg pool and FC inputs
+def include_densenet_layers_fn(n, m):
     # n is the trace name, m is the actual module which can be used to target modules with specific attributes
-    return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or isinstance(m, th.nn.AvgPool2d)
+    return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or \
+           isinstance(m, th.nn.AvgPool2d) or isinstance(m, th.nn.Linear) or isinstance(m, th.nn.Identity)
 
 
 # helper functions for more expressive layer filtering
@@ -1783,6 +1781,9 @@ if __name__ == '__main__':
     np.set_printoptions(3)
 
     # 1
+    device_id = 3
+    cut = 0.05
+    seed = 10 + device_id
     device_id = 0
     exp_ids = [0, 1, 2, 3, 4, 5] + [6, 7] + [8, 9, 10]
     # exp_ids = [exp_ids[device_id]]
@@ -1791,13 +1792,14 @@ if __name__ == '__main__':
 
     def common_settings():
         tag = '-@baseline'
+        # tag = f'-@random_c_select_{cut}_seed_{seed}'
         recompute = 0
-        channel_selection_fn = None
+        channel_selection_fn = None  # partial(sample_random_channels, relative_cut=cut,seed=seed) # None
         select_layer_mode = 0
         device = f'cuda:{device_id}'  # exp_ids[0] % th.cuda.device_count()
         augment_measure = False
-        measure_joint_distribution = 1
-        LDA = 0
+        measure_joint_distribution = 0
+        LDA = 1
         return locals()
 
 
@@ -1888,9 +1890,11 @@ if __name__ == '__main__':
     class DN3ExpGroupSettings(Settings):
         def __init__(self, **kwargs):
             settings = common_settings()
+            settings['include_matcher_fn_measure'] = include_densenet_layers_fn
+            settings['include_matcher_fn_test'] = include_densenet_layers_fn
+            settings['tag'] += '-convs_avgpl_fc'
             settings.update(**kwargs)
-            super().__init__(model='DenseNet3',
-                             **settings)
+            super().__init__(model='DenseNet3', **settings)
 
 
     r18_places = Settings(
@@ -1903,7 +1907,7 @@ if __name__ == '__main__':
         model_cfg={'num_classes': 365, 'depth': 18, 'dataset': 'imagenet'},
         ckt_path='model_zoo/resnet18_places365.pth.tar',
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
-        # collector_device='cpu',
+        collector_device='cpu',
         ood_datasets=['imagenet',
                       'folder-places69',
                       'folder-textures',
@@ -2034,7 +2038,7 @@ if __name__ == '__main__':
     setup_logging()
     for args in experiments:
         logging.info(args)
-        if args.num_classes > 500:
+        if args.num_classes > 300:
             _USE_PERCENTILE_DEVICE = True
         else:
             _USE_PERCENTILE_DEVICE = False
