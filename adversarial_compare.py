@@ -441,28 +441,30 @@ class PvalueMatcher():
 
 class PvalueMatcherFromSamples(PvalueMatcher):
     def __init__(self, samples, target_percentiles=th.tensor([0.05,
-                                                                  0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
-                                                                  # decision for fisher is right sided
-                                                                  0.945, 0.94625, 0.9475, 0.94875,
-                                                                  0.95,  # target alpha upper 5%
-                                                                  0.95125, 0.9525, 0.95375, 0.955,
-                                                                  # add more abnormal percentiles for fusions
-                                                                  0.97, 0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999]),
-                 two_side=True, right_side=False,):
-            num_samples = samples.shape[0]
-            adjusted_target_percentiles = (
-                    ((target_percentiles + (1 / num_samples / 2)) // (1 / num_samples)) / num_samples
-            ).clamp(1 / num_samples, 1 - 1 / num_samples).unique()
-            meter = OnlineMeter(batched=True, track_percentiles=True,
-                                target_percentiles=adjusted_target_percentiles,
-                                per_channel=False, number_edge_samples=_NUM_EDGE_FISHER,
-                                track_cov=False)
-            meter.update(samples)
-            # logging.debug(
-            #     f'adjusted percentiles {"right tail" if (right_side and not two_side) else "sym"}:\n'
-            #     f'\t{adjusted_target_percentiles.cpu().numpy()}')
+                                                              0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+                                                              # decision for fisher is right sided
+                                                              0.945, 0.94625, 0.9475, 0.94875,
+                                                              0.95,  # target alpha upper 5%
+                                                              0.95125, 0.9525, 0.95375, 0.955,
+                                                              # add more abnormal percentiles for fusions
+                                                              0.97, 0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999]),
+                 two_side=True, right_side=False, ):
+        num_samples = samples.shape[0]
+        # include percentiles near descision boundary
+        target_percentiles = th.cat([th.tensor([0.948, 0.949, 0.95, 0.951, 0.952]), target_percentiles]).sort()[0]
+        adjusted_target_percentiles = (
+                ((target_percentiles + (1 / num_samples / 2)) // (1 / num_samples)) / num_samples
+        ).clamp(1 / num_samples, 1 - 1 / num_samples).unique()
+        meter = OnlineMeter(batched=True, track_percentiles=True,
+                            target_percentiles=adjusted_target_percentiles,
+                            per_channel=False, number_edge_samples=_NUM_EDGE_FISHER,
+                            track_cov=False)
+        meter.update(samples)
+        # logging.debug(
+        #     f'adjusted percentiles {"right tail" if (right_side and not two_side) else "sym"}:\n'
+        #     f'\t{adjusted_target_percentiles.cpu().numpy()}')
 
-            super().__init__(*meter.get_distribution_histogram(),two_side=two_side, right_side=right_side)
+        super().__init__(*meter.get_distribution_histogram(), two_side=two_side, right_side=right_side)
 
 def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=False, class_id=None):
     # this function summarises all layer pvalues using fisher statistic
@@ -1015,17 +1017,22 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
         classes = measure_ds.classes.copy()
 
     if args.LDA:
-        joint_raw_path = measure_cache_part1.replace('LDA', 'joint')
-        legacy_raw_path = measure_cache_part1.replace('-LDA', '')
+        if measure_cache_part1 is not None:
+            joint_raw_path = measure_cache_part1.replace('LDA', 'joint')
+            legacy_raw_path = measure_cache_part1.replace('-LDA', '')
+            valid_LDA_cache_part1 = os.path.exists(legacy_raw_path) and os.path.exists(joint_raw_path)
         if 'joint_distribution' != classes[-1]:
             classes += ['joint_distribution']
+    else:
+        valid_LDA_cache_part1 = False
 
     all_class_stat_trackers = []
     targets = th.tensor(measure_ds.targets) if hasattr(measure_ds, 'targets') else th.tensor(measure_ds.labels)
-    if not args.recompute and os.path.exists(measure_cache_part1):
+    need_recompute = measure_cache_part1 is not None and not args.recompute
+    if need_recompute and os.path.exists(measure_cache_part1):
         logging.info(f'loading cached class statistics (first measure step) from file: {measure_cache_part1}')
         all_class_stat_trackers = th.load(measure_cache_part1, map_location=args.collector_device)
-    elif not args.recompute and args.LDA and os.path.exists(legacy_raw_path) and os.path.exists(joint_raw_path):
+    elif need_recompute and valid_LDA_cache_part1:
         all_class_stat_trackers = th.load(legacy_raw_path, map_location=args.collector_device)
         all_class_stat_trackers += th.load(joint_raw_path, map_location=args.collector_device)
     else:
@@ -1049,9 +1056,9 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
                                                       reduction_dictionary=args.spatial_reductions,
                                                       # todo: maybe split measure and test include fn in Settings
                                                       include_matcher_fn=args.include_matcher_fn_measure)
-            if args.LDA:
-                measure_settings._cov_off = True
-
+            ## disable per-class covariance compute for speedup measuring and reduce memory usage
+            if args.LDA and class_name != 'joint_distribution':
+                measure_settings.cov_off = True
             # collect basic reduction stats
             class_stats = measure_data_statistics_part1(train_loader, model, epochs=5 if args.augment_measure else 1,
                                                         model_device=args.device,
@@ -1547,7 +1554,10 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
         calib_tag = args.tag
 
     calib_tag = f'{exp_tag}-{calib_tag}'
-    part1_cache = f'measured_stats_per_class-{exp_tag}-raw.pth'
+    if cache_measure:
+        part1_cache = f'measured_stats_per_class-{exp_tag}-raw.pth'
+    else:
+        part1_cache = None
     calibrated_path = f'measured_stats_per_class-{calib_tag}.pth'
     exp_tag += f'-{args.tag}'
     if args.select_layer_mode and not args.recompute:
@@ -1564,8 +1574,9 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
                          per_class_limit=True)
         # ref_stats = measure(model, ds, args)
         ref_stats = measure_v2(model, ds, args, part1_cache)
-        logging.info('saving reference stats dict')
-        th.save(ref_stats, calibrated_path)
+        if cache_measure:
+            logging.info('saving reference stats dict')
+            th.save(ref_stats, calibrated_path)
         if measure_only:
             return
     if args.select_layer_mode:
@@ -1641,7 +1652,8 @@ def findCluster(h0_data, spatial_reduction_name, name_data_set, t=0.8, criterion
         full_class = []
         for layer_name in all_layers:
             layer_pval = \
-            h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[channle_reduction_method][
+                h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[
+                    channle_reduction_method][
                 'record']
             if 'pval_matcher' in h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[
                 channle_reduction_method]:
