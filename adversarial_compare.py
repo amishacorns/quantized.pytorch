@@ -25,9 +25,96 @@ _EDGE_SAMPLES = 200
 _NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
 global _USE_PERCENTILE_DEVICE
+global _MONITOR_OP_OUTPUTS
+
+_MONITOR_OP_OUTPUTS = False  # True # used to flip stats monitors to output tracking instead if input tracking
 _USE_PERCENTILE_DEVICE = False
 _NUM_LOADER_WORKERS = 4
 
+
+# helper functions for more expressive layer filtering
+class WhiteListInclude():
+    def __init__(self, layer_white_list):
+        self.layer_white_list = layer_white_list
+
+    def __call__(self, n, m=None):
+        return n in self.layer_white_list
+
+
+class GroupWhiteListInclude():
+    def __init__(self, group_layer_white_reg):
+        self.group_layer_white_reg = group_layer_white_reg
+        self.all_layers = []
+        if isinstance(group_layer_white_reg, dict):
+            self.per_reduction_groups = True
+            self.n_groups = 0
+            for reduction_name, reduction_groups in group_layer_white_reg.items():
+                self.n_groups = max(len(reduction_groups), self.n_groups)
+                for ll in reduction_groups:
+                    self.all_layers += ll
+        else:
+            self.per_reduction_groups = False
+            for ll in group_layer_white_reg:
+                self.all_layers += ll
+            self.n_groups = len(group_layer_white_reg)
+        self.all_layers = list(set(self.all_layers))
+        self.set_work_group(0)
+
+    def set_work_group(self, id: int):
+        if self.per_reduction_groups:
+            self.layer_white_list = {}
+            for reduction_name, reduction_groups in self.group_layer_white_reg.items():
+                self.layer_white_list[reduction_name] = reduction_groups[id]
+        else:
+            self.layer_white_list = self.group_layer_white_reg[id]
+
+    def get_work_group_members(self):
+        return self.layer_white_list
+
+    def set_global_group(self):
+        self.layer_white_list = self.all_layers
+
+    def _match_trace_name(self, n, layer_list):
+        if any(re.match(f'^{i}.*', n) for i in layer_list):
+            layer_list.append(n)
+            return True
+        return False
+
+    def __call__(self, n, m):
+        if isinstance(m, th.nn.Module):
+            return n in self.all_layers
+
+        if self.per_reduction_groups:
+            if m not in self.layer_white_list:
+                return not (n in self.all_layers or self._match_trace_name(n, self.all_layers))
+            return not (n in self.layer_white_list[m] or self._match_trace_name(n, self.layer_white_list[m]))
+
+        return not (n in self.layer_white_list or self._match_trace_name(n, self.layer_white_list))
+
+
+def positional_log_filter(layer_list, exp=3):
+    ln = len(layer_list)
+    sample = np.unique(np.ceil((ln / np.logspace(0, exp, ln))))
+    ids = np.min(sample) + ln - sample - 1
+    return [layer_list[int(i)] for i in ids]
+
+
+class LayerSlice(WhiteListInclude):
+    def __init__(self, model, include_fn, filter_fn=positional_log_filter):
+        all_layers = []
+        for n, m in model.named_modules():
+            if include_fn(n, m):
+                all_layers.append(n)
+        super().__init__(layer_white_list=filter_fn(all_layers))
+
+
+class RegxInclude():
+    def __init__(self, pattern):
+        self.pattern = pattern
+
+    def __call__(self, n, m):
+        # n is the trace name, m is the actual module which can be used to target modules with specific attributes
+        return bool(re.fullmatch(self.pattern, n))
 
 
 def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
@@ -206,6 +293,7 @@ class Settings:
                  include_matcher_fn_test: Callable[[str, th.nn.Module], bool] = None,
                  # this will try to choose layers to reduce final statistic variance over H0
                  select_layer_mode: bool = False,
+                 select_layer_kwargs: Dict = {},
                  channel_selection_fn: Callable[[List[Dict]], Dict[str, th.Tensor]] = None
                  ):
 
@@ -378,6 +466,8 @@ def plot(clean_act, fgsm_act, layer_key, reference_stats=None, nbins=256, max_ra
 
 def gen_inference_fn(ref_stats_dict, reduction_dict={}):
     def _batch_calc(trace_name, m, inputs):
+        if type(inputs) != tuple:
+            inputs = (inputs,)
         class_specific_stats = [{} for _ in range(len(ref_stats_dict))]
         for reduction_name, reduction_fn in reduction_dict.items():
             shared_reductions_per_input = []
@@ -473,11 +563,11 @@ def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=Fals
     # to calculate the distribution for each layer statistic)
     sum_pval_per_reduction={}
     for layer_name, layer_stats_dict in ref_stats.items():
-        if filter_layer and filter_layer(layer_name):
-            continue
         if class_id is not None:
             layer_stats_dict = layer_stats_dict[class_id]
         for spatial_reduction_name, record_per_input in layer_stats_dict.items():
+            if filter_layer and filter_layer(layer_name, spatial_reduction_name):
+                continue
             if spatial_reduction_name not in sum_pval_per_reduction:
                 sum_pval_per_reduction[spatial_reduction_name] = {}
                 if using_ref_record:
@@ -497,42 +587,66 @@ def fisher_reduce_all_layers(ref_stats, filter_layer=None, using_ref_record=Fals
                             # need to get pvalues first
                             pval = channel_reduction_record['pval_matcher'](pval)
                         # free memory after extracting stats
-                        del channel_reduction_record['record']
-                        if 'meter' in (channel_reduction_record.keys()):
-                            del channel_reduction_record['meter']
+                        # del channel_reduction_record['record']
+                        # if 'meter' in (channel_reduction_record.keys()):
+                        #     del channel_reduction_record['meter']
                         sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
-                    del record.meter
+                    # del record.meter
                 else:
                     for channel_reduction_name, pval in record.items():
                         sum_pval_per_reduction[spatial_reduction_name][channel_reduction_name] += -2 * th.log(pval)
 
     return sum_pval_per_reduction
 
-def extract_output_distribution_single_class(layer_wise_ref_stats,target_percentiles=th.tensor([0.05,
-                                                                      0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
-                                                                      # decision for fisher is right sided
-                                                                      0.945, 0.94625, 0.9475, 0.94875,
-                                                                      0.95,# target alpha upper 5%
-                                                                      0.95125, 0.9525,0.95375, 0.955,
-                                                                      # add more abnormal percentiles for fusions
-                                                                      0.97,0.98,0.99, 0.995,0.999,0.9995,0.9999]),
-                                right_sided_fisher_pvalue = False,filter_layer=None):
+
+def extract_output_distribution_single_class(layer_wise_ref_stats, target_percentiles=th.tensor([0.05,
+                                                                                                 0.1, 0.2, 0.3, 0.4,
+                                                                                                 0.5, 0.6, 0.7, 0.8,
+                                                                                                 0.9,
+                                                                                                 # decision for fisher is right sided
+                                                                                                 0.945, 0.94625, 0.9475,
+                                                                                                 0.94875,
+                                                                                                 0.95,
+                                                                                                 # target alpha upper 5%
+                                                                                                 0.95125, 0.9525,
+                                                                                                 0.95375, 0.955,
+                                                                                                 # add more abnormal percentiles for fusions
+                                                                                                 0.97, 0.98, 0.99,
+                                                                                                 0.995, 0.999, 0.9995,
+                                                                                                 0.9999]),
+                                             right_sided_fisher_pvalue=False, filter_layer=None):
+    def _prep_pval_matcher(sum_pval_per_reduction):
+        fisher_pvals_per_reduction = {}
+        for spatial_reduction_name, sum_pval_record in sum_pval_per_reduction.items():
+            logging.debug(f'\t{spatial_reduction_name}:')
+            fisher_pvals_per_reduction[spatial_reduction_name] = {}
+            # different channle reduction strategies will have different pvalues
+            for channel_reduction_name, sum_pval in sum_pval_record.items():
+                # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
+                kwargs = {'target_percentiles': target_percentiles}
+                if right_sided_fisher_pvalue:
+                    kwargs.update({'two_side': False, 'right_side': True})
+                fisher_pvals_per_reduction[spatial_reduction_name][channel_reduction_name] = PvalueMatcherFromSamples(
+                    samples=sum_pval, **kwargs)
+                logging.debug(f'\t\t{channel_reduction_name}:\t mean:{sum_pval.mean():0.3f}\tstd:{sum_pval.std():0.3f}')
+        return fisher_pvals_per_reduction
+
     # reduce all layers (e.g. fisher)
+    pvalue_matcher_per_group = []
+    if isinstance(filter_layer, GroupWhiteListInclude):
+        for g in range(filter_layer.n_groups):
+            filter_layer.set_work_group(g)
+            logging.info(f'processing group {g} pvalues: {filter_layer.get_work_group_members()}')
+            sum_pval_per_reduction = fisher_reduce_all_layers(layer_wise_ref_stats, filter_layer, using_ref_record=True)
+            pvalue_matcher_per_group.append(_prep_pval_matcher(sum_pval_per_reduction))
+        # this allows the next iteration to recover the global fisher pvalue matcher and append it last
+        filter_layer.set_global_group()
+
     sum_pval_per_reduction = fisher_reduce_all_layers(layer_wise_ref_stats, filter_layer, using_ref_record=True)
+    pvalue_matcher_per_group.append(_prep_pval_matcher(sum_pval_per_reduction))
+    return pvalue_matcher_per_group
     # update replace fisher output with pvalue per reduction
-    fisher_pvals_per_reduction = {}
-    for spatial_reduction_name, sum_pval_record in sum_pval_per_reduction.items():
-        logging.debug(f'\t{spatial_reduction_name}:')
-        fisher_pvals_per_reduction[spatial_reduction_name]={}
-        # different channle reduction strategies will have different pvalues
-        for channel_reduction_name,sum_pval in sum_pval_record.items():
-            # use right tail pvalue since we don't care about fisher "normal" looking pvalues that are closer to 0
-            kwargs = {'target_percentiles':target_percentiles}
-            if right_sided_fisher_pvalue:
-                kwargs.update({'two_side':False,'right_side':True})
-            fisher_pvals_per_reduction[spatial_reduction_name][channel_reduction_name] = PvalueMatcherFromSamples(samples=sum_pval,**kwargs)
-            logging.debug(f'\t\t{channel_reduction_name}:\t mean:{sum_pval.mean():0.3f}\tstd:{sum_pval.std():0.3f}')
-    return fisher_pvals_per_reduction
+
 
 def extract_output_distribution(all_class_ref_stats, target_percentiles=th.tensor([0.05,
                                                                                    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7,
@@ -581,11 +695,18 @@ class OODDetector():
             for k in all_keys:
                 if k not in self.stats_recorder.tracked_modules.keys():
                     del rc[k]
+        self.test_layers = list(self.stats_recorder.tracked_modules.keys())
+        self.ref_layers = all_keys
         gc.collect()
+        if isinstance(include_matcher_fn, GroupWhiteListInclude):
+            self.filter_layer = include_matcher_fn
+        else:
+            self.filter_layer = lambda layer_name, reduction_name: layer_name not in self.test_layers
+
         self.output_pval_matcher = extract_output_distribution(all_class_ref_stats,
                                                                right_sided_fisher_pvalue=right_sided_fisher_pvalue,
-                                                               filter_layer=lambda
-                                                                   n: n not in self.stats_recorder.tracked_modules.keys())
+                                                               filter_layer=self.filter_layer,
+                                                               target_percentiles=th.linspace(0, 1, 1000))
         self.num_classes = len(all_class_ref_stats)
 
 
@@ -610,12 +731,46 @@ class OODDetector():
         for class_id in range(self.num_classes):
             sum_pval_per_reduction = fisher_reduce_all_layers(self.stats_recorder.record, class_id=class_id,
                                                               using_ref_record=False)
-            # update fisher pvalue per reduction
+            fisher_pvals_per_reduction = self._extract_fisher_pvalues(sum_pval_per_reduction, class_id=class_id)
+
+            per_class_record.append(fisher_pvals_per_reduction)
+
+        return self._gen_output_dict(per_class_record)
+
+    def _extract_fisher_pvalues(self, sum_pval_per_reduction, class_id, group_id=-1):
+        # update fisher pvalue per reduction
+        fisher_pvals_per_reduction = {}
+        for reduction_name, sum_pval_record in sum_pval_per_reduction.items():
+            for s, sum_pval in sum_pval_record.items():
+                fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = \
+                    self.output_pval_matcher[class_id][group_id][reduction_name][s](sum_pval)
+
+        return fisher_pvals_per_reduction
+
+    def get_fisher_groups(self, combine_fn=calc_simes, groups_filter: GroupWhiteListInclude = None):
+        if groups_filter is None and not isinstance(self.filter_layer, GroupWhiteListInclude):
+            return self.get_fisher()
+        groups_filter = groups_filter or self.filter_layer
+        per_class_record = []
+        # reduce all layers (e.g. fisher)
+        for class_id in range(self.num_classes):
             fisher_pvals_per_reduction = {}
-            for reduction_name, sum_pval_record in sum_pval_per_reduction.items():
-                for s, sum_pval in sum_pval_record.items():
-                    fisher_pvals_per_reduction[f'{reduction_name}_{s}'] = \
-                        self.output_pval_matcher[class_id][reduction_name][s](sum_pval)
+            for g in range(groups_filter.n_groups):
+                groups_filter.set_work_group(g)
+                logging.debug(f'processing group {g} pvalues: {groups_filter.get_work_group_members()}')
+                sum_pval_per_reduction = fisher_reduce_all_layers(self.stats_recorder.record,
+                                                                  filter_layer=groups_filter,
+                                                                  using_ref_record=False, class_id=class_id)
+                for k, v in self._extract_fisher_pvalues(sum_pval_per_reduction, group_id=g, class_id=class_id).items():
+                    if k not in fisher_pvals_per_reduction:
+                        fisher_pvals_per_reduction[k] = []
+                    fisher_pvals_per_reduction[k] += [v]
+
+            ## combine groups using fisher (alternativly this can be combined outside)
+            for k in fisher_pvals_per_reduction.keys():
+                fisher_pvals_per_reduction[k] = th.cat(fisher_pvals_per_reduction[k], -1)
+                if combine_fn:
+                    fisher_pvals_per_reduction[k] = combine_fn(fisher_pvals_per_reduction[k])
 
             per_class_record.append(fisher_pvals_per_reduction)
 
@@ -1593,6 +1748,13 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
             # currently we can only look at
             selected_layers_names = selected_layers_names['spatial-mean'][0]
             args.include_matcher_fn_test = WhiteListInclude(selected_layers_names)
+        if args.select_layer_mode == 'auto_group':
+            logging.info(f'layer clustering with groups')
+            selected_layers_names = {}
+            for reduction_name in args.spatial_reductions.keys():
+                selected_layers_names[reduction_name] = find_cluster_groups(ref_stats, reduction_name,
+                                                                            **args.select_layer_kwargs)
+            args.include_matcher_fn_test = GroupWhiteListInclude(selected_layers_names)
         elif args.select_layer_mode == 'logspace':
             logging.info(f'logspace layer selection')
             args.include_matcher_fn_test = LayerSlice(model, include_fn=args.include_matcher_fn_measure)
@@ -1648,10 +1810,9 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
 
 ### 'maxclust' is used to choose number of clusters, 'distance' to choose according to threshold
 def findCluster(h0_data, spatial_reduction_name, name_data_set, t=0.8, criterion='distance', plot_layer=False,
-                plot_summary=False,channle_reduction_method='mahalanobis'):
+                plot_summary=False, channle_reduction_method='simes_c'):
     import seaborn as sns
     import scipy.cluster.hierarchy as spc
-
     corr_list = list()
     all_layers = [str(i) for i in h0_data[0].keys()]
     for class_id in range(0, len(h0_data)):
@@ -1767,48 +1928,51 @@ def findClusterMain(settings: Settings, h0_data,cut_off_thres=None,plot=False):
     return res_dict
 
 
-## this filter will allow us to collect the convolution layers outputs as well as avg pool and FC inputs
-def include_densenet_layers_fn(n, m):
-    # n is the trace name, m is the actual module which can be used to target modules with specific attributes
-    return isinstance(m, th.nn.BatchNorm2d) and n.split('.')[-1].endswith('2') or \
-           isinstance(m, th.nn.AvgPool2d) or isinstance(m, th.nn.Linear) or isinstance(m, th.nn.Identity)
+def find_cluster_groups(h0_data, spatial_reduction_name, t=10, criterion='maxclust',
+                        channle_reduction_method='simes_c'):
+    import scipy.cluster.hierarchy as spc
 
+    corr_list = list()
+    all_layers = [str(i) for i in h0_data[0].keys()]
+    for class_id in range(0, len(h0_data)):
+        dim_num = np.array([i for i in range(len(all_layers))])
+        full_class = []
+        for layer_name in all_layers:
+            layer_pval = \
+                h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[
+                    channle_reduction_method][
+                    'record']
+            if 'pval_matcher' in h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[
+                channle_reduction_method]:
+                layer_pval = h0_data[class_id][layer_name][spatial_reduction_name][0].channel_reduction_record[
+                    channle_reduction_method]['pval_matcher'](layer_pval)
 
-# helper functions for more expressive layer filtering
-class WhiteListInclude():
-    def __init__(self, layer_white_list):
-        self.layer_white_list = layer_white_list
-
-    def __call__(self, n, m):
-        return n in self.layer_white_list
-
-
-def positional_log_filter(layer_list, exp=3):
-    ln = len(layer_list)
-    sample = np.unique(np.ceil((ln / np.logspace(0, exp, ln))))
-    ids = np.min(sample) + ln - sample - 1
-    return [layer_list[int(i)] for i in ids]
-
-
-class LayerSlice(WhiteListInclude):
-    def __init__(self, model, include_fn, filter_fn=positional_log_filter):
-        all_layers = []
-        for n, m in model.named_modules():
-            if include_fn(n, m):
-                all_layers.append(n)
-        super().__init__(layer_white_list=filter_fn(all_layers))
-
-
-import re
-
-
-class RegxInclude():
-    def __init__(self, pattern):
-        self.pattern = pattern
-
-    def __call__(self, n, m):
-        # n is the trace name, m is the actual module which can be used to target modules with specific attributes
-        return bool(re.fullmatch(self.pattern, n))
+            if (layer_pval < 0).sum():
+                print('negative pvalue at', class_id, layer_name, spatial_reduction_name, channle_reduction_method)
+            full_class.append(layer_pval)
+        full_dat_log = th.log(th.stack(full_class, 1).squeeze(-1)).cpu().numpy()
+        corr = np.corrcoef(full_dat_log.T)  ## correlation
+        if np.isnan(corr).sum() > 0:
+            import pdb;
+            pdb.set_trace()
+        corr_list.append(corr)
+    #### Select dimensions according to correlation
+    ### Heirarchal clustering
+    avg_corr = sum(corr_list) / max(len(corr_list), 1)
+    pwdist = abs(avg_corr)
+    # take upper half of the distance metric 1-corr
+    # pwdist  = spc.distance.pdist(1 - abs(avg_corr)) ### abs for sake of correctness
+    pwdist = pwdist[np.triu_indices_from(pwdist, 1)]
+    linkage = spc.linkage(pwdist, method='ward')
+    # apply thershold to trim connections between weakly correlated layers
+    cluster = spc.fcluster(linkage, t=t, criterion=criterion) - 1
+    ### Sample from clusters
+    n_clusters = len(np.unique(cluster))
+    chosen_layers = [None] * n_clusters
+    for j in range(n_clusters):
+        chosen_layers[j] = [all_layers[i] for i in (dim_num[np.where(cluster == j)[0]])]
+        # take layer with maximum correlation with other layers (avg)
+    return chosen_layers
 
 # reminder we look at the input of layers, following layers used by mhalanobis paper
 densenet_mahalanobis_matcher_fn = WhiteListInclude(['block1', 'block2','block3','avg_pool'])
