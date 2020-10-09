@@ -1056,6 +1056,9 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
                                                       reduction_dictionary=args.spatial_reductions,
                                                       # todo: maybe split measure and test include fn in Settings
                                                       include_matcher_fn=args.include_matcher_fn_measure)
+            if len(ds_) <= args.batch_size_measure:
+                measure_settings.num_edge_samples = 0
+
             ## disable per-class covariance compute for speedup measuring and reduce memory usage
             if args.LDA and class_name != 'joint_distribution':
                 measure_settings.cov_off = True
@@ -1069,6 +1072,7 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
         if measure_cache_part1 is not None:
             assert type(measure_cache_part1) == str
             th.save(all_class_stat_trackers, measure_cache_part1)
+
     if args.LDA:
         assert len(all_class_stat_trackers) == len(measure_ds.classes) + 1
         LDA_tracker = all_class_stat_trackers[-1]
@@ -1103,6 +1107,9 @@ def measure_v2(model, measure_ds, args: Settings, measure_cache_part1=None):
                                                   sampled_channels=sampled_channels_dict[class_id] if \
                                                       type(sampled_channels_dict) == list else sampled_channels_dict)
         measure_settings.LDA_tracker = LDA_tracker
+        if len(ds_) <= args.batch_size_measure:
+            measure_settings.num_edge_samples = 0
+
         # collect basic reduction stats
         class_stats = measure_data_statistics_part2(all_class_stat_trackers[class_id], train_loader, model,
                                                     epochs=5 if args.augment_measure else 1,
