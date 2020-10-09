@@ -2,7 +2,9 @@ import gc
 import inspect
 import logging
 import os
+import re
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, List, Dict
 
 import matplotlib
@@ -14,21 +16,23 @@ import torch.nn.functional as F
 import tqdm
 
 import models
+from calculate_log import metric
 from data import get_dataset
 from preprocess import get_transform
 from utils.log import setup_logging
 from utils.meters import MeterDict, OnlineMeter, AverageMeter, accuracy
 from utils.misc import Recorder
 
-th.backends.cudnn.benchmark = False
-_EDGE_SAMPLES = 200
-_NUM_EDGE_FISHER = 100
 # use this setting to save gpu memory
+global _EDGE_SAMPLES
+global _NUM_EDGE_FISHER
 global _USE_PERCENTILE_DEVICE
 global _MONITOR_OP_OUTPUTS
 
 _MONITOR_OP_OUTPUTS = False  # True # used to flip stats monitors to output tracking instead if input tracking
 _USE_PERCENTILE_DEVICE = False
+_EDGE_SAMPLES = 200
+_NUM_EDGE_FISHER = 0
 _NUM_LOADER_WORKERS = 4
 
 
@@ -122,6 +126,30 @@ def _default_matcher_fn(n: str, m: th.nn.Module) -> bool:
            isinstance(m, th.nn.AdaptiveAvgPool2d) or isinstance(m, th.nn.Linear) or isinstance(m, th.nn.Identity)
 
 
+## default densenet_collector: convolution outputs + avg pool & FC inputs
+def include_densenet_layers_fn(n, m):
+    return isinstance(m, th.nn.Linear) or isinstance(m, th.nn.Identity) or isinstance(m, th.nn.AvgPool2d)
+
+
+# clac Simes per batch element (samples x variables)
+def calc_simes(pval):
+    pval, _ = th.sort(pval, 1)
+    view_shape = [-1, pval.shape[1]] + [1] * (pval.dim() - 2)
+    rank = th.arange(1, pval.shape[1] + 1, device=pval.device).view(view_shape)
+    simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
+    return simes_pval.unsqueeze(1)
+
+
+def calc_cond_fisher(pval, thresh=0.25):
+    pval[pval > thresh] = 1
+    return -2 * pval.log().sum(1).unsqueeze(1)
+
+
+# rescaled fisher test
+def calc_mean_fisher(pval):
+    return -2 * pval.log().mean(1).unsqueeze(1)
+
+
 def spatial_mean(x):
     return x.mean(tuple(range(2, x.dim()))) if x.dim() > 2 else x
 
@@ -181,7 +209,7 @@ _DEFAULT_SPATIAL_REDDUCTIONS = {
     'spatial-max': spatial_max,
     # 'spatial-min': spatial_min,
     # 'spatial-min_max': spatial_min_max,
-    'spatial-mean_max': spatial_mean_max,
+    # 'spatial-mean_max': spatial_mean_max,
     # 'spatial-min_mean_max': spatial_min_mean_max,
     # 'spatial-l2':spatial_l2,
     # 'spatial-l2':spatial_l2
@@ -808,22 +836,6 @@ class OODDetector():
         return self._gen_output_dict(per_class_record)
 
 
-# clac Simes per batch element (samples x variables)
-def calc_simes(pval):
-    pval, _ = th.sort(pval, 1)
-    view_shape = [-1, pval.shape[1]] + [1] * (pval.dim() - 2)
-    rank = th.arange(1, pval.shape[1] + 1, device=pval.device).view(view_shape)
-    simes_pval, _ = th.min(pval.shape[1] * pval / rank, 1)
-    return simes_pval.unsqueeze(1)
-
-def calc_cond_fisher(pval, thresh=0.1):
-    pval[pval>thresh]=1
-    return -2*pval.log().sum(1).unsqueeze(1)
-
-# rescaled fisher test
-def calc_mean_fisher(pval):
-    return -2*pval.log().mean(1).unsqueeze(1)
-
 
 class ChannelSelect():
     def __init__(self,ids):
@@ -1130,7 +1142,7 @@ def measure_data_statistics_part2(tracker, loader, model,epochs=5, model_device=
     logging.info(f'\t\tcalculating layer pvalues using measured mean and quantiles')
     measure_settings.mahalanobis = True
     measure_settings.find_simes = True
-    measure_settings.find_cond_fisher = True
+    measure_settings.find_cond_fisher = False
     _loop_over_data()
 
     ## build reference dictionary with per layer information per reduction (reversing collection order)
@@ -1462,13 +1474,14 @@ def measure_data_statistics(loader, model, epochs=5, model_device='cuda', collec
     return ret_stat_dict
 
 
-def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dist=False, save_pvalues=False):
+def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dist=False, save_pvalues=False, limit=None,
+                  simes_l=False, fusions=True, keep_intermidiate_pvalues=False, keep_logits=False):
     alpha_list = alpha_list or [0.05]
     TNR95_id = alpha_list.index(0.05)
     accuracy_dict = MeterDict(AverageMeter)
     rejected = {}
     if save_pvalues:
-        save_pvalues = {}
+        save_pvalues_dict = {'intermidiate_pvalues': []}
 
     def _gen_curve(pvalues_for_val):
         rejected_ = []
@@ -1479,11 +1492,11 @@ def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dis
     def _evaluate_pvalues_dict(pvalues_dict, prefix=''):
         for reduction_name, pvalues in pvalues_dict.items():
             reduction_name = f'{prefix}-{reduction_name}'
-            if save_pvalues:
-                if reduction_name in save_pvalues:
-                    save_pvalues[reduction_name] = th.cat([save_pvalues[reduction_name], pvalues], 0)
+            if save_pvalues and bool(re.match(save_pvalues, reduction_name)):
+                if reduction_name in save_pvalues_dict:
+                    save_pvalues_dict[reduction_name] = th.cat([save_pvalues_dict[reduction_name], pvalues], 0)
                 else:
-                    save_pvalues[reduction_name] = pvalues
+                    save_pvalues_dict[reduction_name] = pvalues
 
             # measure rejection rates for a range of pvalues under each measure and each reduction
             if reduction_name not in rejected:
@@ -1579,33 +1592,58 @@ def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dis
                 fused_pval = th.stack(fused_pval, 1)
                 ret_pvalues[fusion_name] = calc_simes(fused_pval).squeeze(1)
         return ret_pvalues
-        # rejected['fusion'].update({fusion_name + '_roc': _gen_curve(calc_simes(fused_pval))})
 
     model.eval()
     model.to(model_device)
+    batch_count = 0
     with th.no_grad():
         for d, l in tqdm.tqdm(loader, total=len(loader)):
+            if limit and batch_count * d.shape[0] >= limit:
+                break
+            batch_count += 1
             out = model(d.to(model_device)).cpu()
             predicted = out.argmax(1)
-            pvalues_dict_fisher = detector.get_fisher()
-            pvalues_dict_simes = detector.get_simes()
-            detector.stats_recorder.record.clear()
-
-            joint_dict = {}
-            for pval_layer_reduction_method, pval_dict in zip(['simes', 'fisher'],
-                                                              [pvalues_dict_simes, pvalues_dict_fisher]):
-                joint_dict.update({f'{pval_layer_reduction_method}-{rm}': p for rm, p in pval_dict.items()})
-            pvalues_fusion = _fusion_pvalues(joint_dict, 2)
+            if save_pvalues:
+                if 'predicted_id' in save_pvalues_dict:
+                    save_pvalues_dict['predicted_id'] = th.cat([save_pvalues_dict['predicted_id'], out.argmax(1)], 0)
+                else:
+                    save_pvalues_dict['predicted_id'] = out.argmax(1)
 
             if in_dist:
                 # model accuracy
                 correct_predictions = l == predicted
                 t1, t5 = accuracy(out, l, (1, 5))
                 accuracy_dict.update({'model_acc': (th.stack([t1, t5]), out.shape[0])})
+                if save_pvalues and keep_logits:
+                    if 'logits' in save_pvalues_dict:
+                        save_pvalues_dict['logits'] = th.cat([save_pvalues_dict['logits'], out], 0)
+                        save_pvalues_dict['labels'] = th.cat([save_pvalues_dict['labels'], l], 0)
+                    else:
+                        save_pvalues_dict['logits'] = out
+                        save_pvalues_dict['labels'] = l
+            if save_pvalues and keep_intermidiate_pvalues:
+                save_pvalues_dict['intermidiate_pvalues'].append(detector.stats_recorder.record.copy())
 
-            _evaluate_pvalues_dict(pvalues_dict_simes, 'simes')
+            ## extract pvalues and evaluate them
+            if isinstance(detector.filter_layer, GroupWhiteListInclude):
+                pvalues_dict_fisher_groups = detector.get_fisher_groups()
+                _evaluate_pvalues_dict(pvalues_dict_fisher_groups, 'fisher_group')
+            pvalues_dict_fisher = detector.get_fisher()
             _evaluate_pvalues_dict(pvalues_dict_fisher, 'fisher')
-            _evaluate_pvalues_dict(pvalues_fusion, 'fusion')
+            if simes_l:
+                pvalues_dict_simes = detector.get_simes()
+                _evaluate_pvalues_dict(pvalues_dict_simes, 'simes')
+            if fusions:
+                if simes_l:
+                    joint_dict = {}
+                    for pval_layer_reduction_method, pval_dict in zip(['simes', 'fisher'],
+                                                                      [pvalues_dict_simes, pvalues_dict_fisher]):
+                        joint_dict.update({f'{pval_layer_reduction_method}-{rm}': p for rm, p in pval_dict.items()})
+                    pvalues_fusion = _fusion_pvalues(joint_dict, 2)
+                else:
+                    pvalues_fusion = _fusion_pvalues(pvalues_dict_fisher, 2)
+                _evaluate_pvalues_dict(pvalues_fusion, 'fusion')
+            detector.stats_recorder.record.clear()
             _report(logging.DEBUG)
         ## end of eval report
         logging.info(f'DONE: {getattr(loader.dataset,"root",loader.dataset)}')
@@ -1623,19 +1661,33 @@ def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dis
         for reduction_name_accuracy, accuracy_d in accuracy_dict.items():
             ret_dict[reduction_name_accuracy] = accuracy_d
 
-    return ret_dict, save_pvalues
+    return ret_dict, save_pvalues_dict if save_pvalues else None
 
     # Important! recorder hooks should be removed when done
 
-def result_summary(res_dict,args_dict,TNR_target=0.05):
+
+def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=r'(^simes)|(^fusion)', include_pattern=None,
+                   pvalue_record=None):
+    from utils.meters import simple_auc
+    from _collections import OrderedDict
     ## if not configured setup logging for external caller
     if not logging.getLogger('').handlers:
         setup_logging()
     in_dist = args_dict['dataset']
     alphas = args_dict['alphas']
     logging.info(f'Report for {args_dict["model"]} - {in_dist}')
+    result_dict = OrderedDict(model=args_dict["model"], in_dist=args_dict['dataset'], LDA=args_dict.get('LDA'),
+                              joint=args_dict['measure_joint_distribution'], tag=args_dict['tag'],
+                              channles_sellect=args_dict.get('channel_selection_fn'),
+                              test_fn=args_dict['include_matcher_fn_test'],
+                              measure_fn=args_dict['include_matcher_fn_measure'])
     # read indist results to calibrate alpha value for target TNR
+    rows = []
     for reduction_name, reduction_metrics in res_dict[in_dist].items():
+        if skip_pattern and bool(re.match(skip_pattern, reduction_name)) or include_pattern and not bool(
+                re.match(include_pattern, reduction_name)):
+            continue
+        result_dict['reduction'] = reduction_name
         logging.info(reduction_name)
         if type(reduction_metrics) != dict:
             # report simple metric
@@ -1643,43 +1695,107 @@ def result_summary(res_dict,args_dict,TNR_target=0.05):
             continue
         # report reduction specific metrics
         for metric_name, meter_object in reduction_metrics.items():
+            metric_stats = MeterDict()
             if not metric_name.endswith('_roc'):
                 # in-dist metric with a single value (e.g. mean pvalues, prediction accuracy etc)
                 logging.info(f'\t{metric_name}: {meter_object.mean.numpy():0.3}')
                 continue
-            indist_pvalues_roc = meter_object.mean
-            calibrated_alpha_id = (indist_pvalues_roc < TNR_target).sum() - 1
+            FPR = meter_object.mean.numpy()
+            calibrated_alpha_id = (FPR < TNR_target).sum() - 1
 
             if calibrated_alpha_id == -1:
                 # all pvalues are larger than alpha
-                calibrated_alpha_raw = meter_object.mean[0]
-                interp_alpha = indist_pvalues_roc[0]
+                fpr_under_target_alpha = meter_object.mean[0]
+                interp_alpha = FPR[0]
                 calibrated_alpha_id = 0
             else:
-                calibrated_alpha_raw = indist_pvalues_roc[calibrated_alpha_id]
+                fpr_under_target_alpha = FPR[calibrated_alpha_id]
                 # actual rejection threshold to use for TNR 95%
-                interp_alpha = np.interp(0.05, indist_pvalues_roc.squeeze_(), alphas)
+                interp_alpha = np.interp(0.05, FPR.squeeze(), alphas)
 
-            logging.info(f'\t{metric_name} - in-dist raw rejected: '
+            result_dict.update(dict(metric_name=metric_name, FPR_strict=fpr_under_target_alpha,
+                                    FPR_over=FPR[calibrated_alpha_id + 1],
+                                    chosen_alpha=interp_alpha))
+            logging.info(f'\t{metric_name} - in-dist rejected: '
                          # f'alpha-{indist_pvalues_roc[alphas.index(TNR_target)]:0.3f} ({TNR_target:0.3f}), '
-                         f'under-{calibrated_alpha_raw:0.3f} ({alphas[calibrated_alpha_id]:0.3f}), '
+                         f'under-{fpr_under_target_alpha:0.3f} ({alphas[calibrated_alpha_id]:0.3f}), '
                          f'interp-{TNR_target:0.3f} ({interp_alpha:0.3f}), '
-                         f'over-{indist_pvalues_roc[calibrated_alpha_id + 1]:0.3f} ({alphas[calibrated_alpha_id + 1]})')
+                         f'over-{FPR[calibrated_alpha_id + 1]:0.3f} ({alphas[calibrated_alpha_id + 1]})')
+
+            if pvalue_record and reduction_name in pvalue_record[in_dist]:
+                if metric_name.startswith('class_cond') and 'predicted_id' in pvalue_record[in_dist]:
+                    predicted_ids = pvalue_record[in_dist]['predicted_id']
+                    in_cc_pval_pred = pvalue_record[in_dist][reduction_name][
+                        th.arange(predicted_ids.shape[0]), predicted_ids]
+                else:
+                    in_cc_pval_pred = pvalue_record[in_dist][reduction_name].max(1)[0]
 
             for target_dataset_name, reduction_metrics in res_dict.items():
                 if target_dataset_name != in_dist and metric_name in reduction_metrics[reduction_name]:
                     interp_rejected = np.interp(interp_alpha, alphas,
                                                 reduction_metrics[reduction_name][metric_name].mean.numpy())
-                    raw_rejected = reduction_metrics[reduction_name][metric_name].mean.numpy()[alphas.index(TNR_target)]
-                    logging.info(f'\t\t{target_dataset_name}:\traw-{raw_rejected:0.3f}\tinterp-{interp_rejected:0.3f}')
+                    TPR = reduction_metrics[reduction_name][metric_name].mean.numpy()
+                    raw_rejected = TPR[alphas.index(TNR_target)]
+                    auroc = simple_auc(TPR, FPR)
+                    logging.info(
+                        f'\t\t{target_dataset_name}:\traw-{raw_rejected:0.3f}\tinterp-{interp_rejected:0.3f}\tAUROC:{auroc:0.3f}')
+                    if pvalue_record and reduction_name in pvalue_record[target_dataset_name]:
+                        if metric_name.startswith('class_cond') and 'predicted_id' in pvalue_record[
+                            target_dataset_name]:
+                            predicted_ids = pvalue_record[target_dataset_name]['predicted_id']
+                            out_cc_pval_pred = pvalue_record[target_dataset_name][reduction_name][
+                                th.arange(predicted_ids.shape[0]), predicted_ids]
+                        else:
+                            out_cc_pval_pred = pvalue_record[target_dataset_name][reduction_name].max(1)[0]
+
+                        m = metric(in_cc_pval_pred.numpy(), out_cc_pval_pred.numpy())
+                        logging.info(f'\t\t\tbenchmark metrics: {m}')
+                        result_dict.update(**m)
+
+                    result_dict.update(
+                        dict(out_dist=target_dataset_name, TPR95_raw=raw_rejected, TPR95_interp=interp_rejected,
+                             AUROC=auroc))
+                    rows.append(result_dict.copy())
+
+                    if in_dist.startswith('cifar') and target_dataset_name.startswith('cifar'):
+                        continue
+                    metric_stats.update(
+                        dict(TPR95_raw=th.tensor([raw_rejected]), TPR95_interp=th.tensor([interp_rejected]),
+                             AUROC=th.tensor([auroc])))
+
+            if target_dataset_name != in_dist and metric_name in reduction_metrics[reduction_name]:
+                result_dict['out_dist'] = 'avg'
+                logging.info(
+                    f'\tmetric avg stats: {[k + " " + str(float(v)) for k, v in metric_stats.get_mean_dict().items()]}')
+                result_dict.update(**metric_stats.get_mean_dict())
+                rows.append(result_dict.copy())
+    return rows
 
 
-def report_from_file(path):
-    res = th.load(path,map_location='cpu')
-    result_summary(res['results'], res['settings'])
+def report_from_file(path, skip_pattern=r'(^simes)|(^fusion)|(.*export*)', include_pattern=r'^fisher-.*-max_simes'):
+    from glob import glob
+    from pandas import DataFrame as df
+    result_collection = []
+    for p in glob(path):
+        res = th.load(p, map_location='cpu')
+        summ_rows = result_summary(res['results'], res['settings'], skip_pattern=skip_pattern,
+                                   include_pattern=include_pattern,
+                                   pvalue_record=res.get('pvalues_collection'))
+        for r in summ_rows:
+            r['result_file_path'] = p
+            r['time_stamp'] = res.get('time_stamp')
+            r['test_layers'] = res.get('test_layers')
+            r['ref_layers'] = res.get('ref_layers')
+            r.update(res['settings'])
+
+        result_collection += summ_rows
+    df(result_collection).to_csv('report.csv')
 
 
-def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
+def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False, cache_measure=True,
+                     keep_intermidiate_pvalues=False):
+    from datetime import datetime
+    TIME_START = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     rejection_results = {}  # dataset , out
     model = getattr(models, args.model)(**(args.model_cfg))
     checkpoint = th.load(args.ckt_path, map_location='cpu')
@@ -1779,7 +1895,8 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
         batch_size=args.batch_size_test, shuffle=False,
         num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
     e_ret = evaluate_data(val_loader, model, detector, args.device, alpha_list=args.alphas, in_dist=True,
-                          save_pvalues=export_pvalues)
+                          save_pvalues=export_pvalues, limit=args.limit_test,
+                          keep_intermidiate_pvalues=keep_intermidiate_pvalues)
     if export_pvalues:
         pvalues_collection = {args.dataset: e_ret[1]}
     rejection_results[args.dataset] = e_ret[0]
@@ -1796,15 +1913,18 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False):
             num_workers=_NUM_LOADER_WORKERS, pin_memory=False, drop_last=False)
         logging.info(f'evaluating {ood_dataset}')
         e_ret = evaluate_data(ood_loader, model, detector, args.device, alpha_list=args.alphas,
-                              save_pvalues=export_pvalues)
+                              save_pvalues=export_pvalues, limit=args.limit_test,
+                              keep_intermidiate_pvalues=keep_intermidiate_pvalues)
         if export_pvalues:
-            pvalues_collection[args.dataset] = e_ret[1]
+            pvalues_collection[ood_dataset] = e_ret[1]
         rejection_results[ood_dataset] = e_ret[0]
 
-    save = {'results': rejection_results, 'settings': args.get_args_dict()}
+    save = {'results': rejection_results, 'settings': args.get_args_dict(), 'time_stamp': TIME_START,
+            'test_layers': detector.test_layers, 'ref_layers': detector.ref_layers}
     if export_pvalues:
         save['pvalues_collection'] = pvalues_collection
-    th.save(save, f'experiment_results-{exp_tag}.pth')
+        exp_tag += '-pval_export'
+    th.save(save, f'{TIME_START}_experiment_results-{exp_tag}.pth')
     result_summary(rejection_results, args.get_args_dict())
 
 
@@ -1980,22 +2100,30 @@ resnet_mahalanobis_matcher_fn = WhiteListInclude(['layer1', 'layer2','layer3','l
 if __name__ == '__main__':
     np.set_printoptions(3)
 
-    # 1
-    device_id = 3
-    cut = 0.05
-    seed = 10 + device_id
+    exp_ids = [0, 1, 2, 3, 4, 5] + [6, 7, 8] + [9, 10, 11]
     device_id = 0
-    exp_ids = [0, 1, 2, 3, 4, 5] + [6, 7] + [8, 9, 10]
-    # exp_ids = [exp_ids[device_id]]
-    measure_only = False
+    exp_ids = [exp_ids[device_id]]
+    measure_kwargs = dict(export_pvalues=r'.*',  # r'^fisher-.*-max',## this is require for reference metric
+                          measure_only=False,
+                          cache_measure=True,
+                          keep_intermidiate_pvalues=False)
+
+    limit_test = None  # 1000 if measure_kwargs['export_pvalues'] else None
+    cut = 0  # 0.05
+    seed = 10 + device_id
+    tag = '-@baseline_final_mean_max_reductions'
 
 
     def common_settings():
-        tag = '-@baseline'
-        # tag = f'-@random_c_select_{cut}_seed_{seed}'
-        recompute = 0
-        channel_selection_fn = None  # partial(sample_random_channels, relative_cut=cut,seed=seed) # None
-        select_layer_mode = 0
+        tag = tag or '-@baseline'
+        recompute = 1
+        if cut > 0:
+            tag = f'-@random_c_select_{cut}_seed_{seed}'
+            channel_selection_fn = partial(sample_random_channels, relative_cut=cut, seed=seed)  # None
+        else:
+            channel_selection_fn = None
+        select_layer_mode = None  # 'auto_group'
+        select_layer_kwargs = None  # dict(t=3, criterion='maxclust', channle_reduction_method='simes_c')
         device = f'cuda:{device_id}'  # exp_ids[0] % th.cuda.device_count()
         augment_measure = False
         measure_joint_distribution = 0
@@ -2071,19 +2199,13 @@ if __name__ == '__main__':
     #     device=f'cuda:{device_id}'
     # )
 
-    # common_exp_settings = dict(measure_joint_distribution=measure_joint_distribution,
-    #                 select_layer_mode=select_layers_mode,
-    #                 channel_selection_fn=channel_selection_fn,
-    #                 augment_measure=False, recompute=recompute,tag=tag,
-    #                 device=f'cuda:{device_id}',
-    #                 )
 
     class R34ExpGroupSettings(Settings):
         def __init__(self, **kwargs):
             settings = common_settings()
             settings.update(**kwargs)
-            super().__init__(model='ResNet34',  # limit_measure=1000,limit_test=1000,
-                             # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+            settings['limit_test'] = limit_test
+            super().__init__(model='ResNet34',
                              **settings)
 
 
@@ -2092,7 +2214,7 @@ if __name__ == '__main__':
             settings = common_settings()
             settings['include_matcher_fn_measure'] = include_densenet_layers_fn
             settings['include_matcher_fn_test'] = include_densenet_layers_fn
-            settings['tag'] += '-convs_avgpl_fc'
+            settings['limit_test'] = limit_test
             settings.update(**kwargs)
             super().__init__(model='DenseNet3', **settings)
 
@@ -2100,7 +2222,7 @@ if __name__ == '__main__':
     r18_places = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='places365_standard',
-        limit_test=5000,
+        limit_test=limit_test or 5000,
         batch_size_measure=1000,
         batch_size_test=500,
         num_classes=365,
@@ -2122,7 +2244,7 @@ if __name__ == '__main__':
     )
     r18_domainnet = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
-        limit_test=5000,
+        limit_test=limit_test or 5000,
         dataset='DomainNet-real-A-measure',
         batch_size_measure=500,
         batch_size_test=500,
@@ -2143,7 +2265,7 @@ if __name__ == '__main__':
     r18_lsun = Settings(
         model='resnet',  # limit_measure=1000,limit_test=1000,
         dataset='LSUN-raw',
-        limit_test=5000,
+        limit_test=limit_test or 5000,
         limit_measure=10000,
         batch_size_test=500,
         model_cfg={'num_classes': 10, 'depth': 18, 'dataset': 'imagenet'},
@@ -2158,8 +2280,15 @@ if __name__ == '__main__':
     oe_cifar10 = Settings(
         model='WideResNet',  # limit_measure=1000,limit_test=1000,
         dataset='cifar10',
+        num_classes=10,
+        limit_test=limit_test,
         model_cfg={'num_classes': 10, 'depth': 40, 'widen_factor': 2},
-        ckt_path='model_zoo/cifar10_wrn_oe_scratch_epoch_99.pt',
+        ckt_path='model_zoo/cifar10_wrn_oe_tune_epoch_9.pt',
+        ood_datasets=['folder-textures',
+                      'SVHN',
+                      'cifar100',
+                      'places365_standard',
+                      'LSUN-raw'],
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         **common_settings()
     )
@@ -2168,12 +2297,36 @@ if __name__ == '__main__':
         model='WideResNet',  # limit_measure=1000,limit_test=1000,
         dataset='cifar100',
         model_cfg={'num_classes': 100, 'depth': 40, 'widen_factor': 2},
-        ckt_path='model_zoo/cifar100_wrn_oe_scratch_epoch_99.pt',
+        ckt_path='model_zoo/cifar100_wrn_oe_tune_epoch_9.pt',
         # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
         batch_size_measure=500,
         collector_device='cpu',
+        ood_datasets=['folder-textures',
+                      'SVHN',
+                      'cifar10',
+                      'places365_standard',
+                      'LSUN-raw'],
+        limit_test=limit_test,
+
         **common_settings()
     )
+
+    oe_svhn = Settings(
+        model='WideResNet',  # limit_measure=1000,limit_test=1000,
+        dataset='SVHN',
+        num_classes=10,
+        model_cfg={'num_classes': 10, 'depth': 16, 'widen_factor': 4},
+        ckt_path='model_zoo/svhn_wrn_oe_tune_epoch_4.pt',
+        ood_datasets=['folder-textures',
+                      'cifar10',
+                      'places365_standard',
+                      'LSUN-raw'],
+        limit_test=limit_test,
+
+        # include_matcher_fn=resnet_mahalanobis_matcher_fn,,
+        **common_settings()
+    )
+
     resnet34_cifar10 = R34ExpGroupSettings(
         dataset='cifar10',
         num_classes=10,
@@ -2231,9 +2384,8 @@ if __name__ == '__main__':
     #     include_matcher_fn=densenet_mahalanobis_matcher_fn
     # )
 
-    #experiments = [densenet_svhn_cross_cifar10]
     experiments = [resnet34_cifar10, resnet34_cifar100, resnet34_svhn, densenet_cifar10, densenet_cifar100,
-                   densenet_svhn, oe_cifar10, oe_cifar100, r18_places, r18_lsun, r18_domainnet]
+                   densenet_svhn, oe_cifar10, oe_cifar100, oe_svhn, r18_places, r18_lsun, r18_domainnet]
     experiments = [experiments[exp_id] for exp_id in exp_ids]
     setup_logging()
     for args in experiments:
@@ -2242,7 +2394,11 @@ if __name__ == '__main__':
             _USE_PERCENTILE_DEVICE = True
         else:
             _USE_PERCENTILE_DEVICE = False
-        measure_and_eval(args, measure_only=measure_only)
+        measure_and_eval(args, **measure_kwargs)
+
+    report_from_file(f'*experiment_results-.*{tag}*',
+                     skip_pattern=r'(^simes)|(^fusion)',
+                     include_pattern=r'(.*-max_simes.*)|(^fisher_group-.*-max_simes)')
 pass
 
 # record = th.load(f'record-{args.dataset}.pth')
