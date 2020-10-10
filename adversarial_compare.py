@@ -8,7 +8,6 @@ from functools import partial
 from typing import Callable, List, Dict
 
 import matplotlib
-# from matplotlib import pyplot as plt
 import matplotlib.pylab as plt
 import numpy as np
 import torch as th
@@ -1666,7 +1665,7 @@ def evaluate_data(loader, model, detector, model_device, alpha_list=None, in_dis
     # Important! recorder hooks should be removed when done
 
 
-def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=r'(^simes)|(^fusion)', include_pattern=None,
+def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=None, include_pattern='.*',
                    pvalue_record=None):
     from utils.meters import simple_auc
     from _collections import OrderedDict
@@ -1678,16 +1677,36 @@ def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=r'(^simes)
     logging.info(f'Report for {args_dict["model"]} - {in_dist}')
     result_dict = OrderedDict(model=args_dict["model"], in_dist=args_dict['dataset'], LDA=args_dict.get('LDA'),
                               joint=args_dict['measure_joint_distribution'], tag=args_dict['tag'],
-                              channles_sellect=args_dict.get('channel_selection_fn'),
-                              test_fn=args_dict['include_matcher_fn_test'],
-                              measure_fn=args_dict['include_matcher_fn_measure'])
+                              channles_sellect=args_dict.get('channel_selection_fn'))
     # read indist results to calibrate alpha value for target TNR
     rows = []
+    accuracies = {'model': {}}
+    for reduction_name, reduction_metrics in res_dict[in_dist].items():
+        accuracies[reduction_name] = {}
+        if reduction_name.endswith('_acc'):
+            acc = reduction_metrics.mean.cpu().numpy()
+            std = reduction_metrics.std.cpu().numpy()
+            acc_name = reduction_name.replace('_acc', '')
+            if acc_name == 'model':
+                reduction_name = 'model'
+            if acc_name.endswith('rescaled-smx'):
+                reduction_name = acc_name[:-13]
+                acc_name = 'model_rescaled_smx'
+            elif acc_name.endswith('-pval'):
+                reduction_name = acc_name[:-5]
+                acc_name = 'pval'
+
+            accuracies[reduction_name][f'{acc_name}_t1'] = acc[0]
+            accuracies[reduction_name][f'{acc_name}_t5'] = acc[1]
+            accuracies[reduction_name][f'{acc_name}_std_t1'] = std[0]
+
     for reduction_name, reduction_metrics in res_dict[in_dist].items():
         if skip_pattern and bool(re.match(skip_pattern, reduction_name)) or include_pattern and not bool(
                 re.match(include_pattern, reduction_name)):
             continue
         result_dict['reduction'] = reduction_name
+        result_dict.update(**accuracies['model'])
+        result_dict.update(**accuracies[reduction_name])
         logging.info(reduction_name)
         if type(reduction_metrics) != dict:
             # report simple metric
@@ -1697,7 +1716,6 @@ def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=r'(^simes)
         for metric_name, meter_object in reduction_metrics.items():
             metric_stats = MeterDict()
             if not metric_name.endswith('_roc'):
-                # in-dist metric with a single value (e.g. mean pvalues, prediction accuracy etc)
                 logging.info(f'\t{metric_name}: {meter_object.mean.numpy():0.3}')
                 continue
             FPR = meter_object.mean.numpy()
@@ -1772,7 +1790,8 @@ def result_summary(res_dict, args_dict, TNR_target=0.05, skip_pattern=r'(^simes)
     return rows
 
 
-def report_from_file(path, skip_pattern=r'(^simes)|(^fusion)|(.*export*)', include_pattern=r'^fisher-.*-max_simes'):
+def report_from_file(path, skip_pattern=r'(^simes)|(^fusion)|(.*export*)', include_pattern=r'^fisher-.*-max_simes',
+                     output='report'):
     from glob import glob
     from pandas import DataFrame as df
     result_collection = []
@@ -1789,7 +1808,7 @@ def report_from_file(path, skip_pattern=r'(^simes)|(^fusion)|(.*export*)', inclu
             r.update(res['settings'])
 
         result_collection += summ_rows
-    df(result_collection).to_csv('report.csv')
+    df(result_collection).to_csv(f'{output}.csv')
 
 
 def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False, cache_measure=True,
@@ -1832,10 +1851,7 @@ def measure_and_eval(args: Settings, export_pvalues=False, measure_only=False, c
         calib_tag = args.tag
 
     calib_tag = f'{exp_tag}-{calib_tag}'
-    if cache_measure:
-        part1_cache = f'measured_stats_per_class-{exp_tag}-raw.pth'
-    else:
-        part1_cache = None
+    part1_cache = f'measured_stats_per_class-{exp_tag}-raw.pth'
     calibrated_path = f'measured_stats_per_class-{calib_tag}.pth'
     exp_tag += f'-{args.tag}'
     if args.select_layer_mode and not args.recompute:
@@ -2102,21 +2118,21 @@ if __name__ == '__main__':
 
     exp_ids = [0, 1, 2, 3, 4, 5] + [6, 7, 8] + [9, 10, 11]
     device_id = 0
-    exp_ids = [exp_ids[device_id]]
+    exp_ids = [0, 1, 2, 3, 4, 5]  # [exp_ids[device_id]]
     measure_kwargs = dict(export_pvalues=r'.*',  # r'^fisher-.*-max',## this is require for reference metric
                           measure_only=False,
-                          cache_measure=True,
+                          cache_measure=False,
                           keep_intermidiate_pvalues=False)
 
     limit_test = None  # 1000 if measure_kwargs['export_pvalues'] else None
-    cut = 0  # 0.05
-    seed = 10 + device_id
-    tag = '-@baseline_final_mean_max_reductions'
+    cut = 0.5  # 0.05
+    seed = 0 + device_id
+    tag_ = '-@baseline_final_mean_max_reductions'
 
 
     def common_settings():
-        tag = tag or '-@baseline'
-        recompute = 1
+        tag = tag_ or '-@baseline'
+        recompute = 0
         if cut > 0:
             tag = f'-@random_c_select_{cut}_seed_{seed}'
             channel_selection_fn = partial(sample_random_channels, relative_cut=cut, seed=seed)  # None
@@ -2395,8 +2411,8 @@ if __name__ == '__main__':
         else:
             _USE_PERCENTILE_DEVICE = False
         measure_and_eval(args, **measure_kwargs)
-
-    report_from_file(f'*experiment_results-.*{tag}*',
+    # report_from_file('./Final_results_baseine_2020-10-08/*/*', skip_pattern=None, include_pattern=r'.*')
+    report_from_file(f'*experiment_results-*{tag_}*',
                      skip_pattern=r'(^simes)|(^fusion)',
                      include_pattern=r'(.*-max_simes.*)|(^fisher_group-.*-max_simes)')
 pass
